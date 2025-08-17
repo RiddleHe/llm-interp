@@ -4,6 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import os
+import heapq
 
 model_name = "Qwen/Qwen3-8B"
 
@@ -41,7 +42,10 @@ print(f"Logits generated, shape: {logits.shape}.")
 
 token_entropies = []
 conditional_entropies = []
-for logit in tqdm(logits, desc="Calculating entropies"):
+top_k_heap = []
+k = 8
+
+for idx, logit in enumerate(tqdm(logits, desc="Calculating entropies")):
     probs = torch.softmax(logit[0], dim=-1)
     top_probs, _ = torch.topk(probs, k=100)
     top_probs = top_probs / top_probs.sum()
@@ -49,6 +53,14 @@ for logit in tqdm(logits, desc="Calculating entropies"):
     entropy = -torch.sum(top_probs * torch.log(top_probs + 1e-10))
     token_entropies.append(entropy.item())
     conditional_entropies.append(entropy.item()) # model generation is condtioned on prev toks
+
+    if len(top_k_heap) < k or entropy.item() > top_k_heap[0][0]:
+        top_5_probs, top_5_indices = torch.topk(probs, k=5)
+        if len(top_k_heap) < k:
+            heapq.heappush(top_k_heap, (entropy.item(), idx, top_5_indices))
+        else:
+            heapq.heapreplace(top_k_heap, (entropy.item(), idx, top_5_indices))
+
 print(f"Entropies calculated.")
 
 cumulative_entropy_rate = np.cumsum(conditional_entropies) / np.arange(1, len(conditional_entropies) + 1)
@@ -57,21 +69,28 @@ generated_ids = outputs.sequences[0, inputs.input_ids.shape[1]:]
 generated_tokens = tokenizer.convert_ids_to_tokens(generated_ids)
 # generated_text = tokenizer.decode(generated_ids)
 
-n_top_tokens = 8
 n_gram_size = 8
-top_entropy_indices = np.argsort(token_entropies)[-n_top_tokens:][::-1]
-for rank, idx in enumerate(top_entropy_indices):
-    token = generated_tokens[idx]
-    token_text = tokenizer.decode(generated_ids[idx:idx+1], skip_special_tokens=False)
-    entropy = token_entropies[idx]
-
+top_entropy_pos = sorted(top_k_heap, reverse=True) # highest first
+for rank, (entropy, idx, top_5_indices) in enumerate(top_entropy_pos):
     start_context = max(0, idx - n_gram_size // 2)
     end_context = min(len(generated_tokens), idx + n_gram_size // 2 + 1)
-    context_tokens = generated_tokens[start_context:end_context]
     context_text = tokenizer.decode(generated_ids[start_context:end_context], skip_special_tokens=False)
 
+    token_text = tokenizer.decode(generated_ids[idx:idx+1], skip_special_tokens=False)
+    top_5_tokens_text = [
+        tokenizer.decode([tid.item()], skip_special_tokens=False)
+        for tid in top_5_indices
+    ]
+    top_5_tokens_text = [
+        f'"{token_text}"' if token_text != '\n' else r'"\n"'
+        for token_text in top_5_tokens_text
+    ]
+
     print(f"Token: {token_text} (Entropy: {entropy:.4f}, Rank: {rank+1})")
-    print(f"Context: {context_text}")
+    print(f"Top 5 candidates: {', '.join(top_5_tokens_text)}")
+    newline = '\n'
+    escape_newline = r'\n'
+    print(f"Context: {context_text.replace(newline, escape_newline)}")
     print("\n")
 
 window_size = 16
@@ -138,7 +157,7 @@ for start, end, entropy_val in merged_high_entropy_regions:
     window_tokens = generated_tokens[start:end]
     window_text = tokenizer.decode(generated_ids[start:end], skip_special_tokens=False)
     print(f"Position [{start}:{end}] - Entropy: {entropy_val:.4f}")
-    print(f"Text: {window_text}")
+    print(f"Text: {window_text.replace(newline, escape_newline)}")
     print("\n")
 
 print(f"Threshold: {threshold:.4f}")
