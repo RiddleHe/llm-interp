@@ -1,3 +1,12 @@
+"""
+This script analyzes how ByteDance-Seed/Seed-OSS-36B-Instruct controls its thinking budget.
+
+To start, run CUDA_VISIBLE_DEVICES=<at least three GPUS> \
+    python analyze_seed_thinking_budget.py \
+        --token_budget <token_budget> \
+        --max_tokens <max_tokens> \
+"""
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, TopPLogitsWarper, TemperatureLogitsWarper
 import os
 import re
@@ -13,7 +22,10 @@ parser.add_argument("--max_tokens", type=int, default=2048)
 parser.add_argument("--temperature", type=float, default=1.1)
 parser.add_argument("--top_p", type=float, default=0.95)
 parser.add_argument("--prompt_type", type=str, default="livecodebench")
+# Token swapping experiments
 parser.add_argument("--swap_token", action="store_true", default=False)
+parser.add_argument("--truncate_token", action="store_true", default=False)
+parser.add_argument("--truncate_offset", type=int, default=1)
 args = parser.parse_args()
 
 token_budget = args.token_budget
@@ -21,6 +33,7 @@ max_tokens = args.max_tokens
 temperature = args.temperature
 top_p = args.top_p
 prompt_type = args.prompt_type
+truncate_offset = args.truncate_offset
 
 with open(f"prompts.json", "r") as f:
     prompts = json.load(f)
@@ -51,6 +64,7 @@ top_p_warper = TopPLogitsWarper(top_p)
 budget_reflection_start = -1
 budget_reflection_stop = -1
 perform_swap = False
+truncate_token = False
 
 for step in tqdm(range(max_tokens), desc="Generating tokens"):
     with torch.no_grad():
@@ -60,7 +74,6 @@ for step in tqdm(range(max_tokens), desc="Generating tokens"):
             use_cache=True,
         )
     logits = output.logits[:, -1, :]
-    past_key_values = output.past_key_values
 
     logits = temp_warper(generated_ids, logits)
     logits = top_p_warper(generated_ids, logits)
@@ -73,12 +86,26 @@ for step in tqdm(range(max_tokens), desc="Generating tokens"):
         print(f"COT budget reflection starts at step {step} with total tokens {step + prompt_len + 1}")
         if step > token_budget:
             print("COT budget reflection exceeds the budget")
+
         if args.swap_token:
             perform_swap = not perform_swap
-            if perform_swap:
+            if perform_swap: # new token, same kv
                 next_token = tokenizer.encode(" ")
                 next_token = torch.tensor(next_token).unsqueeze(0).to(generated_ids.device)
                 print(f"Swapped token to empty space token")
+
+        elif args.truncate_token:
+            truncate_token = not truncate_token
+            if truncate_token: # new kv, recomputed
+                if truncate_offset == 0:
+                    print(f"Truncate 0 tokens, regenerating at current step {step}")
+                    continue
+                generated_ids = generated_ids[:, :-truncate_offset]
+                # Only choose -truncate_offset from past_key_values
+                past_key_values.crop(prompt_len + step - truncate_offset)
+
+                print(f"Truncated {truncate_offset} tokens, resetting to step {step - truncate_offset}")
+                continue
 
     elif next_token.item() == 6: # </seed:cot_budget_reflect>
         budget_reflection_stop = step
@@ -90,6 +117,7 @@ for step in tqdm(range(max_tokens), desc="Generating tokens"):
         budget_reflection_stop = -1
 
     generated_ids = torch.cat([generated_ids, next_token], dim=1)
+    past_key_values = output.past_key_values
 
     if next_token.item() == tokenizer.eos_token_id:
         break
