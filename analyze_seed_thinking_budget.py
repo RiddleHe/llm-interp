@@ -14,12 +14,14 @@ import argparse
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
+import numpy as np
 import json
 
 from utils import (
     plot_budget_token_ranks, 
     plot_hidden_token_ranks,
     plot_attention_weights,
+    plot_key_norms,
 )
 
 parser = argparse.ArgumentParser()
@@ -60,6 +62,13 @@ def capture_attention_hooks(attention_list):
         attention_list.extend(last_two_attns)
         attention_list.append(attn)
     return hook
+
+def calculate_key_norms(keys, n_layers, num_layers_plot): # (bs=1, n_heads, k_len, head_dim)
+    key_norms = {}
+    for i, key in enumerate(keys):
+        key_norm = key[0, ...].norm(dim=-1).norm(dim=0).float().detach().cpu().numpy() # (k_len,)
+        key_norms[n_layers - num_layers_plot - 1 + i] = [key_norm]
+    return key_norms
 
 def main():
     args = parser.parse_args()
@@ -165,6 +174,12 @@ def main():
                 plot_hidden_token_ranks(hidden_token_ranks, step)
 
             if output_attentions:
+                keys = [
+                    past_key_values.layers[layer_idx].keys[:, :, -8:, :] # up to -1 token
+                    for layer_idx in layer_indices
+                ]
+                key_norms = calculate_key_norms(keys, len(past_key_values.layers), num_layers_plot)
+                plot_key_norms(key_norms, step)
                 plot_attention_weights(attention_dict, step)
 
             if args.swap_token:
