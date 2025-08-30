@@ -58,3 +58,55 @@ def plot_hidden_token_ranks(hidden_token_ranks, step):
 
     plt.tight_layout()
     plt.savefig(f"visualizations/budget_token_ranks_hidden_{step}.png")
+
+def plot_attention_weights(attention_dict, step):
+    sorted_layers = sorted(attention_dict.keys())
+
+    prev_pre_attention_matrix = np.stack(
+        [attention_dict[layer_idx][0] for layer_idx in sorted_layers],
+        axis=0
+    )
+    prev_attention_matrix = np.stack(
+        [attention_dict[layer_idx][1] for layer_idx in sorted_layers],
+        axis=0
+    )
+    curr_attention_matrix = np.stack(
+        [attention_dict[layer_idx][2] for layer_idx in sorted_layers],
+        axis=0
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(24, len(sorted_layers)))
+
+    for idx, (attention_matrix, ax, title_suffix) in enumerate(
+        [
+            ([prev_pre_attention_matrix, axes[0], f"Previous step {step -2}"]),
+            ([prev_attention_matrix, axes[1], f"Previous step {step -1}"]),
+            ([curr_attention_matrix, axes[2], f"Current step {step}"])
+        ]
+    ):
+        im = ax.imshow(
+            attention_matrix, cmap="hot",
+            aspect="auto", interpolation="nearest"
+        )
+
+        ax.set_xlabel('Token position', fontsize=12)
+        ax.set_ylabel('Layer', fontsize=12)
+        ax.set_title(f'Attention Scores Heatmap - {title_suffix}', fontsize=14)
+
+        ax.set_yticks(range(len(sorted_layers)))
+        ax.set_yticklabels(sorted_layers)
+
+        token_len = attention_matrix.shape[-1]
+        ax.set_xticks(range(token_len))
+        ax.set_xticklabels(range(- token_len, 0))
+
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Attention Score', rotation=270, labelpad=20)
+
+        ax.set_xticks(np.arange(token_len) - 0.5, minor=True)
+        ax.set_yticks(np.arange(len(sorted_layers)) - 0.5, minor=True)
+
+        ax.grid(which="minor", color="gray", linestyle="-", linewidth=0.3, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f"visualizations/budget_token_attention_weights_{step}.png")
