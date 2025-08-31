@@ -117,7 +117,6 @@ def plot_key_norms(key_norms, step):
         [key_norms[layer_idx][0] for layer_idx in sorted_layers],
         axis=0
     )
-    print(f"norm matrix: {norm_matrix.shape}")
 
     fig, ax = plt.subplots(figsize=(12, len(sorted_layers)))
 
@@ -135,7 +134,7 @@ def plot_key_norms(key_norms, step):
 
     token_len = norm_matrix.shape[-1]
     ax.set_xticks(range(token_len))
-    ax.set_xticklabels(range(- token_len, 0)) # does not include current token
+    ax.set_xticklabels(range(- token_len + 1, 1)) # include current token
 
     cbar = plt.colorbar(im, ax=ax)
     cbar.set_label('K vector norm', rotation=270, labelpad=20)
@@ -146,4 +145,36 @@ def plot_key_norms(key_norms, step):
     ax.grid(which="minor", color="gray", linestyle="-", linewidth=0.3, alpha=0.3)
 
     plt.tight_layout()
-    # plt.savefig(f"visualizations/budget_token_k_norms_{step}.png")
+    plt.savefig(f"visualizations/budget_token_k_norms_{step}.png")
+
+def plot_heatmap_generic(matrix, step, layer_indices, title, cmap="hot"):
+    sorted_layers = sorted(layer_indices)
+
+    fig, ax = plt.subplots(figsize=(12, len(sorted_layers)))
+
+    im = ax.imshow(
+        matrix, cmap=cmap,
+        aspect="auto", interpolation="nearest"
+    )
+
+    ax.set_xlabel('Token position', fontsize=12)
+    ax.set_ylabel('Layer', fontsize=12)
+    ax.set_title(f'{title} at step {step}', fontsize=14)
+
+    ax.set_yticks(range(len(sorted_layers)))
+    ax.set_yticklabels(sorted_layers)
+
+    token_len = matrix.shape[-1]
+    ax.set_xticks(range(token_len))
+    ax.set_xticklabels(range(- token_len + 1, 1)) # including current token
+
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Magnitude', rotation=270, labelpad=20)
+
+    ax.set_xticks(np.arange(token_len) - 0.5, minor=True)
+    ax.set_yticks(np.arange(len(sorted_layers)) - 0.5, minor=True)
+
+    ax.grid(which="minor", color="gray", linestyle="-", linewidth=0.3, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(f"visualizations/budget_token_heatmap_{step}_{'_'.join(title.split(' '))}.png")
