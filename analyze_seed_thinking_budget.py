@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import numpy as np
 import json
 import math
+from contextlib import contextmanager
 
 from utils import (
     plot_budget_token_ranks, 
@@ -45,6 +46,8 @@ parser.add_argument("--output_hidden_states", action="store_true", default=False
 parser.add_argument("--output_attentions", action="store_true", default=False)
 parser.add_argument("--num_layers_plot", type=int, default=8)
 parser.add_argument("--rope", action="store_true", default=False)
+parser.add_argument("--normalize", action="store_true", default=False)
+parser.add_argument("--rerope_current_key", type=int, default=0)
 
 def get_prompt(prompt_type):
     with open(f"prompts.json", "r") as f:
@@ -85,41 +88,94 @@ def compute_query_vectors(last_n_hidden_states, layer_indices, model):
         hidden_state = layer.input_layernorm(hidden_state)
         attn_module = layer.self_attn
         query_vector = attn_module.q_proj(hidden_state)
+
+        n_q_heads = attn_module.num_attention_heads # (attn_dim,)
+        head_dim = query_vector.numel() // n_q_heads
+        query_vector = query_vector.view(n_q_heads, head_dim) # (n_q_heads, head_dim)
         query_vectors.append(query_vector)
     return query_vectors
 
-def conpute_scores_from_scratch(last_n_query_vectors, keys, total_steps=None, model=None):
+def conpute_scores_from_scratch(last_n_query_vectors, keys, total_steps=None, model=None, normalize=False, rerope_current_key=0):
     keys = torch.stack(keys, dim=0) # (n_layers, bs=1, n_heads, k_len, head_dim=128)
     keys = keys.squeeze(1) # (n_layers, n_heads=10, k_len, head_dim) 
 
-    queries = torch.stack(last_n_query_vectors, dim=0) # (n_layers, hidden_dim=128*80)
-    queries = queries.view(queries.shape[0], -1, keys.shape[-1]) # (n_layers, n_heads=80, head_dim=128)
+    queries = torch.stack(last_n_query_vectors, dim=0) # (n_layers, n_q_heads, head_dim)
 
+    head_dim = keys.shape[-1]
+    k_len = keys.shape[-2]
+    
     if total_steps is not None:
-        k_len = keys.shape[-2]
-        head_dim = keys.shape[-1]
-        position_ids = torch.arange(total_steps - k_len + 1, total_steps + 1, device=keys.device).unsqueeze(0)
-        cos, sin = model.model.rotary_emb(keys.new_zeros(1, k_len, head_dim), position_ids=position_ids) # shape of each: (bs, id_lens, head_dim)
-        q_rot, _ = apply_rotary_pos_emb(queries.unsqueeze(2), queries.unsqueeze(2), cos[:, -1:, :], sin[:, -1:, :])
+        position_ids = total_steps - 1
+        cos, sin = model.model.rotary_emb(
+            queries.new_zeros(1, 1, head_dim), position_ids=torch.tensor([[position_ids]], device=queries.device)
+        )
+        q_rot, _ = apply_rotary_pos_emb(queries.unsqueeze(2), queries.unsqueeze(2), cos, sin)
         queries = q_rot.squeeze(2)
 
-    # keys_norm, queries_norm = F.normalize(keys, dim=-1), F.normalize(queries, dim=-1)
-    keys_norm, queries_norm = keys, queries
+    if rerope_current_key != 0:
+        rerope_single_key_inplace(keys, model, rerope_current_key, p_old=total_steps + rerope_current_key, p_new=total_steps - 256)
+
+    if normalize:
+        keys_norm, queries_norm = F.normalize(keys, dim=-1), F.normalize(queries, dim=-1)
+    else:
+        keys_norm, queries_norm = keys, queries
 
     n_layers, n_heads_q, n_heads_k = queries.shape[0], queries.shape[1], keys.shape[1]
     group_size = n_heads_q // n_heads_k
+    assert n_heads_q % n_heads_k == 0, f"GQA, q: {n_heads_q}, k: {n_heads_k}"
 
     # we group the query, not the key, for efficiency :)
     queries_grouped = queries_norm.view(n_layers, n_heads_k, group_size, -1) # (n_layers, n_heads_k=10, group_size=8, head_dim)
     
-    cos_sim = torch.einsum(
-        'lhgd, lhsd->lhgs', queries_grouped, keys_norm # (n_layers, n_heads_k, group_size, k_len)
+    logits = torch.einsum(
+        'lhgd,lhsd->lhgs', queries_grouped, keys_norm # (n_layers, n_heads_k, group_size, k_len)
     )
-    cos_sim = cos_sim.view(n_layers, n_heads_q, -1) # (n_layers, n_heads_q, k_len)
-    cos_sim_mean = cos_sim.mean(dim=1) # (n_layers, k_len)
-    cos_sim_mean = cos_sim_mean / math.sqrt(head_dim)
-    cos_sim_mean = F.softmax(cos_sim_mean, dim=-1)
-    return cos_sim_mean
+    logits = logits.view(n_layers, n_heads_q, -1) # (n_layers, n_heads_q, k_len)
+    if not normalize: logits = logits / math.sqrt(head_dim)
+    scores = F.softmax(logits, dim=-1)
+    scores = scores.mean(dim=1) # compute mean after softmax!!
+
+    scores = scores[:, -8:] # only take last 8 tokens
+    return scores
+
+@torch.no_grad()
+def rerope_single_key_inplace(keys, model, key_index, p_old=None, p_new=None):    
+    target_keys = keys[:, :, key_index, :] # (n_layers, n_heads_k, head_dim)
+    target_keys = target_keys.to(torch.float32).unsqueeze(2) # (n_layers, n_heads_k, 1, head_dim)
+
+    cos_old, sin_old = model.model.rotary_emb(
+        target_keys.new_zeros(1, 1, target_keys.shape[-1]),
+        position_ids=torch.tensor([[p_old]], device=keys.device)
+    )
+    cos_old, sin_old = cos_old.to(keys.device), sin_old.to(keys.device)
+
+    k_content, _ = apply_rotary_pos_emb(target_keys, target_keys, cos_old, -sin_old)
+    
+    cos_new, sin_new = model.model.rotary_emb(
+        target_keys.new_zeros(1, 1, target_keys.shape[-1]),
+        position_ids=torch.tensor([[p_new]], device=keys.device)
+    )
+    cos_new, sin_new = cos_new.to(keys.device), sin_new.to(keys.device)
+
+    k_content_new, _ = apply_rotary_pos_emb(k_content, k_content, cos_new, sin_new)
+
+    keys[:, :, key_index, :] = k_content_new.squeeze(2).to(keys.dtype)
+
+@contextmanager
+def rope_shift(model, delta_steps):
+    rotary = model.model.rotary_emb
+    orig_forward = rotary.forward
+
+    def shifted_forward(x, position_ids=None, **kw):
+        if position_ids is not None:
+            position_ids = position_ids + delta_steps
+        return orig_forward(x, position_ids=position_ids, **kw)
+
+    rotary.forward = shifted_forward
+    try:
+        yield
+    finally:
+        rotary.forward = orig_forward
 
 def main():
     args = parser.parse_args()
@@ -136,6 +192,8 @@ def main():
     output_attentions = args.output_attentions
     num_layers_plot = args.num_layers_plot
     rope = args.rope
+    normalize = args.normalize
+    rerope_current_key = args.rerope_current_key
 
     prompt = get_prompt(prompt_type)
 
@@ -240,10 +298,14 @@ def main():
                         for layer_idx in layer_indices
                     ] # layer_idx shifts -1, which is what we expect
                     last_n_query_vectors = compute_query_vectors(last_n_hidden_states, layer_indices, model)
+                    keys_all = [
+                            output.past_key_values.layers[layer_idx].keys
+                            for layer_idx in layer_indices
+                        ]
                     if rope:
-                        scores = conpute_scores_from_scratch(last_n_query_vectors, keys, step + prompt_len, model)
+                        scores = conpute_scores_from_scratch(last_n_query_vectors, keys_all, step + prompt_len, model, rerope_current_key=rerope_current_key)
                     else:
-                        scores = conpute_scores_from_scratch(last_n_query_vectors, keys)
+                        scores = conpute_scores_from_scratch(last_n_query_vectors, keys_all, normalize=normalize)
                     scores = scores.float().detach().cpu().numpy() # (n_layers, k_len)
                     plot_heatmap_generic(scores, step, layer_indices, "cosine similarity between query and key")
 
@@ -257,15 +319,43 @@ def main():
             elif args.truncate_token:
                 truncate_token = not truncate_token
                 if truncate_token: # new kv, recomputed
-                    if truncate_offset == 0:
-                        print(f"Truncate 0 tokens, regenerating at current step {step}")
-                        continue
-                    generated_ids = generated_ids[:, :-truncate_offset]
-                    # Only choose -truncate_offset from past_key_values
-                    past_key_values.crop(prompt_len + step - truncate_offset)
+                    print(f"Truncate 0 tokens, regenerating at current step {step}")
+                    delta = -256
+                    if rerope_current_key == -2:
+                        abs_prev = prompt_len + step - 1
+                        for layer in range(len(past_key_values.layers)):
+                            k = past_key_values.layers[layer].keys
+                            rerope_single_key_inplace(k, model, key_index=-1, p_old=abs_prev, p_new=abs_prev + delta)
 
-                    print(f"Truncated {truncate_offset} tokens, resetting to step {step - truncate_offset}")
-                    continue
+                        with torch.no_grad():
+                            output = model(
+                                generated_ids if step == 0 else generated_ids[:, -1:],
+                                past_key_values=past_key_values,
+                                use_cache=True,
+                                output_hidden_states=False,
+                                output_attentions=False
+                            )
+
+                    elif rerope_current_key == -1:
+                        past_key_values.crop(prompt_len + step)
+                        with torch.no_grad():
+                            with rope_shift(model, delta_steps=-256):
+                                output = model(
+                                    generated_ids if step == 0 else generated_ids[:, -1:],
+                                    past_key_values=past_key_values,
+                                    use_cache=True,
+                                    output_hidden_states=False,
+                                    output_attentions=False
+                                )
+                    else:
+                        raise ValueError(f"Invalid rerope_current_key")
+
+                    logits = output.logits[:, -1, :]
+                    logits = temp_warper(generated_ids, logits)
+                    logits = top_p_warper(generated_ids, logits)
+                    probs = F.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    past_key_values = output.past_key_values
 
         elif next_token.item() == budget_token_stop: # </seed:cot_budget_reflect>
             budget_reflection_stop = step
