@@ -3,11 +3,10 @@ import torch
 import random
 import argparse
 
-def load_model(model_id):
+def load_model(model_id, attn_implementation):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    attn_implementation = "sdpa"
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.float16,
@@ -72,7 +71,7 @@ def last_logits_full(model, seqs):
     last_logits = out[rows, idx, :]
     return last_logits
 
-def experiment(model_id, seq_len, runs):
+def experiment(model_id, seq_len, runs, attn_implementation):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
 
@@ -80,7 +79,7 @@ def experiment(model_id, seq_len, runs):
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
-    tokenizer, model = load_model(model_id)
+    tokenizer, model = load_model(model_id, attn_implementation)
     target = make_tokens(tokenizer, seq_len)
     ref = last_logits_alone(model, target)
 
@@ -106,10 +105,11 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--runs", type=int, default=6)
+    parser.add_argument("--attn_implementation", default="sdpa")
     args = parser.parse_args()
 
     with torch.no_grad():
-        experiment(args.model, args.seq_len, args.runs)
+        experiment(args.model, args.seq_len, args.runs, args.attn_implementation)
 
 if __name__ == "__main__":
     main()
