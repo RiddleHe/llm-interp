@@ -2,6 +2,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import random
 import argparse
+import os
 
 def add_common_determinism_flags():
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -10,6 +11,31 @@ def add_common_determinism_flags():
     random.seed(42)
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
+
+def print_env_summary():
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    print(f"[Env] torch={torch.__version__} | cuda={torch.version.cuda} | device={gpu}")
+    try:
+        import flash_attn
+        ver = getattr(flash_attn, "__version__", "unknown")
+        print(f"[Env] flash_attn={ver}")
+    except Exception as e:
+        print(f"[Env] flash_attn import failed: {e}")
+
+def configure_fa2_deterministic(enabled, split_size, reduction_tree):
+    os.environ["FA2_DETERMINISTIC"] = "1" if enabled else "0"
+    if split_size is not None:
+        os.environ["FA2_SPLIT_SIZE"] = str(int(split_size))
+    if reduction_tree:
+        os.environ["FA2_REDUCTION_TREE"] = reduction_tree
+    
+    try:
+        import flash_attn
+        if hasattr(flash_attn, "set_deterministic_mode"):
+            flash_attn.set_deterministic_mode(enabled=enabled, split_size=split_size, reduction_tree=reduction_tree)
+    except Exception as e:
+        if enabled:
+            print(f"[Warning] Could not call flash_attn.set_deterministic_model: {e} (falling back to env vars)")
 
 def load_model(model_id, attn_implementation, dtype):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -154,7 +180,24 @@ def main():
     parser.add_argument("--mode", choices=["batch", "prefill"], default="batch")
     parser.add_argument("--chunk_sizes", default="512,256,128,32")
     parser.add_argument("--dtype", choices=['float16', 'float32', 'bfloat16'], default='float16')
+    # fa2 deterministic
+    parser.add_argument("--fa2_deterministic", action="store_true")
+    parser.add_argument("--fa2_split_size", type=int, default=None)
+    parser.add_argument("--fa2_reduction_tree", choices=["pairwise", "linear", "kary"], default="pairwise")
+    parser.add_argument("--fa2_verbose", action="store_true")
     args = parser.parse_args()
+
+    if args.fa2_verbose:
+        print_env_summary()
+
+    if args.fa2_deterministic and args.attn_implementation != "flash_attention_2":
+        print(f"[Warning] --fa2_deterministic requested but attn_implementation is not flash_attention+_2")
+
+    configure_fa2_deterministic(
+        enabled=args.fa2_deterministic,
+        split_size=args.fa2_split_size,
+        reduction_tree=args.fa2_reduction_tree,
+    )
 
     with torch.no_grad():
         if args.mode == "batch":
