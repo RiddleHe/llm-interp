@@ -212,7 +212,7 @@ def main():
     parser.add_argument("--seq_lens", default="4096,6144")
     parser.add_argument("--batch_sizes", default="1,2,4,8,16")
     # fa2 deterministic
-    parser.add_argument("--fa2_deterministic", action="store_true")
+    parser.add_argument("--fa2_deterministic", action="store_true") # TODO: experimental feature, not working
     parser.add_argument("--fa2_split_size", type=int, default=None)
     parser.add_argument("--fa2_verbose", action="store_true")
     args = parser.parse_args()
