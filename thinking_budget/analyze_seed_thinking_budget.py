@@ -26,7 +26,7 @@ from utils import (
     plot_key_norms,
     plot_heatmap_generic
 )
-from modules.rope import *
+from rope import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--token_budget", type=int, default=1024)
