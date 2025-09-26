@@ -22,17 +22,15 @@ def print_env_summary():
     except Exception as e:
         print(f"[Env] flash_attn import failed: {e}")
 
-def configure_fa2_deterministic(enabled, split_size, reduction_tree):
+def configure_fa2_deterministic(enabled, split_size):
     os.environ["FA2_DETERMINISTIC"] = "1" if enabled else "0"
     if split_size is not None:
         os.environ["FA2_SPLIT_SIZE"] = str(int(split_size))
-    if reduction_tree:
-        os.environ["FA2_REDUCTION_TREE"] = reduction_tree
     
     try:
         import flash_attn
         if hasattr(flash_attn, "set_deterministic_mode"):
-            flash_attn.set_deterministic_mode(enabled=enabled, split_size=split_size, reduction_tree=reduction_tree)
+            flash_attn.set_deterministic_mode(enabled=enabled, split_size=split_size)
     except Exception as e:
         if enabled:
             print(f"[Warning] Could not call flash_attn.set_deterministic_model: {e} (falling back to env vars)")
@@ -121,7 +119,7 @@ def last_logits_chunked_prefill(model, ids, chunk_size):
         cur = ids[:, pos: min(pos + chunk_size, L)]
         cur_len = cur.size(1)
         cum_len = pos + cur_len
-        attn = torch.ones((1, cum_len), dtype=torch.long, device=model.device)
+        attn = torch.ones((B, cum_len), dtype=torch.long, device=model.device)
         
         out = model(
             input_ids=cur,
@@ -134,29 +132,59 @@ def last_logits_chunked_prefill(model, ids, chunk_size):
         pos += cur_len
     return last_logits
 
-def experiment_batch(model_id, seq_len, runs, attn_implementation, dtype):
+@torch.no_grad()
+def decode_step_batched(model, seqs):
+    """Simulate a single decoding step with a long kv cache."""
+    pad_id = model.config.pad_token_id
+    lengths = [t.shape[1] for t in seqs]
+    pre_ids = [t[:, :-1] for t in seqs]
+    cur_ids = [t[:, -1:] for t in seqs]
+    max_pre = max(l - 1 for l in lengths)
+
+    pre_padded, pre_masks = [], []
+    for x, l in zip(pre_ids, lengths):
+        need = max_pre - (l - 1)
+        if need:
+            x = torch.cat([x, x.new_full((1, need), pad_id)], dim=1)
+        pre_padded.append(x)
+        m = torch.zeros_like(x, dtype=torch.long, device=model.device)
+        m[:, :l-1] = 1
+        pre_masks.append(m)
+    
+    Xpre = torch.cat(pre_padded, dim=0).to(model.device)
+    Mpre = torch.cat(pre_masks, dim=0).to(model.device)
+    out = model(Xpre, attention_mask=Mpre, use_cache=True)
+    past = out.past_key_values
+
+    cur = torch.cat(cur_ids, dim=0).to(model.device)
+    Mdec = torch.zeros((len(seqs), max_pre + 1), dtype=torch.long, device=model.device)
+    for i, l in enumerate(lengths):
+        Mdec[i, :l] = 1
+    out2 = model(cur, attention_mask=Mdec, past_key_values=past, use_cache=True)
+    return out2.logits[:, -1, :]
+
+def experiment_split_kv(model_id, seq_lens, batch_sizes, attn_implementation, dtype):
     add_common_determinism_flags()
-
     tokenizer, model = load_model(model_id, attn_implementation, dtype)
-    target = make_tokens(tokenizer, seq_len)
-    ref = last_logits_oneshot_prefill(model, target)
 
-    lengths = [63, 127, 255, 511,1023]
-    batch_sizes = [1, 2, 4, 8, 16, 32]
+    for L in seq_lens:
+        target = make_tokens(tokenizer, L)
+        ref_logits = decode_step_batched(model, [target])
+        ref = ref_logits[0:1, :]
 
-    for i in range(runs):
-        B = batch_sizes[i % len(batch_sizes)]
-        distractors = [
-            make_tokens(tokenizer, max(4, lengths[(i+j) % len(lengths)]))
-            for j in range(max(0, B-1))
-        ]
-        pos = (i * 2) % max(1, B)
-        seqs = distractors[:pos] + [target] + distractors[pos:]
-        logits = last_logits_full(model, seqs)
-        cur = logits[pos:pos+1, :]
-        
-        stats = diff_stats(ref, cur)
-        print(f"[Batch] Run {i+1:02d}: B={len(seqs):2d} target_pos={pos:2d} -> max_abs={stats['max_abs']:.8e} | mean_abs={stats['mean_abs']:.8e} | rel_l2={stats['rel_l2']:.8e}")
+        for B in batch_sizes:
+            distractors = [
+                make_tokens(tokenizer, max(4, L-1))
+                for j in range(B - 1)
+            ]
+            pos = 0
+            seqs = [target] + distractors
+
+            logits = decode_step_batched(model, seqs)
+            cur = logits[pos:pos+1, :]
+            stats = diff_stats(ref, cur)
+            print(f"[SplitKV] B={B:2d} seq_len={L:4d} -> "
+                f"max_abs={stats['max_abs']:.8e} | mean_abs={stats['mean_abs']:.8e} | rel_l2={stats['rel_l2']:.8e}")
 
 def experiment_prefill(model_id, seq_len, chunk_sizes, attn_implementation, dtype):
     add_common_determinism_flags()
@@ -174,16 +202,18 @@ def experiment_prefill(model_id, seq_len, chunk_sizes, attn_implementation, dtyp
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
-    parser.add_argument("--seq_len", type=int, default=512)
-    parser.add_argument("--runs", type=int, default=6)
     parser.add_argument("--attn_implementation", choices=['flash_attention_2', 'sdpa'], default="flash_attention_2")
-    parser.add_argument("--mode", choices=["batch", "prefill"], default="batch")
-    parser.add_argument("--chunk_sizes", default="512,256,128,32")
+    parser.add_argument("--mode", choices=["split_kv", "prefill"], default="split_kv")
     parser.add_argument("--dtype", choices=['float16', 'float32', 'bfloat16'], default='float16')
+    # prefill
+    parser.add_argument("--chunk_sizes", default="512,256,128,32")
+    parser.add_argument("--seq_len", type=int, default=512)
+    # split_kv
+    parser.add_argument("--seq_lens", default="4096,6144")
+    parser.add_argument("--batch_sizes", default="1,2,4,8,16")
     # fa2 deterministic
     parser.add_argument("--fa2_deterministic", action="store_true")
     parser.add_argument("--fa2_split_size", type=int, default=None)
-    parser.add_argument("--fa2_reduction_tree", choices=["pairwise", "linear", "kary"], default="pairwise")
     parser.add_argument("--fa2_verbose", action="store_true")
     args = parser.parse_args()
 
@@ -196,15 +226,16 @@ def main():
     configure_fa2_deterministic(
         enabled=args.fa2_deterministic,
         split_size=args.fa2_split_size,
-        reduction_tree=args.fa2_reduction_tree,
     )
 
     with torch.no_grad():
-        if args.mode == "batch":
-            experiment_batch(args.model, args.seq_len, args.runs, args.attn_implementation, args.dtype)
-        else:
+        if args.mode == "prefill":
             chunk_sizes = [int(s) for s in args.chunk_sizes.split(",") if s.strip()]
             experiment_prefill(args.model, args.seq_len, chunk_sizes, args.attn_implementation, args.dtype)
+        elif args.mode == "split_kv":
+            seq_lens = [int(x) for x in args.seq_lens.split(",") if x.strip()]
+            batch_sizes = [int(x) for x in args.batch_sizes.split(",") if x.strip()]
+            experiment_split_kv(args.model, seq_lens, batch_sizes, args.attn_implementation, args.dtype)
 
 if __name__ == "__main__":
     main()
