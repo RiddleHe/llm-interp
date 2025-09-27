@@ -22,6 +22,54 @@ def print_env_summary():
     except Exception as e:
         print(f"[Env] flash_attn import failed: {e}")
 
+def _enable_fa2():
+    from transformers.models.qwen3 import modeling_qwen3 as qwen_mod
+
+    orig = qwen_mod.ALL_ATTENTION_FUNCTIONS.get("flash_attention_2")
+    if orig is None:
+        print(f"[Patch] flash_attention_2 not found for qwen3")
+        return
+
+    import flash_attn
+    
+    def fa2_wrapper(self, q, k, v, attn_mask, *, dropout, scaling, sliding_window, **kwargs):
+        try:
+            is_decode = q.dim() == 4 and q.size(2) == 1
+            no_mask = attn_mask is None
+            if dropout == 0.0 and (sliding_window is None) and is_decode and no_mask:
+                k_cache = k[:, :, :-1, :]
+                v_cache = v[:, :, :-1, :]
+                k_new = k[:, :, -1:, :]
+                v_new = v[:, :, -1:, :]
+
+                # n_rep = self.num_key_value_groups
+                # k = qwen_mod.repeat_kv(k, n_rep)
+                # v = qwen_mod.repeat_kv(v, n_rep)
+
+                q_ = q.transpose(1, 2).contiguous() # (B, S, H, D) for fa2
+                k_cache = k_cache.transpose(1, 2).contiguous()
+                v_cache = v_cache.transpose(1, 2).contiguous()
+                k_new = k_new.transpose(1, 2).contiguous()
+                v_new = v_new.transpose(1, 2).contiguous()
+
+                out = flash_attn.flash_attn_with_kvcache(
+                    q=q_, k_cache=k_cache, v_cache=v_cache, k=k_new, v=v_new,
+                    cache_seqlens=k_cache.size(1), softmax_scale=scaling, causal=True,
+                    num_splits=0
+                )
+                return out, None
+            else:
+                return orig(
+                    self, q, k, v, attn_mask, dropout=dropout, scaling=scaling, sliding_window=sliding_window, **kwargs
+                )
+        except Exception as e:
+            print(f"[Patch] error in patched flash_attention_2: {e}")
+            return orig(
+                self, q, k, v, attn_mask, dropout=dropout, scaling=scaling, sliding_window=sliding_window, **kwargs
+            )
+
+    qwen_mod.ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = fa2_wrapper
+
 def configure_fa2_deterministic(enabled, split_size):
     os.environ["FA2_DETERMINISTIC"] = "1" if enabled else "0"
     if split_size is not None:
@@ -29,11 +77,10 @@ def configure_fa2_deterministic(enabled, split_size):
     
     try:
         import flash_attn
-        if hasattr(flash_attn, "set_deterministic_mode"):
-            flash_attn.set_deterministic_mode(enabled=enabled, split_size=split_size)
+        print(f"[Env] flash_attn file ={flash_attn.__file__}")
+        flash_attn.set_deterministic_mode(enabled=enabled, split_size=split_size)
     except Exception as e:
-        if enabled:
-            print(f"[Warning] Could not call flash_attn.set_deterministic_model: {e} (falling back to env vars)")
+        print(f"[Warning] Could not call flash_attn.set_deterministic_mode: {e} (falling back to stock implementation)")
 
 def load_model(model_id, attn_implementation, dtype):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -157,10 +204,10 @@ def decode_step_batched(model, seqs):
     past = out.past_key_values
 
     cur = torch.cat(cur_ids, dim=0).to(model.device)
-    Mdec = torch.zeros((len(seqs), max_pre + 1), dtype=torch.long, device=model.device)
-    for i, l in enumerate(lengths):
-        Mdec[i, :l] = 1
-    out2 = model(cur, attention_mask=Mdec, past_key_values=past, use_cache=True)
+    # Mdec = torch.zeros((len(seqs), max_pre + 1), dtype=torch.long, device=model.device)
+    # for i, l in enumerate(lengths):
+    #     Mdec[i, :l] = 1
+    out2 = model(cur, attention_mask=None, past_key_values=past, use_cache=True)
     return out2.logits[:, -1, :]
 
 def experiment_split_kv(model_id, seq_lens, batch_sizes, attn_implementation, dtype):
@@ -174,7 +221,7 @@ def experiment_split_kv(model_id, seq_lens, batch_sizes, attn_implementation, dt
 
         for B in batch_sizes:
             distractors = [
-                make_tokens(tokenizer, max(4, L-1))
+                make_tokens(tokenizer, max(4, L))
                 for j in range(B - 1)
             ]
             pos = 0
@@ -212,21 +259,23 @@ def main():
     parser.add_argument("--seq_lens", default="4096,6144")
     parser.add_argument("--batch_sizes", default="1,2,4,8,16")
     # fa2 deterministic
+    parser.add_argument("--use_fa2_repo", action="store_true")
     parser.add_argument("--fa2_deterministic", action="store_true") # TODO: experimental feature, not working
     parser.add_argument("--fa2_split_size", type=int, default=None)
     parser.add_argument("--fa2_verbose", action="store_true")
     args = parser.parse_args()
 
-    if args.fa2_verbose:
-        print_env_summary()
+    if args.use_fa2_repo:
+        assert args.attn_implementation == "flash_attention_2", f"[Error] --use_fa2_repo requested but attn_implementation is not flash_attention_2"
 
-    if args.fa2_deterministic and args.attn_implementation != "flash_attention_2":
-        print(f"[Warning] --fa2_deterministic requested but attn_implementation is not flash_attention+_2")
+        configure_fa2_deterministic(
+            enabled=args.fa2_deterministic,
+            split_size=args.fa2_split_size,
+        )
+        _enable_fa2()
 
-    configure_fa2_deterministic(
-        enabled=args.fa2_deterministic,
-        split_size=args.fa2_split_size,
-    )
+        if args.fa2_verbose:
+            print_env_summary()
 
     with torch.no_grad():
         if args.mode == "prefill":
