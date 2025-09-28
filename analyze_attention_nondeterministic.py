@@ -1,8 +1,11 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import random
 import argparse
 import os
+import copy
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.cache_utils import DynamicCache
 
 def add_common_determinism_flags():
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -42,20 +45,18 @@ def _enable_fa2():
                 k_new = k[:, :, -1:, :]
                 v_new = v[:, :, -1:, :]
 
-                # n_rep = self.num_key_value_groups
-                # k = qwen_mod.repeat_kv(k, n_rep)
-                # v = qwen_mod.repeat_kv(v, n_rep)
-
                 q_ = q.transpose(1, 2).contiguous() # (B, S, H, D) for fa2
                 k_cache = k_cache.transpose(1, 2).contiguous()
                 v_cache = v_cache.transpose(1, 2).contiguous()
                 k_new = k_new.transpose(1, 2).contiguous()
                 v_new = v_new.transpose(1, 2).contiguous()
 
+                # print(f"[Patch] with_kvcache used: B={q.size(0)} S_cache={k_cache.size(1)}")
+
                 out = flash_attn.flash_attn_with_kvcache(
                     q=q_, k_cache=k_cache, v_cache=v_cache, k=k_new, v=v_new,
                     cache_seqlens=k_cache.size(1), softmax_scale=scaling, causal=True,
-                    num_splits=0
+                    num_splits=1
                 )
                 return out, None
             else:
@@ -179,56 +180,68 @@ def last_logits_chunked_prefill(model, ids, chunk_size):
         pos += cur_len
     return last_logits
 
-@torch.no_grad()
-def decode_step_batched(model, seqs):
-    """Simulate a single decoding step with a long kv cache."""
-    pad_id = model.config.pad_token_id
-    lengths = [t.shape[1] for t in seqs]
-    pre_ids = [t[:, :-1] for t in seqs]
-    cur_ids = [t[:, -1:] for t in seqs]
-    max_pre = max(l - 1 for l in lengths)
-
-    pre_padded, pre_masks = [], []
-    for x, l in zip(pre_ids, lengths):
-        need = max_pre - (l - 1)
-        if need:
-            x = torch.cat([x, x.new_full((1, need), pad_id)], dim=1)
-        pre_padded.append(x)
-        m = torch.zeros_like(x, dtype=torch.long, device=model.device)
-        m[:, :l-1] = 1
-        pre_masks.append(m)
-    
-    Xpre = torch.cat(pre_padded, dim=0).to(model.device)
-    Mpre = torch.cat(pre_masks, dim=0).to(model.device)
-    out = model(Xpre, attention_mask=Mpre, use_cache=True)
-    past = out.past_key_values
-
-    cur = torch.cat(cur_ids, dim=0).to(model.device)
-    # Mdec = torch.zeros((len(seqs), max_pre + 1), dtype=torch.long, device=model.device)
-    # for i, l in enumerate(lengths):
-    #     Mdec[i, :l] = 1
-    out2 = model(cur, attention_mask=None, past_key_values=past, use_cache=True)
-    return out2.logits[:, -1, :]
-
 def experiment_split_kv(model_id, seq_lens, batch_sizes, attn_implementation, dtype):
     add_common_determinism_flags()
     tokenizer, model = load_model(model_id, attn_implementation, dtype)
+    device = model.device
+    pad_id = model.config.pad_token_id
+
+    def cat_pastkv(past_a, past_b):
+        past_a = past_a.to_legacy_cache()
+        past_b = past_b.to_legacy_cache()
+        if isinstance(past_a, tuple) and len(past_a) > 0 and isinstance(past_a[0], tuple):
+            merged_layers = []
+            for la, lb in zip(past_a, past_b):
+                merged_layer = []
+                for ta, tb in zip(la, lb):
+                    if isinstance(ta, torch.Tensor) and isinstance(tb, torch.Tensor):
+                        merged_layer.append(torch.cat([ta, tb], dim=0))
+                    else:
+                        merged_layer.append(ta)
+                merged_layers.append(tuple(merged_layer))
+            return tuple(merged_layers)
+        raise RuntimeError("Unsupported past_key_values format.")
 
     for L in seq_lens:
         target = make_tokens(tokenizer, L)
-        ref_logits = decode_step_batched(model, [target])
-        ref = ref_logits[0:1, :]
+
+        pre_t = target[:, :-1].to(device) # cache
+        attn_t = torch.ones_like(pre_t, dtype=torch.long, device=device)
+        out_t = model(pre_t, attention_mask=attn_t, use_cache=True)
+        past_t = out_t.past_key_values
+        cur_t = target[:, -1:].to(device)
+
+        # reference 
+        out_ref = model(cur_t, attention_mask=None, past_key_values=copy.deepcopy(past_t), use_cache=True)
+        ref = out_ref.logits[0:1, -1, :]
 
         for B in batch_sizes:
-            distractors = [
-                make_tokens(tokenizer, max(4, L))
-                for j in range(B - 1)
-            ]
-            pos = 0
-            seqs = [target] + distractors
+            if B == 1:
+                stats = diff_stats(ref, ref)
+                print(f"[SplitKV] B={B:2d} seq_len={L:4d} -> "
+                    f"max_abs={stats['max_abs']:.8e} | mean_abs={stats['mean_abs']:.8e} | rel_l2={stats['rel_l2']:.8e}")
+                continue
 
-            logits = decode_step_batched(model, seqs)
-            cur = logits[pos:pos+1, :]
+            else:
+                distractors = [
+                    make_tokens(tokenizer, L)
+                    for j in range(B - 1)
+                ] # equal length for all sequences in the batch
+                pre_ids = torch.cat([x[:, :-1] for x in distractors], dim=0).to(device) # batch cache
+                pre_masks = torch.ones_like(pre_ids, dtype=torch.long, device=device)
+
+                out_d = model(pre_ids, attention_mask=pre_masks, use_cache=True)
+                past_d = out_d.past_key_values
+
+                merged_past = cat_pastkv(past_t, past_d)
+                merged_past = DynamicCache.from_legacy_cache(merged_past)
+                cur_d = torch.cat([x[:, -1:] for x in distractors], dim=0).to(device)
+                cur_all = torch.cat([cur_t, cur_d], dim=0)
+            
+            out = model(cur_all, attention_mask=None, past_key_values=merged_past, use_cache=True)
+            logits = out.logits
+            cur = logits[0:1, -1, :]
+
             stats = diff_stats(ref, cur)
             print(f"[SplitKV] B={B:2d} seq_len={L:4d} -> "
                 f"max_abs={stats['max_abs']:.8e} | mean_abs={stats['mean_abs']:.8e} | rel_l2={stats['rel_l2']:.8e}")
