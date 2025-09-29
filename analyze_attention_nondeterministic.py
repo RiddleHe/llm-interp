@@ -6,6 +6,9 @@ import copy
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
+from transformers.models.qwen3 import modeling_qwen3 as qwen_mod
+import flash_attn
+import flash_attn_2_cuda as fa2_cuda
 
 def add_common_determinism_flags():
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -26,14 +29,10 @@ def print_env_summary():
         print(f"[Env] flash_attn import failed: {e}")
 
 def _enable_fa2():
-    from transformers.models.qwen3 import modeling_qwen3 as qwen_mod
-
     orig = qwen_mod.ALL_ATTENTION_FUNCTIONS.get("flash_attention_2")
     if orig is None:
         print(f"[Patch] flash_attention_2 not found for qwen3")
         return
-
-    import flash_attn
     
     def fa2_wrapper(self, q, k, v, attn_mask, *, dropout, scaling, sliding_window, **kwargs):
         try:
@@ -91,7 +90,7 @@ def load_model(model_id, attn_implementation, dtype):
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         device_map="auto",
         attn_implementation=attn_implementation,
     )
@@ -180,7 +179,95 @@ def last_logits_chunked_prefill(model, ids, chunk_size):
         pos += cur_len
     return last_logits
 
-def experiment_split_kv(model_id, seq_lens, batch_sizes, attn_implementation, dtype):
+def experiment_split_kv(model_id, seq_lens, batch_sizes, attn_implementation, dtype, layer_idx=-1):
+    add_common_determinism_flags()
+    tokenizer, model = load_model(model_id, attn_implementation, dtype)
+    device = model.device
+
+    for L in seq_lens:
+        target = make_tokens(tokenizer, L)
+        pre_t = target[:, :-1].to(device)
+        attn_t = torch.ones_like(pre_t, dtype=torch.long, device=device)
+        out_t = model(pre_t, attention_mask=attn_t, use_cache=True)
+        past_t_cache = out_t.past_key_values
+        frozen_past_t = past_t_cache.to_legacy_cache()
+        k_cache_t, v_cache_t = frozen_past_t[layer_idx]
+
+        q_cap = {"q": None, "k_new": None, "v_new": None, "scale": None}
+        attn_mod = model.model.layers[layer_idx].self_attn
+
+        def pre_hook(module, args, kwargs):
+            """A hook to capture the q, k_new, and v_new at the single decoding step"""
+            hidden_states = kwargs.get("hidden_states")
+            cos, sin = kwargs.get("position_embeddings")
+            B, S, _ = hidden_states.shape
+            Hq, Hkv, D = module.config.num_attention_heads, module.config.num_key_value_heads, module.head_dim
+            q = module.q_proj(hidden_states).view(B, S, Hq, D)
+            k = module.k_proj(hidden_states).view(B, S, Hkv, D)
+            v = module.v_proj(hidden_states).view(B, S, Hkv, D)
+
+            q = module.q_norm(q).transpose(1, 2) # (B, Hq, S, D)
+            k = module.k_norm(k).transpose(1, 2) # (B, Hkv, S, D)
+            v = v.transpose(1, 2)
+
+            q, k = qwen_mod.apply_rotary_pos_emb(q, k, cos, sin)
+            q_cap["q"] = q.detach().contiguous()
+            q_cap["k_new"] = k.detach().contiguous()
+            q_cap["v_new"] = v.detach().contiguous()
+            q_cap["scale"] = float(module.scaling)
+
+        h = attn_mod.register_forward_pre_hook(pre_hook, with_kwargs=True)
+        try:
+            cur_t = target[:, -1:].to(device)
+            _ = model(cur_t, attention_mask=None, past_key_values=past_t_cache, use_cache=True)
+        finally:
+            h.remove()
+
+        # Transpose for FA
+        q_t = q_cap["q"].transpose(1, 2).contiguous()
+        k_new_t = q_cap["k_new"].transpose(1, 2).contiguous()
+        v_new_t = q_cap["v_new"].transpose(1, 2).contiguous()
+        scale = q_cap["scale"]
+        cache_len_1 = torch.tensor([k_cache_t.size(2)], dtype=torch.int32, device=device)
+        assert q_t.size(1) == k_new_t.size(1) == v_new_t.size(1) == 1, f"q_t, k_new_t, v_new_t must have seq_len=1, but get: q_t={q_t.size(1)}, k_new_t={k_new_t.size(1)}, v_new_t={v_new_t.size(1)}"
+
+        out_ref = flash_attn.flash_attn_with_kvcache(
+            q=q_t, 
+            k_cache=k_cache_t.transpose(1, 2).contiguous(),
+            v_cache=v_cache_t.transpose(1, 2).contiguous(),
+            k=k_new_t,
+            v=v_new_t,
+            cache_seqlens=cache_len_1, softmax_scale=scale, causal=True, 
+            num_splits=0
+        )
+        ref_ctx = out_ref[0:1, -1, :, :].reshape(1, -1).detach() # (1, Hq * D)
+
+        for B in batch_sizes:
+            if B == 1:
+                stats = diff_stats(ref_ctx, ref_ctx)
+                print(f"[AttnKernel] B={B:2d} seq_len={L:4d} -> "
+                    f"max_abs={stats['max_abs']:.8e} | mean_abs={stats['mean_abs']:.8e} | rel_l2={stats['rel_l2']:.8e}")
+                continue
+
+            q_b = q_t.expand(B, -1, -1, -1).contiguous().clone()
+            k_b = k_new_t.expand(B, -1, -1, -1).contiguous().clone()
+            v_b = v_new_t.expand(B, -1, -1, -1).contiguous().clone()
+            k_cache_b = k_cache_t.transpose(1, 2).contiguous().expand(B, -1, -1, -1).contiguous().clone()
+            v_cache_b = v_cache_t.transpose(1, 2).contiguous().expand(B, -1, -1, -1).contiguous().clone()
+            cache_lens = torch.full((B,), k_cache_t.size(2), dtype=torch.int32, device=device)
+
+            out_b = flash_attn.flash_attn_with_kvcache(
+                q=q_b, k_cache=k_cache_b, v_cache=v_cache_b, k=k_b, v=v_b,
+                cache_seqlens=cache_lens, softmax_scale=scale, causal=True,
+                num_splits=0
+            )
+            # assert torch.allclose(out_b[0], out_b[1], atol=0, rtol=0), f"Rows differ at B={B}; inputs are not identical"
+            cur_ctx = out_b[0:1, -1, :, :].reshape(1, -1).detach()
+            stats = diff_stats(ref_ctx, cur_ctx)
+            print(f"[AttnKernel] B={B:2d} seq_len={L:4d} -> "
+                    f"max_abs={stats['max_abs']:.8e} | mean_abs={stats['mean_abs']:.8e} | rel_l2={stats['rel_l2']:.8e}")
+
+def experiment_batch(model_id, seq_lens, batch_sizes, attn_implementation, dtype):
     add_common_determinism_flags()
     tokenizer, model = load_model(model_id, attn_implementation, dtype)
     device = model.device
@@ -273,7 +360,7 @@ def main():
     parser.add_argument("--batch_sizes", default="1,2,4,8,16")
     # fa2 deterministic
     parser.add_argument("--use_fa2_repo", action="store_true")
-    parser.add_argument("--fa2_deterministic", action="store_true") # TODO: experimental feature, not working
+    parser.add_argument("--fa2_deterministic", action="store_true")
     parser.add_argument("--fa2_split_size", type=int, default=None)
     parser.add_argument("--fa2_verbose", action="store_true")
     args = parser.parse_args()
