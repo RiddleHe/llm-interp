@@ -1,9 +1,11 @@
-import argparse, os, numpy as np, torch, matplotlib.pyplot as plt
+import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch.nn.functional as F
 
 EPS = 1e-8
 PRINT_CHOICES = ["heatmap", "log"]
+
+# Perturbation & loading functions
 
 def load_model(model_name, device, dtype):
     torch_dtype = {"auto": "auto", "bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -17,40 +19,6 @@ def load_model(model_name, device, dtype):
 def tokenize(tok, text):
     enc = tok(text, return_tensors="pt", add_special_tokens=True)
     return enc["input_ids"]
-
-def _parse_qpos(arg, seq_len):
-    if arg:
-        return [max(0, min(seq_len - 1, int(x))) for x in arg.split(",")]
-    last = seq_len - 1
-    two_thirds = max(0, (2 * seq_len) // 3 - 1)
-    one_third = max(0, seq_len // 3 - 1)
-    q_positions = sorted({one_third, two_thirds, last})
-    return q_positions
-
-def run_cosine(tok, model, input_ids, position_ids, layer, head, qpos_arg):
-    cache = {}
-    _capture_qk(model, layer, cache)
-    attns = prefill(model, input_ids, position_ids)
-    hook = cache.pop("_hook", None)
-    if hook is not None:
-        hook.remove()
-
-    q, k = cache["q"], cache["k"]
-    seq_len = q.shape[2]
-    q_positions = list(_parse_qpos(qpos_arg, seq_len))
-    series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=0, q_positions=q_positions)
-    attn_mat = attns[layer][0, head].detach().float().cpu()
-
-    print(f"Cosine (Q[q_idx], k[0]) layer={layer} head={head}")
-    cos_vals = []
-    for qi, cos in series:
-        attn_to_sink = float(attn_mat[qi, 0].item())
-        print(f"  q={qi}\tcos={cos:.6f}\tattn={attn_to_sink:.6f}")
-        cos_vals.append(cos)
-    return {
-        "layer": layer, "head": head, "q_positions": q_positions,
-        "cos": cos_vals, "k_norm": float(k_norm)
-    }
 
 def make_position_ids(seq_len):
     return torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
@@ -78,6 +46,41 @@ def apply_perturbations(base_pos, rope_overrides=None, mask=None):
         applied["mask"] = True
     return pos_ids, applied
 
+# Parsing functions
+
+def parse_overrides(s):
+    """'12=0,42=1' -> [(12,0),(42,1)]"""
+    if not s: return []
+    out = []
+    for part in s.split(","):
+        if not part: continue
+        ti, rp = part.split("=")
+        out.append((int(ti), int(rp)))
+    return out
+
+def _parse_qpos(arg, seq_len):
+    if arg:
+        return [max(0, min(seq_len - 1, int(x))) for x in arg.split(",")]
+    last = seq_len - 1
+    two_thirds = max(0, (2 * seq_len) // 3 - 1)
+    one_third = max(0, seq_len // 3 - 1)
+    q_positions = sorted({one_third, two_thirds, last})
+    return q_positions
+
+# Forward & capture functions
+
+def _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False):
+    cache = {}
+    if need_qkv:
+        _capture_qkv(model, layer, cache)
+    attns = prefill(model, input_ids, position_ids)
+    hook = cache.pop("_hook", None)
+    if hook is not None:
+        hook.remove()
+
+    q, k, v = cache.get("q", None), cache.get("k", None), cache.get("v", None)
+    return attns, q, k, v
+
 @torch.no_grad()
 def prefill(model, input_ids, position_ids):
     device = next(model.parameters()).device
@@ -90,9 +93,92 @@ def prefill(model, input_ids, position_ids):
     )
     return out.attentions # tuple(len=layers) of [B, H, Q, K]
 
+def _capture_qkv(model, layer_idx, cache):
+    attn = model.model.layers[layer_idx].self_attn
+    num_heads = model.config.num_attention_heads
+    num_kv = model.config.num_key_value_heads
+    num_groups = max(1, num_heads // max(1, num_kv))
+    head_dim = model.config.head_dim
+
+    def hook(_module, args, kwargs):
+        hidden_states = kwargs["hidden_states"]
+        cos, sin = kwargs["position_embeddings"]
+        B, S, _ = hidden_states.shape
+
+        q = attn.q_proj(hidden_states).view(B, S, num_heads, head_dim)
+        k = attn.k_proj(hidden_states).view(B, S, num_kv, head_dim)
+        v = attn.v_proj(hidden_states).view(B, S, num_kv, head_dim)
+        q = attn.q_norm(q).transpose(1, 2).contiguous()
+        k = attn.k_norm(k).transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+
+        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if num_kv != num_heads:
+            k = k.repeat_interleave(num_groups, dim=1)
+            v = v.repeat_interleave(num_groups, dim=1)
+        cache["q"] = q.detach().float().cpu()
+        cache["k"] = k.detach().float().cpu()
+        cache["v"] = v.detach().float().cpu()
+
+    h = attn.register_forward_pre_hook(hook, with_kwargs=True)
+    cache["_hook"] = h
+
+def compute_cosine_series(q, k, head_idx, k_sink_idx, q_positions):
+    kv = k[0, head_idx, k_sink_idx]
+    kn = F.normalize(kv, dim=0)
+
+    series = []
+    for qi in q_positions:
+        qv = q[0, head_idx, qi]
+        qn = F.normalize(qv, dim=0)
+        cos = float(torch.dot(qn, kn))
+        series.append((qi, cos))
+    return series, float(kv.norm().item())
+
+# Run functions
+
+def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg):
+    attns, q, k, v = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=True)
+    if q is None or k is None:
+        raise RuntimeError("Failed to capture Q/K.")
+
+    seq_len = q.shape[2]
+    q_positions = list(_parse_qpos(qpos_arg, seq_len))
+    series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=0, q_positions=q_positions)
+    v_norm = float(v[0, head, 0].norm().item())
+    attn_mat = attns[layer][0, head].detach().float().cpu()
+
+    print(f"Cosine (Q[q_idx], k[0]) layer={layer} head={head}")
+    cos_vals = []
+    for qi, cos in series:
+        attn_to_sink = float(attn_mat[qi, 0].item())
+        print(f"  q={qi}\tcos={cos:.6f}\tattn={attn_to_sink:.6f}")
+        cos_vals.append(cos)
+    return {
+        "layer": layer, "head": head, "q_positions": q_positions,
+        "cos": cos_vals, "k_norm": float(k_norm), "v_norm": float(v_norm)
+    }
+
+def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE", return_map=False):
+    attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False)
+    head_attn = pick_head(attns, layer, head)
+    title = f"{tag}Layer {layer} Head {head}"
+    if return_map:
+        return head_attn, title
+    tag_safe = str(tag).lower().replace(" ", "_")
+    _plot_attn(
+        head_attn, 
+        title, 
+        os.path.join(outdir, f"{tag_safe}_layer_{layer}_head_{head}.png")
+    )
+    return None, None
+
 def pick_head(attentions, layer_idx, head_idx):
     attn_l = attentions[layer_idx]
     return attn_l[0, head_idx].detach().float().cpu().numpy()
+
+# Plotting functions
 
 def _plot_attn(attn, title, out_path):
     plt.figure(figsize=(6, 4.5))
@@ -106,17 +192,17 @@ def _plot_attn(attn, title, out_path):
     plt.savefig(out_path, bbox_inches="tight", dpi=300)
     plt.close()
 
-def _plot_k_norm_progression(stats, outdir):
+def _plot_norm_progression(stats, outdir, key, ylabel, title, fname):
     layers = sorted({s["layer"] for s in stats})
-    layers_to_kn = {s["layer"]: s["k_norm"] for s in stats}
-    y = [layers_to_kn[L] for L in layers]
+    by_layer = {s["layer"]: s for s in stats}
+    y = [by_layer[L][key] for L in layers]
     plt.figure(figsize=(7, 3.5))
     plt.plot(layers, y, marker="o")
     plt.xlabel("Layer")
-    plt.ylabel("||K[0]||")
-    plt.title(f"K-norm progression")
+    plt.ylabel(ylabel)
+    plt.title(title)
     plt.tight_layout()
-    plt.savefig(os.path.join(outdir, f"scan_knorm.png"), dpi=300)
+    plt.savefig(os.path.join(outdir, fname), dpi=300)
     plt.close()
 
 def _plot_cosine_stack(stats, outdir):
@@ -139,64 +225,37 @@ def _plot_cosine_stack(stats, outdir):
     fig.savefig(os.path.join(outdir, f"scan_cosine.png"), dpi=300)
     plt.close(fig)
 
-def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE"):
-    attn = prefill(model, input_ids, position_ids)
-    head_attn = pick_head(attn, layer, head)
-    tag_safe = str(tag).lower().replace(" ", "_")
-    _plot_attn(
-        head_attn, 
-        f"{tag} L{layer} H{head}", 
-        os.path.join(outdir, f"{tag_safe}_L{layer}_H{head}.png")
-    )
+def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4):
+    n = len(attn_maps)
+    if n == 0:
+        return
+    cols = math.ceil(n / rows)
+    fig, axes = plt.subplots(rows, cols, figsize=(3.0*cols, 2.6*rows), squeeze=False)
 
-def parse_overrides(s):
-    """'12=0,42=1' -> [(12,0),(42,1)]"""
-    if not s: return []
-    out = []
-    for part in s.split(","):
-        if not part: continue
-        ti, rp = part.split("=")
-        out.append((int(ti), int(rp)))
-    return out
-
-def _capture_qk(model, layer_idx, cache):
-    attn = model.model.layers[layer_idx].self_attn
-    num_heads = model.config.num_attention_heads
-    num_kv = model.config.num_key_value_heads
-    num_groups = max(1, num_heads // max(1, num_kv))
-    head_dim = model.config.head_dim
-
-    def hook(_module, args, kwargs):
-        hidden_states = kwargs["hidden_states"]
-        cos, sin = kwargs["position_embeddings"]
-        B, S, _ = hidden_states.shape
-
-        q = attn.q_proj(hidden_states).view(B, S, num_heads, head_dim)
-        k = attn.k_proj(hidden_states).view(B, S, num_kv, head_dim)
-        q = attn.q_norm(q).transpose(1, 2).contiguous()
-        k = attn.k_norm(k).transpose(1, 2).contiguous()
-
-        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        if num_kv != num_heads:
-            k = k.repeat_interleave(num_groups, dim=1)
-        cache["q"] = q.detach().float().cpu()
-        cache["k"] = k.detach().float().cpu()
-
-    h = attn.register_forward_pre_hook(hook, with_kwargs=True)
-    cache["_hook"] = h
-
-def compute_cosine_series(q, k, head_idx, k_sink_idx, q_positions):
-    kv = k[0, head_idx, k_sink_idx]
-    kn = F.normalize(kv, dim=0)
-
-    series = []
-    for qi in q_positions:
-        qv = q[0, head_idx, qi]
-        qn = F.normalize(qv, dim=0)
-        cos = float(torch.dot(qn, kn))
-        series.append((qi, cos))
-    return series, float(kv.norm().item())
+    vmin = min(float(np.min(m)) for m in attn_maps)
+    vmax = max(float(np.max(m)) for m in attn_maps)
+    for i in range(rows*cols):
+        r, c = divmod(i, cols)
+        ax = axes[r][c]
+        if i < n:
+            im = ax.imshow(
+                attn_maps[i], aspect="auto", origin="lower", interpolation="nearest",
+                vmin=vmin, vmax=vmax
+            )
+            ax.set_title(titles[i], fontsize=9)
+            ax.set_xlabel("K")
+            ax.set_ylabel("Q")
+            ax.invert_yaxis()
+        else:
+            ax.axis("off")
+    
+    fig.subplots_adjust(right=0.88, top=0.92, bottom=0.02, hspace=0.25, wspace=0.25)
+    cbar_ax = fig.add_axes([0.90, 0.22, 0.02, 0.65])
+    fig.colorbar(im, cax=cbar_ax, label="Attention prob")
+    fig.suptitle("Attention heatmaps", fontsize=12, y=0.985)
+    fig.tight_layout(rect=[0, 0.01, 0.88, 0.95])
+    fig.savefig(out_path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
 
 def main():
     p = argparse.ArgumentParser()
@@ -213,8 +272,8 @@ def main():
     p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print log, eg. '256,512,768")
     # perturbations
     p.add_argument("--rope", default=None, help="Comma-separated list of token_idx=rope_pos, eg. '12=0,42=1")
-    p.add_argument("--mask", default=None, help="Casual mask type")
-    p.add_argument("--outdir", default="figures")
+    p.add_argument("--mask", default=None, help="Causal mask type")
+    p.add_argument("--outdir", default="results")
     args = p.parse_args()
 
     tok, model = load_model(args.model, args.device, args.dtype)
@@ -234,20 +293,28 @@ def main():
     num_layers = model.config.num_hidden_layers
     num_heads = model.config.num_attention_heads
     scan_stats = []
+    scan_maps, scan_titles = [], []
 
     def handle_one(layer, head):
         pos_ids_perturbed, applied = apply_perturbations(base_pos, rope_overrides=rope_overrides)
 
         if args.print_mode == "log":
-            stats = run_cosine(tok, model, input_ids, pos_ids_perturbed, layer, head, args.qpos)
+            stats = run_cosine(model, input_ids, pos_ids_perturbed, layer, head, args.qpos)
             scan_stats.append(stats)
 
         elif args.print_mode == "heatmap":
-            tag = "PERTURBED"
+            tag = ""
             if rope_overrides:
                 ov_str = ",".join([f"{ti}={rp}" for ti, rp in rope_overrides])
-                tag = f"PERTURBED rope({ov_str})"
-            run_heatmap(model, input_ids, pos_ids_perturbed, layer, head, args.outdir, tag=tag)
+                tag = f"PERTURBED rope({ov_str}) "
+
+            if args.scan:
+                m, t = run_heatmap(model, input_ids, pos_ids_perturbed, layer, head, args.outdir, tag=tag, return_map=True)
+                if m is not None and t is not None:
+                    scan_maps.append(m)
+                    scan_titles.append(t)
+            else: 
+                run_heatmap(model, input_ids, pos_ids_perturbed, layer, head, args.outdir, tag=tag, return_map=False)
 
     if args.scan:
         for L in range(0, num_layers, 4):
@@ -255,8 +322,18 @@ def main():
 
         if args.print_mode == "log" and len(scan_stats) > 0:
             scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
-            _plot_k_norm_progression(scan_stats, args.outdir)
+            _plot_norm_progression(
+                scan_stats, args.outdir, key="k_norm", ylabel="||K[0]||",
+                title="K-norm progression", fname="scan_knorm.png"
+            )
+            _plot_norm_progression(
+                scan_stats, args.outdir, key="v_norm", ylabel="||V[0]||",
+                title="V-norm progression", fname="scan_vnorm.png"
+            )
             _plot_cosine_stack(scan_stats, args.outdir)
+        
+        elif args.print_mode == "heatmap" and len(scan_maps) > 0:
+            _plot_heatmap_grid(scan_maps, scan_titles, os.path.join(args.outdir, "scan_heatmaps.png"), rows=4)
 
     else:
         handle_one(args.layer, args.head)
