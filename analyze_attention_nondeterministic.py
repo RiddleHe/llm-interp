@@ -55,7 +55,7 @@ def _enable_fa2():
                 out = flash_attn.flash_attn_with_kvcache(
                     q=q_, k_cache=k_cache, v_cache=v_cache, k=k_new, v=v_new,
                     cache_seqlens=k_cache.size(1), softmax_scale=scaling, causal=True,
-                    num_splits=1
+                    num_splits=0
                 )
                 return out, None
             else:
