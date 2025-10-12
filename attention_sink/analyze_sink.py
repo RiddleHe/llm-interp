@@ -7,7 +7,7 @@ PRINT_CHOICES = ["heatmap", "log"]
 
 # Perturbation & loading functions
 
-def load_model(model_name, device, dtype):
+def load_model(model_name, device, dtype, ):
     torch_dtype = {"auto": "auto", "bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dmap = "auto" if device == "auto" else None
 
@@ -66,6 +66,12 @@ def _parse_qpos(arg, seq_len):
     one_third = max(0, seq_len // 3 - 1)
     q_positions = sorted({one_third, two_thirds, last})
     return q_positions
+
+def _append_suffix(path, suffix):
+    if not suffix:
+        return path
+    root, ext = os.path.splitext(path)
+    return f"{root}{suffix}{ext}"
 
 # Forward & capture functions
 
@@ -160,17 +166,18 @@ def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg):
         "cos": cos_vals, "k_norm": float(k_norm), "v_norm": float(v_norm)
     }
 
-def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE", return_map=False):
+def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE", return_map=False, suffix=""):
     attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False)
     head_attn = pick_head(attns, layer, head)
-    title = f"{tag}Layer {layer} Head {head}"
+    title = f"Layer {layer} Head {head}" if return_map else f"{tag}Layer {layer} head {head}" 
     if return_map:
         return head_attn, title
     tag_safe = str(tag).lower().replace(" ", "_")
     _plot_attn(
         head_attn, 
         title, 
-        os.path.join(outdir, f"{tag_safe}_layer_{layer}_head_{head}.png")
+        os.path.join(outdir, f"{tag_safe}_layer_{layer}_head_{head}.png"),
+        suffix=suffix
     )
     return None, None
 
@@ -180,7 +187,7 @@ def pick_head(attentions, layer_idx, head_idx):
 
 # Plotting functions
 
-def _plot_attn(attn, title, out_path):
+def _plot_attn(attn, title, out_path, suffix=""):
     plt.figure(figsize=(6, 4.5))
     im = plt.imshow(attn, aspect="auto", origin="lower", interpolation="nearest")
     plt.gca().invert_yaxis()
@@ -189,10 +196,10 @@ def _plot_attn(attn, title, out_path):
     plt.ylabel("Q")
     cbar = plt.colorbar(im)
     cbar.set_label("Attention prob")
-    plt.savefig(out_path, bbox_inches="tight", dpi=300)
+    plt.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
     plt.close()
 
-def _plot_norm_progression(stats, outdir, key, ylabel, title, fname):
+def _plot_norm_progression(stats, outdir, key, ylabel, title, fname, suffix=""):
     layers = sorted({s["layer"] for s in stats})
     by_layer = {s["layer"]: s for s in stats}
     y = [by_layer[L][key] for L in layers]
@@ -202,10 +209,10 @@ def _plot_norm_progression(stats, outdir, key, ylabel, title, fname):
     plt.ylabel(ylabel)
     plt.title(title)
     plt.tight_layout()
-    plt.savefig(os.path.join(outdir, fname), dpi=300)
+    plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
     plt.close()
 
-def _plot_cosine_stack(stats, outdir):
+def _plot_cosine_stack(stats, outdir, suffix=""):
     layers = sorted({s["layer"] for s in stats})
     by_layer = {s["layer"]: s for s in stats}
     q_positions = stats[0]["q_positions"]
@@ -222,10 +229,10 @@ def _plot_cosine_stack(stats, outdir):
     axes[-1].set_xlabel("Layer")
     fig.suptitle(f"Cosine to K[0] across layers")
     fig.tight_layout(rect=[0, 0, 1, 0.97])
-    fig.savefig(os.path.join(outdir, f"scan_cosine.png"), dpi=300)
+    fig.savefig(_append_suffix(os.path.join(outdir, f"scan_cosine.png"), suffix), dpi=300)
     plt.close(fig)
 
-def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4):
+def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4, suffix="", suptitle="Attention heatmaps"):
     n = len(attn_maps)
     if n == 0:
         return
@@ -252,10 +259,19 @@ def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4):
     fig.subplots_adjust(right=0.88, top=0.92, bottom=0.02, hspace=0.25, wspace=0.25)
     cbar_ax = fig.add_axes([0.90, 0.22, 0.02, 0.65])
     fig.colorbar(im, cax=cbar_ax, label="Attention prob")
-    fig.suptitle("Attention heatmaps", fontsize=12, y=0.985)
+    fig.suptitle(suptitle, fontsize=12, y=0.985)
     fig.tight_layout(rect=[0, 0.01, 0.88, 0.95])
-    fig.savefig(out_path, bbox_inches="tight", dpi=300)
+    fig.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
     plt.close(fig)
+
+def _pert_suffix(rope_overrides=None, mask=None):
+    parts = []
+    if rope_overrides:
+        spec = "-".join(f"{ti}={rp}" for ti, rp in rope_overrides)
+        parts.append(f"rope[{spec}]")
+    if mask:
+        pass
+    return ("__" + "_".join(parts)) if parts else ""
 
 def main():
     p = argparse.ArgumentParser()
@@ -289,6 +305,7 @@ def main():
 
     rope_str = args.rope
     rope_overrides = parse_overrides(rope_str) if rope_str else None
+    pert_suffix = _pert_suffix(rope_overrides=rope_overrides, mask=args.mask)
 
     num_layers = model.config.num_hidden_layers
     num_heads = model.config.num_attention_heads
@@ -309,12 +326,12 @@ def main():
                 tag = f"PERTURBED rope({ov_str}) "
 
             if args.scan:
-                m, t = run_heatmap(model, input_ids, pos_ids_perturbed, layer, head, args.outdir, tag=tag, return_map=True)
+                m, t = run_heatmap(model, input_ids, pos_ids_perturbed, layer, head, args.outdir, tag=tag, return_map=True, suffix=pert_suffix)
                 if m is not None and t is not None:
                     scan_maps.append(m)
                     scan_titles.append(t)
             else: 
-                run_heatmap(model, input_ids, pos_ids_perturbed, layer, head, args.outdir, tag=tag, return_map=False)
+                run_heatmap(model, input_ids, pos_ids_perturbed, layer, head, args.outdir, tag=tag, return_map=False, suffix=pert_suffix)
 
     if args.scan:
         for L in range(0, num_layers, 4):
@@ -324,16 +341,24 @@ def main():
             scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
             _plot_norm_progression(
                 scan_stats, args.outdir, key="k_norm", ylabel="||K[0]||",
-                title="K-norm progression", fname="scan_knorm.png"
+                title="K-norm progression", fname="scan_knorm.png", suffix=pert_suffix
             )
             _plot_norm_progression(
                 scan_stats, args.outdir, key="v_norm", ylabel="||V[0]||",
-                title="V-norm progression", fname="scan_vnorm.png"
+                title="V-norm progression", fname="scan_vnorm.png", suffix=pert_suffix
             )
             _plot_cosine_stack(scan_stats, args.outdir)
         
         elif args.print_mode == "heatmap" and len(scan_maps) > 0:
-            _plot_heatmap_grid(scan_maps, scan_titles, os.path.join(args.outdir, "scan_heatmaps.png"), rows=4)
+            grid_title = "Attention heatmaps"
+            if rope_overrides:
+                spec = ",".join(f"{ti}->{rp}" for ti, rp in rope_overrides)
+                grid_title = f"Attention heatmaps - rope({spec})"
+
+            _plot_heatmap_grid(
+                scan_maps, scan_titles, os.path.join(args.outdir, "scan_heatmaps.png"), rows=4,
+                suffix=pert_suffix, suptitle=grid_title,
+            )
 
     else:
         handle_one(args.layer, args.head)
