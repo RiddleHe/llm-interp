@@ -9,7 +9,7 @@ import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
 
-EPS = 1e-8
+EPS = 1e-12
 PRINT_CHOICES = ["heatmap", "log"]
 
 # Perturbation & loading functions
@@ -51,6 +51,47 @@ def apply_rope_overrides(position_ids, overrides):
         else:
             raise ValueError(f"token idx {ti} out of range (seq_len={seq_len})")
     return pos
+
+def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0):
+    handles = []
+    num_heads = model.config.num_attention_heads
+    num_kv = model.config.num_key_value_heads
+    num_groups = max(1, num_heads // max(1, num_kv))
+
+    for L in layers:
+        attn = model.model.layers[L].self_attn
+        cache = {}
+
+        def _prehook(_module, args, kwargs, _cache=cache):
+            hidden_states = kwargs["hidden_states"]
+            B, S, _ = hidden_states.shape
+            head_dim = model.config.head_dim
+            v = attn.v_proj(hidden_states).view(B, S, num_kv, head_dim)
+            v = v.transpose(1, 2).contiguous()
+            if num_kv != num_heads:
+                v = v.repeat_interleave(num_groups, dim=1)
+            _cache["v"] = v
+
+        def _fwdhook(_module, args, output, _cache=cache):
+            attn_output, attn_probs = output[0], output[1]
+            probs = attn_probs.clone()
+            probs[..., sink_k_idx] *= factor  # we don't renormalize
+
+            v = _cache["v"]
+            ctx = torch.matmul(probs, v)
+            B, H, Q, D = ctx.shape
+            ctx = ctx.transpose(1, 2).contiguous().view(B, Q, H*D)
+            new_out = _module.o_proj(ctx)
+
+            out_list = list(output)
+            out_list[0] = new_out
+            out_list[1] = probs
+            return tuple(out_list)
+
+        h1 = attn.register_forward_pre_hook(_prehook, with_kwargs=True)
+        h2 = attn.register_forward_hook(_fwdhook)
+        handles.append([h1, h2])
+    return handles
 
 def apply_perturbations(base_pos, rope_overrides=None, mask=None):
     pos_ids = base_pos
@@ -280,15 +321,16 @@ def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4, suffix="", suptitle=
     fig.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
     plt.close(fig)
 
-def _pert_suffix(rope_overrides=None, mask=None, random_init=False):
+def _pert_suffix(args):
     suffix = ""
-    if rope_overrides:
-        spec = "-".join(f"{ti}={rp}" for ti, rp in rope_overrides)
-        suffix += "__" + f"rope[{spec}]"
-    if mask:
-        suffix += "__" + f"mask[{mask}]"
-    if random_init:
+    if args.rope:
+        suffix += "__" + f"rope[{args.rope}]"
+    if args.mask:
+        suffix += "__" + f"mask[{args.mask}]"
+    if args.random_init:
         suffix += "__" + "random_init"
+    if args.lower_attn:
+        suffix += "__" + "lower_attn"
     return suffix
 
 def main():
@@ -308,6 +350,8 @@ def main():
     p.add_argument("--rope", default=None, help="Comma-separated list of token_idx=rope_pos, eg. '12=0,42=1")
     p.add_argument("--mask", default=None, choices=["upper"], help="Causal mask type")
     p.add_argument("--random-init", action="store_true", help="DO NOT load pretrained weights")
+    p.add_argument("--lower-attn", action="store_true", help="Iteratively lower attention on sink key at each layer")
+    # output
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
 
@@ -324,10 +368,17 @@ def main():
 
     rope_str = args.rope
     rope_overrides = parse_overrides(rope_str) if rope_str else None
-    pert_suffix = _pert_suffix(rope_overrides=rope_overrides, mask=args.mask, random_init=args.random_init)
+    pert_suffix = _pert_suffix(args)
 
     num_layers = model.config.num_hidden_layers
     num_heads = model.config.num_attention_heads
+
+    lower_attn_handles = []
+    if args.lower_attn:
+        lower_attn_handles = _install_lower_attn_hooks(
+            model, layers=range(num_layers), factor=0.5, sink_k_idx=0
+        )
+
     scan_stats = []
     scan_maps, scan_titles = [], []
 
@@ -383,6 +434,8 @@ def main():
                 grid_title += f" - mask({args.mask})"
             if args.random_init:
                 grid_title += " - [random init]"
+            if args.lower_attn:
+                grid_title += " - lower_attn (x0.5)"
 
             _plot_heatmap_grid(
                 scan_maps, scan_titles, os.path.join(args.outdir, "scan_heatmaps.png"), rows=4,
@@ -391,6 +444,13 @@ def main():
 
     else:
         handle_one(args.layer, args.head)
+
+    for pair in lower_attn_handles:
+        for h in pair:
+            try:
+                h.remove()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
