@@ -1,5 +1,12 @@
+"""
+python analyze_sink.py --scan --print heatmap --rope 0=12,1=13,2=14,3=15
+python analyze_sink.py --scan --print log
+python analyze_sink.py --scan --print heatmap --random-init
+python analyze_sink.py --scan --print heatmap --mask upper
+"""
+
 import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
 
 EPS = 1e-8
@@ -7,11 +14,20 @@ PRINT_CHOICES = ["heatmap", "log"]
 
 # Perturbation & loading functions
 
-def load_model(model_name, device, dtype, ):
+def load_model(model_name, device, dtype, random_init=False):
     torch_dtype = {"auto": "auto", "bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dmap = "auto" if device == "auto" else None
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype[dtype], device_map=dmap, attn_implementation="eager")
+    if random_init:
+        print(f"[init] Creating random-init model: {model_name}")
+        cfg = AutoConfig.from_pretrained(model_name)
+        torch.set_default_device("cuda") # faster init
+        model = AutoModelForCausalLM.from_config(cfg, attn_implementation="eager")
+        torch.set_default_device("cpu") # compatible with rest of the code
+        print(f"[init] Random init complete,")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype[dtype], device_map=dmap, attn_implementation="eager")
+    
     model.eval()
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     return tok, model
@@ -46,6 +62,24 @@ def apply_perturbations(base_pos, rope_overrides=None, mask=None):
         applied["mask"] = True
     return pos_ids, applied
 
+def _build_upper_tri_mask(seq_len, device):
+    q = torch.arange(seq_len, device=device)
+    k = torch.arange(seq_len, device=device)
+    allow = (k[None, :] > q[:, None])
+    mask = torch.where(
+        allow, 
+        torch.zeros(1, 1, seq_len, seq_len, device=device),
+        torch.full((1, 1, seq_len, seq_len), float("-inf"), device=device)
+    )
+    return mask
+
+def _make_attn_mask(mask_arg, seq_len, device):
+    if mask_arg is None:
+        return None
+    if str(mask_arg).lower() == "upper":
+        return _build_upper_tri_mask(seq_len, device)
+    return None
+
 # Parsing functions
 
 def parse_overrides(s):
@@ -75,11 +109,11 @@ def _append_suffix(path, suffix):
 
 # Forward & capture functions
 
-def _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False):
+def _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False, attention_mask=None):
     cache = {}
     if need_qkv:
         _capture_qkv(model, layer, cache)
-    attns = prefill(model, input_ids, position_ids)
+    attns = prefill(model, input_ids, position_ids, attention_mask=attention_mask)
     hook = cache.pop("_hook", None)
     if hook is not None:
         hook.remove()
@@ -88,11 +122,12 @@ def _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False)
     return attns, q, k, v
 
 @torch.no_grad()
-def prefill(model, input_ids, position_ids):
+def prefill(model, input_ids, position_ids, attention_mask=None):
     device = next(model.parameters()).device
     out = model(
         input_ids=input_ids.to(device),
         position_ids=position_ids.to(device),
+        attention_mask=attention_mask,
         use_cache=False,
         output_attentions=True,
         output_hidden_states=True,
@@ -144,8 +179,8 @@ def compute_cosine_series(q, k, head_idx, k_sink_idx, q_positions):
 
 # Run functions
 
-def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg):
-    attns, q, k, v = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=True)
+def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg, attention_mask=None):
+    attns, q, k, v = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=True, attention_mask=attention_mask)
     if q is None or k is None:
         raise RuntimeError("Failed to capture Q/K.")
 
@@ -166,8 +201,8 @@ def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg):
         "cos": cos_vals, "k_norm": float(k_norm), "v_norm": float(v_norm)
     }
 
-def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE", return_map=False, suffix=""):
-    attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False)
+def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE", return_map=False, suffix="", attention_mask=None):
+    attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False, attention_mask=attention_mask)
     head_attn = pick_head(attns, layer, head)
     title = f"Layer {layer} Head {head}" if return_map else f"{tag}Layer {layer} head {head}" 
     if return_map:
@@ -264,14 +299,16 @@ def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4, suffix="", suptitle=
     fig.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
     plt.close(fig)
 
-def _pert_suffix(rope_overrides=None, mask=None):
-    parts = []
+def _pert_suffix(rope_overrides=None, mask=None, random_init=False):
+    suffix = ""
     if rope_overrides:
         spec = "-".join(f"{ti}={rp}" for ti, rp in rope_overrides)
-        parts.append(f"rope[{spec}]")
+        suffix += "__" + f"rope[{spec}]"
     if mask:
-        pass
-    return ("__" + "_".join(parts)) if parts else ""
+        suffix += "__" + f"mask[{mask}]"
+    if random_init:
+        suffix += "__" + "random_init"
+    return suffix
 
 def main():
     p = argparse.ArgumentParser()
@@ -288,11 +325,12 @@ def main():
     p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print log, eg. '256,512,768")
     # perturbations
     p.add_argument("--rope", default=None, help="Comma-separated list of token_idx=rope_pos, eg. '12=0,42=1")
-    p.add_argument("--mask", default=None, help="Causal mask type")
+    p.add_argument("--mask", default=None, choices=["upper"], help="Causal mask type")
+    p.add_argument("--random-init", action="store_true", help="DO NOT load pretrained weights")
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
 
-    tok, model = load_model(args.model, args.device, args.dtype)
+    tok, model = load_model(args.model, args.device, args.dtype, random_init=args.random_init)
 
     if args.prompt:
         text = args.prompt
@@ -305,18 +343,20 @@ def main():
 
     rope_str = args.rope
     rope_overrides = parse_overrides(rope_str) if rope_str else None
-    pert_suffix = _pert_suffix(rope_overrides=rope_overrides, mask=args.mask)
+    pert_suffix = _pert_suffix(rope_overrides=rope_overrides, mask=args.mask, random_init=args.random_init)
 
     num_layers = model.config.num_hidden_layers
     num_heads = model.config.num_attention_heads
     scan_stats = []
     scan_maps, scan_titles = [], []
+    device = next(model.parameters()).device
+    custom_attn_mask = _make_attn_mask(args.mask, base_pos.shape[1], device)
 
     def handle_one(layer, head):
         pos_ids_perturbed, applied = apply_perturbations(base_pos, rope_overrides=rope_overrides)
 
         if args.print_mode == "log":
-            stats = run_cosine(model, input_ids, pos_ids_perturbed, layer, head, args.qpos)
+            stats = run_cosine(model, input_ids, pos_ids_perturbed, layer, head, args.qpos, attention_mask=custom_attn_mask)
             scan_stats.append(stats)
 
         elif args.print_mode == "heatmap":
@@ -326,12 +366,18 @@ def main():
                 tag = f"PERTURBED rope({ov_str}) "
 
             if args.scan:
-                m, t = run_heatmap(model, input_ids, pos_ids_perturbed, layer, head, args.outdir, tag=tag, return_map=True, suffix=pert_suffix)
+                m, t = run_heatmap(
+                    model, input_ids, pos_ids_perturbed, layer, head, 
+                    args.outdir, tag=tag, return_map=True, suffix=pert_suffix, attention_mask=custom_attn_mask
+                )
                 if m is not None and t is not None:
                     scan_maps.append(m)
                     scan_titles.append(t)
             else: 
-                run_heatmap(model, input_ids, pos_ids_perturbed, layer, head, args.outdir, tag=tag, return_map=False, suffix=pert_suffix)
+                run_heatmap(
+                    model, input_ids, pos_ids_perturbed, layer, head, 
+                    args.outdir, tag=tag, return_map=False, suffix=pert_suffix, attention_mask=custom_attn_mask
+                )
 
     if args.scan:
         for L in range(0, num_layers, 4):
@@ -353,7 +399,11 @@ def main():
             grid_title = "Attention heatmaps"
             if rope_overrides:
                 spec = ",".join(f"{ti}->{rp}" for ti, rp in rope_overrides)
-                grid_title = f"Attention heatmaps - rope({spec})"
+                grid_title += f" - rope({spec})"
+            if args.mask:
+                grid_title += f" - mask({args.mask})"
+            if args.random_init:
+                grid_title += " - [random init]"
 
             _plot_heatmap_grid(
                 scan_maps, scan_titles, os.path.join(args.outdir, "scan_heatmaps.png"), rows=4,
