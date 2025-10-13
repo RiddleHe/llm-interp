@@ -62,24 +62,6 @@ def apply_perturbations(base_pos, rope_overrides=None, mask=None):
         applied["mask"] = True
     return pos_ids, applied
 
-def _build_upper_tri_mask(seq_len, device):
-    q = torch.arange(seq_len, device=device)
-    k = torch.arange(seq_len, device=device)
-    allow = (k[None, :] > q[:, None])
-    mask = torch.where(
-        allow, 
-        torch.zeros(1, 1, seq_len, seq_len, device=device),
-        torch.full((1, 1, seq_len, seq_len), float("-inf"), device=device)
-    )
-    return mask
-
-def _make_attn_mask(mask_arg, seq_len, device):
-    if mask_arg is None:
-        return None
-    if str(mask_arg).lower() == "upper":
-        return _build_upper_tri_mask(seq_len, device)
-    return None
-
 # Parsing functions
 
 def parse_overrides(s):
@@ -109,11 +91,11 @@ def _append_suffix(path, suffix):
 
 # Forward & capture functions
 
-def _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False, attention_mask=None):
+def _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False):
     cache = {}
     if need_qkv:
         _capture_qkv(model, layer, cache)
-    attns = prefill(model, input_ids, position_ids, attention_mask=attention_mask)
+    attns = prefill(model, input_ids, position_ids)
     hook = cache.pop("_hook", None)
     if hook is not None:
         hook.remove()
@@ -122,12 +104,11 @@ def _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False,
     return attns, q, k, v
 
 @torch.no_grad()
-def prefill(model, input_ids, position_ids, attention_mask=None):
+def prefill(model, input_ids, position_ids):
     device = next(model.parameters()).device
     out = model(
         input_ids=input_ids.to(device),
         position_ids=position_ids.to(device),
-        attention_mask=attention_mask,
         use_cache=False,
         output_attentions=True,
         output_hidden_states=True,
@@ -179,8 +160,8 @@ def compute_cosine_series(q, k, head_idx, k_sink_idx, q_positions):
 
 # Run functions
 
-def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg, attention_mask=None):
-    attns, q, k, v = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=True, attention_mask=attention_mask)
+def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg):
+    attns, q, k, v = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=True)
     if q is None or k is None:
         raise RuntimeError("Failed to capture Q/K.")
 
@@ -201,8 +182,8 @@ def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg, attention_
         "cos": cos_vals, "k_norm": float(k_norm), "v_norm": float(v_norm)
     }
 
-def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE", return_map=False, suffix="", attention_mask=None):
-    attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False, attention_mask=attention_mask)
+def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE", return_map=False, suffix=""):
+    attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False)
     head_attn = pick_head(attns, layer, head)
     title = f"Layer {layer} Head {head}" if return_map else f"{tag}Layer {layer} head {head}" 
     if return_map:
@@ -349,14 +330,12 @@ def main():
     num_heads = model.config.num_attention_heads
     scan_stats = []
     scan_maps, scan_titles = [], []
-    device = next(model.parameters()).device
-    custom_attn_mask = _make_attn_mask(args.mask, base_pos.shape[1], device)
 
     def handle_one(layer, head):
         pos_ids_perturbed, applied = apply_perturbations(base_pos, rope_overrides=rope_overrides)
 
         if args.print_mode == "log":
-            stats = run_cosine(model, input_ids, pos_ids_perturbed, layer, head, args.qpos, attention_mask=custom_attn_mask)
+            stats = run_cosine(model, input_ids, pos_ids_perturbed, layer, head, args.qpos)
             scan_stats.append(stats)
 
         elif args.print_mode == "heatmap":
@@ -368,7 +347,7 @@ def main():
             if args.scan:
                 m, t = run_heatmap(
                     model, input_ids, pos_ids_perturbed, layer, head, 
-                    args.outdir, tag=tag, return_map=True, suffix=pert_suffix, attention_mask=custom_attn_mask
+                    args.outdir, tag=tag, return_map=True, suffix=pert_suffix
                 )
                 if m is not None and t is not None:
                     scan_maps.append(m)
@@ -376,7 +355,7 @@ def main():
             else: 
                 run_heatmap(
                     model, input_ids, pos_ids_perturbed, layer, head, 
-                    args.outdir, tag=tag, return_map=False, suffix=pert_suffix, attention_mask=custom_attn_mask
+                    args.outdir, tag=tag, return_map=False, suffix=pert_suffix
                 )
 
     if args.scan:
@@ -393,7 +372,7 @@ def main():
                 scan_stats, args.outdir, key="v_norm", ylabel="||V[0]||",
                 title="V-norm progression", fname="scan_vnorm.png", suffix=pert_suffix
             )
-            _plot_cosine_stack(scan_stats, args.outdir)
+            _plot_cosine_stack(scan_stats, args.outdir, suffix=pert_suffix)
         
         elif args.print_mode == "heatmap" and len(scan_maps) > 0:
             grid_title = "Attention heatmaps"
