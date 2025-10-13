@@ -1,8 +1,10 @@
 """
-python analyze_sink.py --scan --print heatmap --rope 0=12,1=13,2=14,3=15
-python analyze_sink.py --scan --print log
-python analyze_sink.py --scan --print heatmap --random-init
-python analyze_sink.py --scan --print heatmap --mask upper
+python analyze_sink.py --scan \
+    --print [heatmap, log] \
+    --rope 0=12,1=13,2=14,3=15 \
+    --random-init \
+    --lower-attn \
+
 """
 
 import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math
@@ -24,7 +26,7 @@ def load_model(model_name, device, dtype, random_init=False):
         torch.set_default_device("cuda") # faster init
         model = AutoModelForCausalLM.from_config(cfg, attn_implementation="eager")
         torch.set_default_device("cpu") # compatible with rest of the code
-        print(f"[init] Random init complete,")
+        print(f"[init] Random init complete.")
     else:
         model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype[dtype], device_map=dmap, attn_implementation="eager")
     
@@ -58,6 +60,8 @@ def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0):
     num_kv = model.config.num_key_value_heads
     num_groups = max(1, num_heads // max(1, num_kv))
 
+    model._lower_attn_cache = {}
+
     for L in layers:
         attn = model.model.layers[L].self_attn
         cache = {}
@@ -74,6 +78,8 @@ def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0):
 
         def _fwdhook(_module, args, output, _cache=cache):
             attn_output, attn_probs = output[0], output[1]
+            model._lower_attn_cache[L] = attn_probs.detach().float().cpu()
+            
             probs = attn_probs.clone()
             probs[..., sink_k_idx] *= factor  # we don't renormalize
 
@@ -210,7 +216,11 @@ def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg):
     q_positions = list(_parse_qpos(qpos_arg, seq_len))
     series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=0, q_positions=q_positions)
     v_norm = float(v[0, head, 0].norm().item())
-    attn_mat = attns[layer][0, head].detach().float().cpu()
+
+    if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
+        attn_mat = model._lower_attn_cache[layer][0, head]
+    else:
+        attn_mat = attns[layer][0, head].detach().float().cpu()
 
     print(f"Cosine (Q[q_idx], k[0]) layer={layer} head={head}")
     cos_vals = []
@@ -225,7 +235,13 @@ def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg):
 
 def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE", return_map=False, suffix=""):
     attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False)
-    head_attn = pick_head(attns, layer, head)
+
+    if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
+        orig = model._lower_attn_cache[layer]
+        head_attn = orig[0, head].numpy()
+    else:
+        head_attn = pick_head(attns, layer, head)
+
     title = f"Layer {layer} Head {head}" if return_map else f"{tag}Layer {layer} head {head}" 
     if return_map:
         return head_attn, title
