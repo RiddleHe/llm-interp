@@ -1,0 +1,16 @@
+When we train large neural networks, we need to keep them healthy. We do not want the tensors in the network—either the weights, activations or gradients—to grow too large or too small. 
+Very small and very large tensors cause a variety of problems not just limited to numerical underflow and overflow. 
+For example, weight matrices changing size during training makes it harder to design training algorithms—since the relative size of updates to weights has a significant impact on the speed of learning.
+The gold standard for keeping tensors healthy is to normalize them. Normalization is commonplace for activation vectors, where we use techniques like layer norm to put the activations on a good scale before passing them to the next layer. 
+It is also commonplace to normalize gradient updates, where we can interpret fast training algorithms like the Muon optimizer as spectrally normalizing the updates. 
+Normalization provides us with certainty about the sizes of tensors—without needing to check Wandb!—and when training large neural networks with many interacting components, having certainty about the network internals is valuable.
+As mentioned above, one common explanation for why kernels add numbers in different orders is the “concurrency + floating point” hypothesis. 
+The hypothesis states that if the order in which concurrent threads finish is nondeterministic and the accumulation order depends on the order in which concurrent threads finish (such as with an atomic add), our accumulation order will be nondeterministic as well.
+Confusingly, although this can lead to nondeterministic kernels, concurrency (and atomic adds) end up being completely uninvolved in LLM inference nondeterminism! To explain what the real culprit is, let’s first understand why modern GPU kernels rarely need atomic adds.
+Typically a GPU launches a program concurrently across many “cores” (i.e. SMs). As the cores have no inherent synchronization among them, this poses a challenge if the cores need to communicate among each other. 
+For example, if all cores must accumulate to the same element, you can use an “atomic add” (sometimes known as a “fetch-and-add”). 
+The atomic add is “nondeterministic” — the order in which the results accumulate is purely dependent on which core finishes first.
+Although you can load all 100 elements in parallel, we must eventually reduce down to a single element. One way to accomplish this is with some kind of “atomic add” primitive, where the hardware guarantees that all additions will be processed but does not guarantee the order.
+This is usually what folks mean by “nondeterminism” — you execute the same kernel twice with exactly the same inputs and you get a different result out. 
+This is known as run-to-run nondeterminism, where you run the same python script twice with the exact same dependencies but get a different result.
+Although concurrent atomic adds do make a kernel nondeterministic, atomic adds are not necessary for the vast majority of kernels.

@@ -391,25 +391,26 @@ def main():
         cos_list = []
         k_norms, v_norms = [], []
         attn_maps = []
-        q_positions = None
+        min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
+        q_positions = list(_parse_qpos(args.qpos, min_len)) # clamp to valid seq range
+        sink_idx = max(0, min(min_len - 1, args.sink_idx)) 
         
         for input_ids, base_pos in tokenized:
             pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
             attns, q, k, v = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=True)
             if q is None or k is None:
                 raise RuntimeError("Failed to capture Q/K.")
-            seq_len = q.shape[2]
-            q_positions = list(_parse_qpos(args.qpos, seq_len)) if q_positions is None else q_positions
-            series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=args.sink_idx, q_positions=q_positions)
-            v_norm = float(v[0, head, args.sink_idx].norm().item())
+            series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=sink_idx, q_positions=q_positions)
+            v_norm = float(v[0, head, sink_idx].norm().item())
 
             k_norms.append(k_norm)
             v_norms.append(v_norm)
             cos_list.append([c for (_, c) in series])
             if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
-                attn_maps.append(pick_head(model._lower_attn_cache, layer, head))
+                hm = pick_head(model._lower_attn_cache, layer, head)
             else:
-                attn_maps.append(pick_head(attns, layer, head))
+                hm = pick_head(attns, layer, head)
+            attn_maps.append(hm[:min_len, :min_len])
 
         cos_mean = np.mean(np.array(cos_list), axis=0).tolist()
         k_mean = float(np.mean(k_norms))
@@ -422,13 +423,16 @@ def main():
 
     def _aggregate_attn_score_for_layer(layer, head, tag):
         attn_maps = []
+        min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
         for input_ids, base_pos in tokenized:
             pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
             attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=False)
             if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
-                attn_maps.append(pick_head(model._lower_attn_cache, layer, head))
+                hm = pick_head(model._lower_attn_cache, layer, head)
             else:
-                attn_maps.append(pick_head(attns, layer, head))
+                hm = pick_head(attns, layer, head)
+            attn_maps.append(hm[:min_len, :min_len])
+
         head_attn = np.mean(np.stack(attn_maps, axis=0), axis=0)
         if args.scan:
             m, t = _plot_heatmap_with_tag(head_attn, layer, head, args.outdir, tag=tag, return_map=True, suffix=pert_suffix)
