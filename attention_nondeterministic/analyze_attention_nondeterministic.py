@@ -1,3 +1,12 @@
+"""
+python analyze_attention_nondeterministic.py \
+    --mode [split_kv, prefill] \
+    --attn_implementation [flash_attention_2, sdpa] \
+    --seq_lens [4096, 6144] \
+    --batch_sizes [1, 2, 4, 8] \
+    --use_fa2_repo --fa2_deterministic --fa2_split_size 1024
+"""
+
 import torch
 import random
 import argparse
