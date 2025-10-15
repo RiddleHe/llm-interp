@@ -1,6 +1,6 @@
 """
 python analyze_sink.py --scan \
-    --print [heatmap, log] \
+    --print [heatmap, qkv] \
     --rope 0=12,1=13,2=14,3=15 \
     --random-init \
     --lower-attn \
@@ -12,7 +12,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
 
 EPS = 1e-12
-PRINT_CHOICES = ["heatmap", "log"]
+PRINT_CHOICES = ["heatmap", "qkv"]
 
 # Perturbation & loading functions
 
@@ -37,6 +37,10 @@ def load_model(model_name, device, dtype, random_init=False):
 def tokenize(tok, text):
     enc = tok(text, return_tensors="pt", add_special_tokens=True)
     return enc["input_ids"]
+
+def _load_prompts_from_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [ln.strip() for ln in f.readlines() if ln.strip()]
 
 def make_position_ids(seq_len):
     return torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
@@ -207,41 +211,13 @@ def compute_cosine_series(q, k, head_idx, k_sink_idx, q_positions):
 
 # Run functions
 
-def run_cosine(model, input_ids, position_ids, layer, head, qpos_arg):
-    attns, q, k, v = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=True)
-    if q is None or k is None:
-        raise RuntimeError("Failed to capture Q/K.")
+def pick_head(attentions, layer_idx, head_idx):
+    attn_l = attentions[layer_idx]
+    return attn_l[0, head_idx].detach().float().cpu().numpy()
 
-    seq_len = q.shape[2]
-    q_positions = list(_parse_qpos(qpos_arg, seq_len))
-    series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=0, q_positions=q_positions)
-    v_norm = float(v[0, head, 0].norm().item())
+# Plotting functions
 
-    if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
-        attn_mat = model._lower_attn_cache[layer][0, head]
-    else:
-        attn_mat = attns[layer][0, head].detach().float().cpu()
-
-    print(f"Cosine (Q[q_idx], k[0]) layer={layer} head={head}")
-    cos_vals = []
-    for qi, cos in series:
-        attn_to_sink = float(attn_mat[qi, 0].item())
-        print(f"  q={qi}\tcos={cos:.6f}\tattn={attn_to_sink:.6f}")
-        cos_vals.append(cos)
-    return {
-        "layer": layer, "head": head, "q_positions": q_positions,
-        "cos": cos_vals, "k_norm": float(k_norm), "v_norm": float(v_norm)
-    }
-
-def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE", return_map=False, suffix=""):
-    attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False)
-
-    if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
-        orig = model._lower_attn_cache[layer]
-        head_attn = orig[0, head].numpy()
-    else:
-        head_attn = pick_head(attns, layer, head)
-
+def _plot_heatmap_with_tag(head_attn, layer, head, outdir, tag="BASE", return_map=False, suffix=""):
     title = f"Layer {layer} Head {head}" if return_map else f"{tag}Layer {layer} head {head}" 
     if return_map:
         return head_attn, title
@@ -253,12 +229,6 @@ def run_heatmap(model, input_ids, position_ids, layer, head, outdir, tag="BASE",
         suffix=suffix
     )
     return None, None
-
-def pick_head(attentions, layer_idx, head_idx):
-    attn_l = attentions[layer_idx]
-    return attn_l[0, head_idx].detach().float().cpu().numpy()
-
-# Plotting functions
 
 def _plot_attn(attn, title, out_path, suffix=""):
     plt.figure(figsize=(6, 4.5))
@@ -280,17 +250,22 @@ def _plot_norm_progression(stats, outdir, key, ylabel, title, fname, suffix=""):
     plt.plot(layers, y, marker="o")
     plt.xlabel("Layer")
     plt.ylabel(ylabel)
+
+    if len(y) > 0:
+        plt.axhline(y[-1], color="gray", linestyle="--", linewidth=1.0)
+
     plt.title(title)
     plt.tight_layout()
     plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
     plt.close()
 
-def _plot_cosine_stack(stats, outdir, suffix=""):
+def _plot_cosine_stack(stats, outdir, suffix="", suptitle="Cosine to K[sink] across layers"):
     layers = sorted({s["layer"] for s in stats})
     by_layer = {s["layer"]: s for s in stats}
     q_positions = stats[0]["q_positions"]
     nrows = len(q_positions)
-    fig, axes = plt.subplots(nrows, 1, figsize=(7, 1.8*nrows), sharex=True)
+    fig_height = 2.2*nrows
+    fig, axes = plt.subplots(nrows, 1, figsize=(7, fig_height), sharex=True)
     if nrows == 1:
         axes = [axes]
     
@@ -298,9 +273,12 @@ def _plot_cosine_stack(stats, outdir, suffix=""):
         y = [by_layer[L]["cos"][i] for L in layers]
         axes[i].plot(layers, y, marker="o")
         axes[i].set_ylabel(f"cos@q={qi}")
+        axes[i].set_ylim(0.0, 1.0)
+        if len(y) > 0:
+            axes[i].axhline(y[-1], color="gray", linestyle="--", linewidth=1.0)
     
     axes[-1].set_xlabel("Layer")
-    fig.suptitle(f"Cosine to K[0] across layers")
+    fig.suptitle(suptitle)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(_append_suffix(os.path.join(outdir, f"scan_cosine.png"), suffix), dpi=300)
     plt.close(fig)
@@ -347,6 +325,8 @@ def _pert_suffix(args):
         suffix += "__" + "random_init"
     if args.lower_attn:
         suffix += "__" + "lower_attn"
+    if args.sink_idx != 0:
+        suffix += "__" + f"sink[{args.sink_idx}]"
     return suffix
 
 def main():
@@ -355,13 +335,15 @@ def main():
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32"])
     p.add_argument("--prompt", default=None)
+    p.add_argument("--prompt-file", default=None)
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--head", type=int, default=0)
     # scanning mode
     p.add_argument("--scan", action="store_true")
     # print mode
-    p.add_argument("--print", dest="print_mode", choices=PRINT_CHOICES, default="log")
-    p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print log, eg. '256,512,768")
+    p.add_argument("--print", dest="print_mode", choices=PRINT_CHOICES, default="qkv")
+    p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print qkv, eg. '256,512,768")
+    p.add_argument("--sink-idx", type=int, default=0, help="Index of the sink in qkv mode")
     # perturbations
     p.add_argument("--rope", default=None, help="Comma-separated list of token_idx=rope_pos, eg. '12=0,42=1")
     p.add_argument("--mask", default=None, choices=["upper"], help="Causal mask type")
@@ -373,13 +355,20 @@ def main():
 
     tok, model = load_model(args.model, args.device, args.dtype, random_init=args.random_init)
 
-    if args.prompt:
-        text = args.prompt
+    if args.prompt_file:
+        prompts = _load_prompts_from_file(args.prompt_file)
     else:
-        text = "To understand the failure of window attention, we find an interesting phenomenon of autoregressive LLMs: a surprisingly large amount of attention score is allocated to the initial tokens, irrespective of their relevance to the language modeling task"
+        if args.prompt:
+            prompts = [args.prompt]
+        else:
+            prompts = ["To understand the failure of window attention, we find an interesting phenomenon of autoregressive LLMs: a surprisingly large amount of attention score is allocated to the initial tokens, irrespective of their relevance to the language modeling task"]
 
-    input_ids = tokenize(tok, text)
-    base_pos = make_position_ids(input_ids.shape[1])
+    tokenized = []
+    for text in prompts:
+        input_ids = tokenize(tok, text)
+        base_pos = make_position_ids(input_ids.shape[1])
+        tokenized.append((input_ids, base_pos))
+
     os.makedirs(args.outdir, exist_ok=True)
 
     rope_str = args.rope
@@ -395,51 +384,85 @@ def main():
             model, layers=range(num_layers), factor=0.5, sink_k_idx=0
         )
 
-    scan_stats = []
+    scan_stats = [] # aggregated per layer
     scan_maps, scan_titles = [], []
 
-    def handle_one(layer, head):
-        pos_ids_perturbed, applied = apply_perturbations(base_pos, rope_overrides=rope_overrides)
+    def _aggregate_qkv_for_layer(layer, head):
+        cos_list = []
+        k_norms, v_norms = [], []
+        attn_maps = []
+        q_positions = None
+        
+        for input_ids, base_pos in tokenized:
+            pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
+            attns, q, k, v = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=True)
+            if q is None or k is None:
+                raise RuntimeError("Failed to capture Q/K.")
+            seq_len = q.shape[2]
+            q_positions = list(_parse_qpos(args.qpos, seq_len)) if q_positions is None else q_positions
+            series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=args.sink_idx, q_positions=q_positions)
+            v_norm = float(v[0, head, args.sink_idx].norm().item())
 
-        if args.print_mode == "log":
-            stats = run_cosine(model, input_ids, pos_ids_perturbed, layer, head, args.qpos)
-            scan_stats.append(stats)
+            k_norms.append(k_norm)
+            v_norms.append(v_norm)
+            cos_list.append([c for (_, c) in series])
+            if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
+                attn_maps.append(pick_head(model._lower_attn_cache, layer, head))
+            else:
+                attn_maps.append(pick_head(attns, layer, head))
 
-        elif args.print_mode == "heatmap":
-            tag = ""
-            if rope_overrides:
-                ov_str = ",".join([f"{ti}={rp}" for ti, rp in rope_overrides])
-                tag = f"PERTURBED rope({ov_str}) "
+        cos_mean = np.mean(np.array(cos_list), axis=0).tolist()
+        k_mean = float(np.mean(k_norms))
+        v_mean = float(np.mean(v_norms))
+        attn_agg = np.mean(np.stack(attn_maps, axis=0), axis=0)
+        return {
+            "k_norm": k_mean, "v_norm": v_mean, "cos": cos_mean, 
+            "layer": layer, "head": head, "q_positions": q_positions
+        }
 
-            if args.scan:
-                m, t = run_heatmap(
-                    model, input_ids, pos_ids_perturbed, layer, head, 
-                    args.outdir, tag=tag, return_map=True, suffix=pert_suffix
-                )
-                if m is not None and t is not None:
-                    scan_maps.append(m)
-                    scan_titles.append(t)
-            else: 
-                run_heatmap(
-                    model, input_ids, pos_ids_perturbed, layer, head, 
-                    args.outdir, tag=tag, return_map=False, suffix=pert_suffix
-                )
+    def _aggregate_attn_score_for_layer(layer, head, tag):
+        attn_maps = []
+        for input_ids, base_pos in tokenized:
+            pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
+            attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=False)
+            if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
+                attn_maps.append(pick_head(model._lower_attn_cache, layer, head))
+            else:
+                attn_maps.append(pick_head(attns, layer, head))
+        head_attn = np.mean(np.stack(attn_maps, axis=0), axis=0)
+        if args.scan:
+            m, t = _plot_heatmap_with_tag(head_attn, layer, head, args.outdir, tag=tag, return_map=True, suffix=pert_suffix)
+            return m, t
+        else:
+            _plot_heatmap_with_tag(head_attn, layer, head, args.outdir, tag=tag, return_map=False, suffix=pert_suffix)
+            return None, None
 
     if args.scan:
         for L in range(0, num_layers, 4):
-            handle_one(L, args.head)
+            if args.print_mode == "qkv":
+                stats = _aggregate_qkv_for_layer(L, args.head)
+                scan_stats.append(stats)
+            else:
+                tag = ""
+                if rope_overrides:
+                    ov_str = ",".join([f"{ti}={rp}" for ti, rp in rope_overrides])
+                    tag = f"PERTURBED rope({ov_str}) "
+                m, t = _aggregate_attn_score_for_layer(L, args.head, tag)
+                if m is not None and t is not None:
+                    scan_maps.append(m)
+                    scan_titles.append(t)
 
-        if args.print_mode == "log" and len(scan_stats) > 0:
+        if args.print_mode == "qkv" and len(scan_stats) > 0:
             scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
             _plot_norm_progression(
                 scan_stats, args.outdir, key="k_norm", ylabel="||K[0]||",
-                title="K-norm progression", fname="scan_knorm.png", suffix=pert_suffix
+                title=f"K-norm progression (sink={args.sink_idx})", fname="scan_knorm.png", suffix=pert_suffix
             )
             _plot_norm_progression(
                 scan_stats, args.outdir, key="v_norm", ylabel="||V[0]||",
-                title="V-norm progression", fname="scan_vnorm.png", suffix=pert_suffix
+                title=f"V-norm progression (sink={args.sink_idx})", fname="scan_vnorm.png", suffix=pert_suffix
             )
-            _plot_cosine_stack(scan_stats, args.outdir, suffix=pert_suffix)
+            _plot_cosine_stack(scan_stats, args.outdir, suffix=pert_suffix, suptitle=f"Cosine to K[{args.sink_idx}] across layers")
         
         elif args.print_mode == "heatmap" and len(scan_maps) > 0:
             grid_title = "Attention heatmaps"
@@ -459,8 +482,15 @@ def main():
             )
 
     else:
-        handle_one(args.layer, args.head)
-
+        if args.print_mode == "qkv":
+            _ = _aggregate_qkv_for_layer(args.layer, args.head)
+        else:
+            tag = ""
+            if rope_overrides:
+                ov_str = ",".join([f"{ti}={rp}" for ti, rp in rope_overrides])
+                tag = f"PERTURBED rope({ov_str}) "
+            _, _ = _aggregate_attn_score_for_layer(args.layer, args.head, tag=tag)
+        
     for pair in lower_attn_handles:
         for h in pair:
             try:
