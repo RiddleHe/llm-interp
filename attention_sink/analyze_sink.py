@@ -10,6 +10,8 @@ python analyze_sink.py --scan \
 import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
+from tqdm import tqdm
+from matplotlib import ticker
 
 EPS = 1e-12
 PRINT_CHOICES = ["heatmap", "qkv"]
@@ -233,10 +235,13 @@ def _plot_heatmap_with_tag(head_attn, layer, head, outdir, tag="BASE", return_ma
 def _plot_attn(attn, title, out_path, suffix=""):
     plt.figure(figsize=(6, 4.5))
     im = plt.imshow(attn, aspect="auto", origin="lower", interpolation="nearest")
-    plt.gca().invert_yaxis()
-    plt.title(title)
-    plt.xlabel("K")
-    plt.ylabel("Q")
+    ax = plt.gca()
+    ax.invert_yaxis()
+    ax.set_title(title)
+    ax.set_xlabel("K")
+    ax.set_ylabel("Q")
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(5))
+    ax.yaxis.set_major_locator(ticker.MultipleLocator(5))
     cbar = plt.colorbar(im)
     cbar.set_label("Attention prob")
     plt.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
@@ -304,6 +309,9 @@ def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4, suffix="", suptitle=
             ax.set_xlabel("K")
             ax.set_ylabel("Q")
             ax.invert_yaxis()
+
+            ax.xaxis.set_major_locator(ticker.MultipleLocator(5))
+            ax.yaxis.set_major_locator(ticker.MultipleLocator(5))
         else:
             ax.axis("off")
     
@@ -344,6 +352,7 @@ def main():
     p.add_argument("--print", dest="print_mode", choices=PRINT_CHOICES, default="qkv")
     p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print qkv, eg. '256,512,768")
     p.add_argument("--sink-idx", type=int, default=0, help="Index of the sink in qkv mode")
+    p.add_argument("--compare", action="store_true", help="Compare perturbed run vs baseline")
     # perturbations
     p.add_argument("--rope", default=None, help="Comma-separated list of token_idx=rope_pos, eg. '12=0,42=1")
     p.add_argument("--mask", default=None, choices=["upper"], help="Causal mask type")
@@ -354,6 +363,9 @@ def main():
     args = p.parse_args()
 
     tok, model = load_model(args.model, args.device, args.dtype, random_init=args.random_init)
+
+    if args.compare and args.print_mode == "heatmap":
+        raise NotImplementedError("--compare is only available for --print qkv")
 
     if args.prompt_file:
         prompts = _load_prompts_from_file(args.prompt_file)
@@ -368,6 +380,8 @@ def main():
         input_ids = tokenize(tok, text)
         base_pos = make_position_ids(input_ids.shape[1])
         tokenized.append((input_ids, base_pos))
+    print(f"[Tokenized] Tokens[0, 0] is {tokenized[0][0][0, 0]}")
+    print(f"[Tokenized] Tokens[0, 0] text is {tok.decode(tokenized[0][0][0, 0])}")
 
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -385,6 +399,7 @@ def main():
         )
 
     scan_stats = [] # aggregated per layer
+    scan_stats_base = []
     scan_maps, scan_titles = [], []
 
     def _aggregate_qkv_for_layer(layer, head):
@@ -395,7 +410,7 @@ def main():
         q_positions = list(_parse_qpos(args.qpos, min_len)) # clamp to valid seq range
         sink_idx = max(0, min(min_len - 1, args.sink_idx)) 
         
-        for input_ids, base_pos in tokenized:
+        for input_ids, base_pos in tqdm(tokenized, desc="Aggregating QKV", position=1, leave=False):
             pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
             attns, q, k, v = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=True)
             if q is None or k is None:
@@ -424,7 +439,7 @@ def main():
     def _aggregate_attn_score_for_layer(layer, head, tag):
         attn_maps = []
         min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
-        for input_ids, base_pos in tokenized:
+        for input_ids, base_pos in tqdm(tokenized, desc="Aggregating attention scores", position=1, leave=False):
             pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
             attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=False)
             if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
@@ -442,7 +457,8 @@ def main():
             return None, None
 
     if args.scan:
-        for L in range(0, num_layers, 4):
+        # perturbed pass
+        for L in tqdm(range(0, num_layers, 4), desc="Scanning layers", position=0, leave=True):
             if args.print_mode == "qkv":
                 stats = _aggregate_qkv_for_layer(L, args.head)
                 scan_stats.append(stats)
@@ -455,6 +471,19 @@ def main():
                 if m is not None and t is not None:
                     scan_maps.append(m)
                     scan_titles.append(t)
+        
+        # baseline pass
+        if args.compare and args.print_mode == "qkv":
+            def _agg_baseline(layer, head):
+                nonlocal rope_overrides
+                tmp = rope_overrides
+                rope_overrides = None
+                try:
+                    return _aggregate_qkv_for_layer(layer, head)
+                finally:
+                    rope_overrides = tmp
+            for L in range(0, num_layers, 4):
+                scan_stats_base.append(_agg_baseline(L, args.head))
 
         if args.print_mode == "qkv" and len(scan_stats) > 0:
             scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
