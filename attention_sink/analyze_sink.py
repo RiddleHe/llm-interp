@@ -247,46 +247,29 @@ def _plot_attn(attn, title, out_path, suffix=""):
     plt.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
     plt.close()
 
-def _plot_norm_progression(stats, outdir, key, ylabel, title, fname, suffix=""):
-    layers = sorted({s["layer"] for s in stats})
-    by_layer = {s["layer"]: s for s in stats}
-    y = [by_layer[L][key] for L in layers]
+def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", stats_b=None):
+    layers = sorted({s["layer"] for s in stats_a})
+    by_a = {s["layer"]: s for s in stats_a}
+    y_a = [by_a[L][key] for L in layers]
     plt.figure(figsize=(7, 3.5))
-    plt.plot(layers, y, marker="o")
+    plt.plot(layers, y_a, marker="o", label="Perturbed" if stats_b else None)
+
+    if stats_b:
+        by_b = {s["layer"]: s for s in stats_b}
+        y_b = [by_b[L][key] for L in layers]
+        plt.plot(layers, y_b, marker="s", label="Baseline")
+
     plt.xlabel("Layer")
     plt.ylabel(ylabel)
-
-    if len(y) > 0:
-        plt.axhline(y[-1], color="gray", linestyle="--", linewidth=1.0)
-
+    if len(y_a) > 0:
+        plt.axhline(y_a[-1], color="gray", linestyle="--", linewidth=1.0)
+    
     plt.title(title)
+    if stats_b:
+        plt.legend()
     plt.tight_layout()
     plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
     plt.close()
-
-def _plot_cosine_stack(stats, outdir, suffix="", suptitle="Cosine to K[sink] across layers"):
-    layers = sorted({s["layer"] for s in stats})
-    by_layer = {s["layer"]: s for s in stats}
-    q_positions = stats[0]["q_positions"]
-    nrows = len(q_positions)
-    fig_height = 2.2*nrows
-    fig, axes = plt.subplots(nrows, 1, figsize=(7, fig_height), sharex=True)
-    if nrows == 1:
-        axes = [axes]
-    
-    for i, qi in enumerate(q_positions):
-        y = [by_layer[L]["cos"][i] for L in layers]
-        axes[i].plot(layers, y, marker="o")
-        axes[i].set_ylabel(f"cos@q={qi}")
-        axes[i].set_ylim(0.0, 1.0)
-        if len(y) > 0:
-            axes[i].axhline(y[-1], color="gray", linestyle="--", linewidth=1.0)
-    
-    axes[-1].set_xlabel("Layer")
-    fig.suptitle(suptitle)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    fig.savefig(_append_suffix(os.path.join(outdir, f"scan_cosine.png"), suffix), dpi=300)
-    plt.close(fig)
 
 def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4, suffix="", suptitle="Attention heatmaps"):
     n = len(attn_maps)
@@ -364,8 +347,8 @@ def main():
 
     tok, model = load_model(args.model, args.device, args.dtype, random_init=args.random_init)
 
-    if args.compare and args.print_mode == "heatmap":
-        raise NotImplementedError("--compare is only available for --print qkv")
+    if args.compare and (args.print_mode == "heatmap" or args.lower_attn):
+        raise NotImplementedError("--compare is only available for --print qkv with limited perturbation options")
 
     if args.prompt_file:
         prompts = _load_prompts_from_file(args.prompt_file)
@@ -407,33 +390,33 @@ def main():
         k_norms, v_norms = [], []
         attn_maps = []
         min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
-        q_positions = list(_parse_qpos(args.qpos, min_len)) # clamp to valid seq range
-        sink_idx = max(0, min(min_len - 1, args.sink_idx)) 
+        last_q = min_len - 1
+        sink_idx = max(0, min(last_q, args.sink_idx)) 
         
         for input_ids, base_pos in tqdm(tokenized, desc="Aggregating QKV", position=1, leave=False):
             pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
             attns, q, k, v = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=True)
             if q is None or k is None:
                 raise RuntimeError("Failed to capture Q/K.")
-            series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=sink_idx, q_positions=q_positions)
+            series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=sink_idx, q_positions=[last_q])
             v_norm = float(v[0, head, sink_idx].norm().item())
 
             k_norms.append(k_norm)
             v_norms.append(v_norm)
-            cos_list.append([c for (_, c) in series])
+            cos_list.append(series[0][1])
             if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
                 hm = pick_head(model._lower_attn_cache, layer, head)
             else:
                 hm = pick_head(attns, layer, head)
             attn_maps.append(hm[:min_len, :min_len])
 
-        cos_mean = np.mean(np.array(cos_list), axis=0).tolist()
+        cos_mean = float(np.mean(np.array(cos_list)))
         k_mean = float(np.mean(k_norms))
         v_mean = float(np.mean(v_norms))
         attn_agg = np.mean(np.stack(attn_maps, axis=0), axis=0)
         return {
             "k_norm": k_mean, "v_norm": v_mean, "cos": cos_mean, 
-            "layer": layer, "head": head, "q_positions": q_positions
+            "layer": layer, "head": head,
         }
 
     def _aggregate_attn_score_for_layer(layer, head, tag):
@@ -487,15 +470,36 @@ def main():
 
         if args.print_mode == "qkv" and len(scan_stats) > 0:
             scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
-            _plot_norm_progression(
-                scan_stats, args.outdir, key="k_norm", ylabel="||K[0]||",
-                title=f"K-norm progression (sink={args.sink_idx})", fname="scan_knorm.png", suffix=pert_suffix
-            )
-            _plot_norm_progression(
-                scan_stats, args.outdir, key="v_norm", ylabel="||V[0]||",
-                title=f"V-norm progression (sink={args.sink_idx})", fname="scan_vnorm.png", suffix=pert_suffix
-            )
-            _plot_cosine_stack(scan_stats, args.outdir, suffix=pert_suffix, suptitle=f"Cosine to K[{args.sink_idx}] across layers")
+            if args.compare and len(scan_stats_base) > 0:
+                scan_stats_base = sorted(scan_stats_base, key=lambda s: s["layer"])
+                _plot_progression(
+                    scan_stats, args.outdir, key="k_norm", ylabel=f"||K[{args.sink_idx}]||",
+                    title=f"K-norm (token={args.sink_idx})", fname="scan_knorm_compare.png", suffix=pert_suffix,
+                    stats_b=scan_stats_base
+                )
+                _plot_progression(
+                    scan_stats, args.outdir, key="v_norm", ylabel=f"||V[{args.sink_idx}]||",
+                    title=f"V-norm (token={args.sink_idx})", fname="scan_vnorm_compare.png", suffix=pert_suffix,
+                    stats_b=scan_stats_base
+                )
+                _plot_progression(
+                    scan_stats, args.outdir, key="cos", ylabel=f"cos(Q[last], K[{args.sink_idx}])",
+                    title=f"Cosine to K[{args.sink_idx}] across layers (compare)", fname="scan_cosine_compare.png", suffix=pert_suffix,
+                    stats_b=scan_stats_base
+                )
+            else:
+                _plot_progression(
+                    scan_stats, args.outdir, key="k_norm", ylabel=f"||K[{args.sink_idx}]||",
+                    title=f"K-norm progression (token={args.sink_idx})", fname="scan_knorm.png", suffix=pert_suffix
+                )
+                _plot_progression(
+                    scan_stats, args.outdir, key="v_norm", ylabel=f"||V[{args.sink_idx}||",
+                    title=f"V-norm progression (token={args.sink_idx})", fname="scan_vnorm.png", suffix=pert_suffix
+                )
+                _plot_progression(
+                    scan_stats, args.outdir, key="cos", ylabel=f"cos(Q[last], K[{args.sink_idx}])",
+                    title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=pert_suffix,
+                )
         
         elif args.print_mode == "heatmap" and len(scan_maps) > 0:
             grid_title = "Attention heatmaps"
