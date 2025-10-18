@@ -127,15 +127,6 @@ def parse_overrides(s):
         out.append((int(ti), int(rp)))
     return out
 
-def _parse_qpos(arg, seq_len):
-    if arg:
-        return [max(0, min(seq_len - 1, int(x))) for x in arg.split(",")]
-    last = seq_len - 1
-    two_thirds = max(0, (2 * seq_len) // 3 - 1)
-    one_third = max(0, seq_len // 3 - 1)
-    q_positions = sorted({one_third, two_thirds, last})
-    return q_positions
-
 def _append_suffix(path, suffix):
     if not suffix:
         return path
@@ -144,7 +135,10 @@ def _append_suffix(path, suffix):
 
 # Forward & capture functions
 
-def _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False):
+def _forward_attn_and_qkv(
+    model, input_ids, position_ids, layer, need_qkv=False, 
+    collect_row=False, row_head=0, row_qidx=None
+):
     cache = {}
     if need_qkv:
         _capture_qkv(model, layer, cache)
@@ -154,7 +148,17 @@ def _forward_attn_and_qkv(model, input_ids, position_ids, layer, need_qkv=False)
         hook.remove()
 
     q, k, v = cache.get("q", None), cache.get("k", None), cache.get("v", None)
-    return attns, q, k, v
+    
+    row_logits = None
+    row_probs = None
+    if collect_row and q is not None and k is not None and row_qidx is not None:
+        head_dim = model.config.head_dim
+        logits = torch.matmul(q[:, row_head], k[:, row_head].transpose(2, 1)) / math.sqrt(head_dim)
+        row_logits = logits[:, row_qidx].detach().float().cpu()
+        probs = attns[layer][:, row_head]
+        row_probs = probs[:, row_qidx].detach().float().cpu()
+    
+    return attns, q, k, v, row_logits, row_probs
 
 @torch.no_grad()
 def prefill(model, input_ids, position_ids):
@@ -247,7 +251,7 @@ def _plot_attn(attn, title, out_path, suffix=""):
     plt.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
     plt.close()
 
-def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", stats_b=None):
+def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", stats_b=None, is_cos=False):
     layers = sorted({s["layer"] for s in stats_a})
     by_a = {s["layer"]: s for s in stats_a}
     y_a = [by_a[L][key] for L in layers]
@@ -263,7 +267,10 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     plt.ylabel(ylabel)
     if len(y_a) > 0:
         plt.axhline(y_a[-1], color="gray", linestyle="--", linewidth=1.0)
-    
+    if is_cos:
+        plt.ylim(0, 1)
+
+    plt.gca().xaxis.set_major_locator(ticker.MultipleLocator(4))
     plt.title(title)
     if stats_b:
         plt.legend()
@@ -318,6 +325,8 @@ def _pert_suffix(args):
         suffix += "__" + "lower_attn"
     if args.sink_idx != 0:
         suffix += "__" + f"sink[{args.sink_idx}]"
+    if args.target_idx is not None:
+        suffix += "__" + f"target[{args.target_idx}]"
     return suffix
 
 def main():
@@ -335,6 +344,7 @@ def main():
     p.add_argument("--print", dest="print_mode", choices=PRINT_CHOICES, default="qkv")
     p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print qkv, eg. '256,512,768")
     p.add_argument("--sink-idx", type=int, default=0, help="Index of the sink in qkv mode")
+    p.add_argument("--target-idx", type=int, default=None, help="Index of the target token for --print qkv")
     p.add_argument("--compare", action="store_true", help="Compare perturbed run vs baseline")
     # perturbations
     p.add_argument("--rope", default=None, help="Comma-separated list of token_idx=rope_pos, eg. '12=0,42=1")
@@ -391,14 +401,18 @@ def main():
         attn_maps = []
         min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
         last_q = min_len - 1
+        if args.target_idx is None:
+            target_q = last_q
+        else:
+            target_q = max(0, min(last_q, args.target_idx))
         sink_idx = max(0, min(last_q, args.sink_idx)) 
         
         for input_ids, base_pos in tqdm(tokenized, desc="Aggregating QKV", position=1, leave=False):
             pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
-            attns, q, k, v = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=True)
+            attns, q, k, v, _, _ = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=True)
             if q is None or k is None:
                 raise RuntimeError("Failed to capture Q/K.")
-            series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=sink_idx, q_positions=[last_q])
+            series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=sink_idx, q_positions=[target_q])
             v_norm = float(v[0, head, sink_idx].norm().item())
 
             k_norms.append(k_norm)
@@ -424,7 +438,7 @@ def main():
         min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
         for input_ids, base_pos in tqdm(tokenized, desc="Aggregating attention scores", position=1, leave=False):
             pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
-            attns, _, _, _ = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=False)
+            attns, _, _, _, _, _ = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=False)
             if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
                 hm = pick_head(model._lower_attn_cache, layer, head)
             else:
@@ -441,9 +455,11 @@ def main():
 
     if args.scan:
         # perturbed pass
-        for L in tqdm(range(0, num_layers, 4), desc="Scanning layers", position=0, leave=True):
+        for L in tqdm(range(0, num_layers, 4), desc="Scanning layers", position=0, leave=False):
             if args.print_mode == "qkv":
                 stats = _aggregate_qkv_for_layer(L, args.head)
+                all_logits, all_probs = [], []
+                
                 scan_stats.append(stats)
             else:
                 tag = ""
@@ -465,27 +481,28 @@ def main():
                     return _aggregate_qkv_for_layer(layer, head)
                 finally:
                     rope_overrides = tmp
-            for L in range(0, num_layers, 4):
+            for L in tqdm(range(0, num_layers, 4), desc="Scanning baseline layers", position=0, leave=False):
                 scan_stats_base.append(_agg_baseline(L, args.head))
 
         if args.print_mode == "qkv" and len(scan_stats) > 0:
             scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
+            q_label = f"Q[{args.target_idx}]" if args.target_idx is not None else "Q[last]"
             if args.compare and len(scan_stats_base) > 0:
                 scan_stats_base = sorted(scan_stats_base, key=lambda s: s["layer"])
                 _plot_progression(
                     scan_stats, args.outdir, key="k_norm", ylabel=f"||K[{args.sink_idx}]||",
-                    title=f"K-norm (token={args.sink_idx})", fname="scan_knorm_compare.png", suffix=pert_suffix,
+                    title=f"K-norm progression (token={args.sink_idx}) (compare)", fname="scan_knorm_compare.png", suffix=pert_suffix,
                     stats_b=scan_stats_base
                 )
                 _plot_progression(
                     scan_stats, args.outdir, key="v_norm", ylabel=f"||V[{args.sink_idx}]||",
-                    title=f"V-norm (token={args.sink_idx})", fname="scan_vnorm_compare.png", suffix=pert_suffix,
+                    title=f"V-norm progression (token={args.sink_idx}) (compare)", fname="scan_vnorm_compare.png", suffix=pert_suffix,
                     stats_b=scan_stats_base
                 )
                 _plot_progression(
-                    scan_stats, args.outdir, key="cos", ylabel=f"cos(Q[last], K[{args.sink_idx}])",
+                    scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
                     title=f"Cosine to K[{args.sink_idx}] across layers (compare)", fname="scan_cosine_compare.png", suffix=pert_suffix,
-                    stats_b=scan_stats_base
+                    stats_b=scan_stats_base, is_cos=True
                 )
             else:
                 _plot_progression(
@@ -497,8 +514,8 @@ def main():
                     title=f"V-norm progression (token={args.sink_idx})", fname="scan_vnorm.png", suffix=pert_suffix
                 )
                 _plot_progression(
-                    scan_stats, args.outdir, key="cos", ylabel=f"cos(Q[last], K[{args.sink_idx}])",
-                    title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=pert_suffix,
+                    scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
+                    title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=pert_suffix, is_cos=True
                 )
         
         elif args.print_mode == "heatmap" and len(scan_maps) > 0:
@@ -520,7 +537,16 @@ def main():
 
     else:
         if args.print_mode == "qkv":
-            _ = _aggregate_qkv_for_layer(args.layer, args.head)
+            input_ids, base_pos = tokenized[0]
+            last_q = input_ids.shape[1] - 1
+            target_q = args.target_idx if args.target_idx is not None else last_q
+            attns, q, k, v, row_logits, row_probs = _forward_attn_and_qkv(
+                model, input_ids, base_pos, args.layer, need_qkv=True,
+                collect_row=True, row_head=args.head, row_qidx=target_q
+            )
+            if row_logits is not None and row_probs is not None:
+                print(f"[layer {args.layer} head {args.head}] logits[query={target_q}]: ", row_logits)
+                print(f"[layer {args.layer} head {args.head}] probs[query={target_q}]: ", row_probs)
         else:
             tag = ""
             if rope_overrides:
