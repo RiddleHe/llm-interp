@@ -18,6 +18,19 @@ PRINT_CHOICES = ["heatmap", "qkv"]
 
 # Perturbation & loading functions
 
+def _disable_packed_sequence_splitting():
+    try:
+        import transformers.masking_utils as _mu
+        import torch
+        
+        def _no_split_find_packed_sequence_indices(position_ids, *args, **kwargs):
+            return torch.zeros_like(position_ids, dtype=torch.long)
+        
+        _mu.find_packed_sequence_indices = _no_split_find_packed_sequence_indices
+        print("[transformers] Disabled packed-sequence split.")
+    except Exception as e:
+        print(f"[transformers] Failed to patch find_packed_sequence_indices: {e}")
+
 def load_model(model_name, device, dtype, random_init=False):
     torch_dtype = {"auto": "auto", "bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dmap = "auto" if device == "auto" else None
@@ -373,6 +386,7 @@ def main():
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
 
+    _disable_packed_sequence_splitting()
     tok, model = load_model(args.model, args.device, args.dtype, random_init=args.random_init)
 
     if args.compare and (args.print_mode == "heatmap" or args.lower_attn):
