@@ -73,7 +73,7 @@ def apply_rope_overrides(position_ids, overrides):
             raise ValueError(f"token idx {ti} out of range (seq_len={seq_len})")
     return pos
 
-def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0):
+def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_return_sink_value=False):
     handles = []
     num_heads = model.config.num_attention_heads
     num_kv = model.config.num_key_value_heads
@@ -103,7 +103,13 @@ def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0):
             probs[..., sink_k_idx] *= factor  # we don't renormalize
 
             v = _cache["v"]
-            ctx = torch.matmul(probs, v)
+            if only_return_sink_value:
+                sink_w = probs[..., sink_k_idx].unsqueeze(-1) # [B, H, Q, 1]
+                v_sink = v[:, :, sink_k_idx:sink_k_idx+1, :] # [B, H, 1, D]
+                ctx = sink_w * v_sink 
+            else:
+                ctx = torch.matmul(probs, v)
+
             B, H, Q, D = ctx.shape
             ctx = ctx.transpose(1, 2).contiguous().view(B, Q, H*D)
             new_out = _module.o_proj(ctx)
@@ -382,6 +388,7 @@ def main():
     p.add_argument("--stop-layers", type=int, nargs=2, default=None, help="Iteratively apply lower attention to all layers until the idx in [BEGIN, END) (0-indexed)")
     p.add_argument("--only-stop-layer", type=int, nargs="+", default=None, help="Only apply lower attention to these layers (0-indexed)")
     p.add_argument("--lower-factor", type=float, default=0.5, help="Factor to lower attention by")
+    p.add_argument("--only-return-sink-value", action="store_true", help="When lowering attention, replace attention sum with only attn_to_sink * V_sink")
     # output
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
@@ -555,7 +562,8 @@ def main():
                 target_layers = [L for L in range(num_layers) if L <= _job_stop]
             if target_layers:
                 lower_attn_handles = _install_lower_attn_hooks(
-                    model, layers=target_layers, factor=args.lower_factor, sink_k_idx=args.sink_idx
+                    model, layers=target_layers, factor=args.lower_factor, sink_k_idx=args.sink_idx,
+                    only_return_sink_value=args.only_return_sink_value
                 )
 
         scan_stats = [] # aggregated per layer
