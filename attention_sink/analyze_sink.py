@@ -291,7 +291,14 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     else:
         plt.ylim(0, 100)
 
-    plt.gca().xaxis.set_major_locator(ticker.MultipleLocator(4))
+    ax = plt.gca()
+    if len(layers) > 0:
+        ax.set_xlim(min(layers), max(layers))
+        ax.set_xticks(layers)
+        ax.set_xticklabels(["baseline" if L == -1 else str(L) for L in layers], rotation=0)
+        if -1 not in layers:
+            ax.xaxis.set_major_locator(ticker.MultipleLocator(2))
+
     plt.title(title)
     if stats_b:
         plt.legend()
@@ -485,7 +492,7 @@ def main():
             "target_q": target_q, "sink_attn": sink_mean
         }
 
-    def _aggregate_attn_score_for_layer(layer, head, tag=""):
+    def _aggregate_attn_score_for_layer(layer, head, tag="", suffix=""):
         attn_maps = []
         min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
         sink_attn_values = []
@@ -506,11 +513,11 @@ def main():
         sink_mean = float(np.mean(np.array(sink_attn_values))) if sink_attn_values else None
         result = {"layer": layer, "head": head, "sink_attn": sink_mean, "heatmap": None, "title": None}
         if args.scan:
-            m, t = _plot_heatmap_with_tag(head_attn, layer, head, args.outdir, tag=tag, return_map=True, suffix=pert_suffix)
+            m, t = _plot_heatmap_with_tag(head_attn, layer, head, args.outdir, tag=tag, return_map=True, suffix=suffix)
             result["heatmap"] = m
             result["title"] = t
         else:
-            _plot_heatmap_with_tag(head_attn, layer, head, args.outdir, tag=tag, return_map=False, suffix=pert_suffix)
+            _plot_heatmap_with_tag(head_attn, layer, head, args.outdir, tag=tag, return_map=False, suffix=suffix)
         return result
 
     def _log_row_summary(prefix, stats_list):
@@ -536,26 +543,28 @@ def main():
         finally:
             rope_overrides = tmp
 
-    stop_jobs = [None]
+    stop_jobs = [("baseline", None)]
     if args.lower_attn:
         if args.stop_layers and args.only_stop_layer:
             raise ValueError("--stop-layers and --only-stop-layer cannot be used together.")
         if args.only_stop_layer:
-            stop_jobs = [args.only_stop_layer]
+            stop_jobs = [("stop", int(L)) for L in args.only_stop_layer]
         elif args.stop_layers:
             b, e = args.stop_layers
             b = max(0, int(b))
             e = min(num_layers, int(e))
-            stop_jobs = list(range(b, e))
+            stop_jobs += [("stop", L) for L in range(b, e)]
         else:
-            stop_jobs = [num_layers - 1]
+            stop_jobs = [("stop", num_layers - 1)]
 
-    for _job_stop in stop_jobs:
+    for _job_kind, _job_stop in stop_jobs:
         args._current_stop_layer = _job_stop
         pert_suffix = _pert_suffix(args)
+        baseline_run = (_job_kind == "baseline")
+        cur_suffix = "" if baseline_run else pert_suffix
 
         lower_attn_handles = []
-        if args.lower_attn:
+        if args.lower_attn and not baseline_run:
             if args.only_stop_layer is not None:
                 target_layers = [int(L) for L in args.only_stop_layer]
             else:
@@ -587,7 +596,7 @@ def main():
                     if rope_overrides:
                         ov_str = ",".join([f"{ti}={rp}" for ti, rp in rope_overrides])
                         tag = f"PERTURBED rope({ov_str}) "
-                    stats = _aggregate_attn_score_for_layer(L, args.head, tag)
+                    stats = _aggregate_attn_score_for_layer(L, args.head, tag, suffix=cur_suffix)
                     if stats["heatmap"] is not None and stats["title"] is not None:
                         scan_maps.append(stats["heatmap"])
                         scan_titles.append(stats["title"])
@@ -606,17 +615,17 @@ def main():
                     scan_stats_base = sorted(scan_stats_base, key=lambda s: s["layer"])
                     _plot_progression(
                         scan_stats, args.outdir, key="k_norm", ylabel=f"||K[{args.sink_idx}]||",
-                        title=f"K-norm progression (token={args.sink_idx}) (compare)", fname="scan_knorm_compare.png", suffix=pert_suffix,
+                        title=f"K-norm progression (token={args.sink_idx}) (compare)", fname="scan_knorm_compare.png", suffix=cur_suffix,
                         stats_b=scan_stats_base
                     )
                     _plot_progression(
                         scan_stats, args.outdir, key="v_norm", ylabel=f"||V[{args.sink_idx}]||",
-                        title=f"V-norm progression (token={args.sink_idx}) (compare)", fname="scan_vnorm_compare.png", suffix=pert_suffix,
+                        title=f"V-norm progression (token={args.sink_idx}) (compare)", fname="scan_vnorm_compare.png", suffix=cur_suffix,
                         stats_b=scan_stats_base
                     )
                     _plot_progression(
                         scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
-                        title=f"Cosine to K[{args.sink_idx}] across layers (compare)", fname="scan_cosine_compare.png", suffix=pert_suffix,
+                        title=f"Cosine to K[{args.sink_idx}] across layers (compare)", fname="scan_cosine_compare.png", suffix=cur_suffix,
                         stats_b=scan_stats_base, is_cos=True
                     )
                     # _log_row_summary("[Perturbed] ", scan_stats)
@@ -624,15 +633,15 @@ def main():
                 else:
                     _plot_progression(
                         scan_stats, args.outdir, key="k_norm", ylabel=f"||K[{args.sink_idx}]||",
-                        title=f"K-norm progression (token={args.sink_idx})", fname="scan_knorm.png", suffix=pert_suffix
+                        title=f"K-norm progression (token={args.sink_idx})", fname="scan_knorm.png", suffix=cur_suffix
                     )
                     _plot_progression(
                         scan_stats, args.outdir, key="v_norm", ylabel=f"||V[{args.sink_idx}]||",
-                        title=f"V-norm progression (token={args.sink_idx})", fname="scan_vnorm.png", suffix=pert_suffix
+                        title=f"V-norm progression (token={args.sink_idx})", fname="scan_vnorm.png", suffix=cur_suffix
                     )
                     _plot_progression(
                         scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
-                        title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=pert_suffix, is_cos=True
+                        title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=cur_suffix, is_cos=True
                     )
                     # _log_row_summary("[Perturbed] ", scan_stats)
             
@@ -645,7 +654,7 @@ def main():
                     grid_title += f" - mask({args.mask})"
                 if args.random_init:
                     grid_title += " - [random init]"
-                if args.lower_attn:
+                if args.lower_attn and not baseline_run:
                     segment = "lower_attn"
                     if args.only_stop_layer is not None:
                         segment += f" only_stop[{args.only_stop_layer}]"
@@ -655,13 +664,16 @@ def main():
 
                 _plot_heatmap_grid(
                     scan_maps, scan_titles, os.path.join(args.outdir, "scan_heatmaps.png"), rows=4,
-                    suffix=pert_suffix, suptitle=grid_title,
+                    suffix=cur_suffix, suptitle=grid_title,
                 )
             
             if summary is not None:
                 print(f"[Summary] sink attention at layer {num_layers - 1}: {summary:.4f} | stop at {args._current_stop_layer}")
-                if args.lower_attn and args._current_stop_layer is not None:
-                    job_summary_stats.append({"layer": int(args._current_stop_layer), "sink_attn": float(summary)})
+                if args.lower_attn:
+                    if baseline_run:
+                        job_summary_stats.append({"layer": -1, "sink_attn": float(summary)})
+                    elif args._current_stop_layer is not None:
+                        job_summary_stats.append({"layer": int(args._current_stop_layer), "sink_attn": float(summary)})
 
         else:
             if args.print_mode == "qkv":
@@ -680,7 +692,7 @@ def main():
                     if rope_overrides:
                         ov_str = ",".join([f"{ti}={rp}" for ti, rp in rope_overrides])
                         tag = f"PERTURBED rope({ov_str}) "
-                    _, _ = _aggregate_attn_score_for_layer(args.layer, args.head, tag=tag)
+                    _, _ = _aggregate_attn_score_for_layer(args.layer, args.head, tag=tag, suffix=cur_suffix)
                 
         for pair in lower_attn_handles:
             for h in pair:
@@ -689,15 +701,16 @@ def main():
                 except Exception:
                     pass
 
-    if args.lower_attn and len(job_summary_stats) > 0:
+    if args.lower_attn and len(job_summary_stats) > 0 and (args.stop_layers is not None) and (args.only_stop_layer is None):
         job_summary_stats = sorted(job_summary_stats, key=lambda s: s["layer"])
         prev_stop = getattr(args, "_current_stop_layer", None)
         args._current_stop_layer = None
         agg_suffix = _pert_suffix(args)
         args._current_stop_layer = prev_stop
+        title_str = f"Sink attention score progression for the last query token (x{args.lower_factor})"
         _plot_progression(
             job_summary_stats, args.outdir, key="sink_attn",
-            ylabel="Sink attention score", title="Sink attention score progression for the last query token",
+            ylabel="Sink attention score", title=title_str,
             fname="scan_sink_attn.png", suffix=agg_suffix, is_cos=True
         )
 
