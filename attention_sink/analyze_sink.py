@@ -341,7 +341,7 @@ def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4, suffix="", suptitle=
     fig.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
     plt.close(fig)
 
-def _pert_suffix(args):
+def _pert_suffix(args, include_lower_attn=True):
     suffix = ""
     if args.rope:
         suffix += "__" + f"rope[{args.rope}]"
@@ -349,7 +349,7 @@ def _pert_suffix(args):
         suffix += "__" + f"mask[{args.mask}]"
     if args.random_init:
         suffix += "__" + "random_init"
-    if args.lower_attn:
+    if include_lower_attn and args.lower_attn:
         segment = "lower_attn"
         cur_stop = getattr(args, "_current_stop_layer", None)
         if args.only_stop_layer is not None:
@@ -426,7 +426,7 @@ def main():
 
     rope_str = args.rope
     rope_overrides = parse_overrides(rope_str) if rope_str else None
-    pert_suffix = _pert_suffix(args)
+    base_suffix = _pert_suffix(args, include_lower_attn=False)
 
     num_layers = model.config.num_hidden_layers
     num_heads = model.config.num_attention_heads
@@ -559,9 +559,9 @@ def main():
 
     for _job_kind, _job_stop in stop_jobs:
         args._current_stop_layer = _job_stop
-        pert_suffix = _pert_suffix(args)
+        pert_suffix = _pert_suffix(args, include_lower_attn=True)
         baseline_run = (_job_kind == "baseline")
-        cur_suffix = "" if baseline_run else pert_suffix
+        cur_suffix = base_suffix if baseline_run else pert_suffix
 
         lower_attn_handles = []
         if args.lower_attn and not baseline_run:
@@ -703,10 +703,10 @@ def main():
 
     if args.lower_attn and len(job_summary_stats) > 0 and (args.stop_layers is not None) and (args.only_stop_layer is None):
         job_summary_stats = sorted(job_summary_stats, key=lambda s: s["layer"])
-        prev_stop = getattr(args, "_current_stop_layer", None)
+        _prev_stop = getattr(args, "_current_stop_layer", None)
         args._current_stop_layer = None
-        agg_suffix = _pert_suffix(args)
-        args._current_stop_layer = prev_stop
+        agg_suffix = _pert_suffix(args, include_lower_attn=True)
+        args._current_stop_layer = _prev_stop
         title_str = f"Sink attention score progression for the last query token (x{args.lower_factor})"
         _plot_progression(
             job_summary_stats, args.outdir, key="sink_attn",
