@@ -73,6 +73,18 @@ def apply_rope_overrides(position_ids, overrides):
             raise ValueError(f"token idx {ti} out of range (seq_len={seq_len})")
     return pos
 
+def _make_v_prehook(attn, cache, num_heads, num_kv, num_groups, model_cfg):
+    def _prehook(_module, args, kwargs, _cache=cache):
+        hidden_states = kwargs["hidden_states"]
+        B, S, _ = hidden_states.shape
+        head_dim = model_cfg.head_dim
+        v = attn.v_proj(hidden_states).view(B, S, num_kv, head_dim)
+        v = v.transpose(1, 2).contiguous()
+        if num_kv != num_heads:
+            v = v.repeat_interleave(num_groups, dim=1)
+        _cache["v"] = v
+    return _prehook
+
 def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_return_sink_value=False):
     handles = []
     num_heads = model.config.num_attention_heads
@@ -85,15 +97,7 @@ def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_retu
         attn = model.model.layers[L].self_attn
         cache = {}
 
-        def _prehook(_module, args, kwargs, _cache=cache):
-            hidden_states = kwargs["hidden_states"]
-            B, S, _ = hidden_states.shape
-            head_dim = model.config.head_dim
-            v = attn.v_proj(hidden_states).view(B, S, num_kv, head_dim)
-            v = v.transpose(1, 2).contiguous()
-            if num_kv != num_heads:
-                v = v.repeat_interleave(num_groups, dim=1)
-            _cache["v"] = v
+        _prehook = _make_v_prehook(attn, cache, num_heads, num_kv, num_groups, model.config)
 
         def _fwdhook(_module, args, output, _cache=cache):
             attn_output, attn_probs = output[0], output[1]
@@ -122,6 +126,49 @@ def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_retu
         h1 = attn.register_forward_pre_hook(_prehook, with_kwargs=True)
         h2 = attn.register_forward_hook(_fwdhook)
         handles.append([h1, h2])
+    return handles
+
+def _install_window_attn_hooks(model, layers, window_size=4):
+    handles = []
+    num_heads = model.config.num_attention_heads
+    num_kv = model.config.num_key_value_heads
+    num_groups = max(1, num_heads // max(1, num_kv))
+
+    for L in layers:
+        attn = model.model.layers[L].self_attn
+        cache = {}
+
+        _prehook = _make_v_prehook(attn, cache, num_heads, num_kv, num_groups, model.config)
+
+        def _fwdhook(_module, args, output, _cache=cache):
+            attn_output, attn_probs = output[0], output[1]
+            B, H, Q, K = attn_probs.shape
+
+            k_idx = torch.arange(K, device=attn_probs.device).view(1, 1, 1, K)
+            q_idx = torch.arange(Q, device=attn_probs.device).view(1, 1, Q, 1)
+            start = (q_idx - (window_size - 1)).clamp_min(0)
+            mask = (k_idx >= start) & (k_idx <= q_idx)
+            mask = mask.to(attn_probs.dtype)
+
+            probs = attn_probs * mask
+            denom = probs.sum(dim=-1, keepdim=True).clamp_min(EPS)
+            probs = probs / denom
+
+            v = _cache["v"]
+            ctx = torch.matmul(probs, v)
+            B_, H_, Q_, D = ctx.shape
+            ctx = ctx.transpose(1, 2).contiguous().view(B_, Q_, H_ * D)
+            new_out = _module.o_proj(ctx)
+
+            out_list = list(output)
+            out_list[0] = new_out
+            out_list[1] = probs
+            return tuple(out_list)
+
+        h1 = attn.register_forward_pre_hook(_prehook, with_kwargs=True)
+        h2 = attn.register_forward_hook(_fwdhook)
+        handles.append([h1, h2])
+
     return handles
 
 def apply_perturbations(base_pos, rope_overrides=None, mask=None):
@@ -333,11 +380,10 @@ def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4, suffix="", suptitle=
         else:
             ax.axis("off")
     
-    fig.subplots_adjust(right=0.88, top=0.92, bottom=0.02, hspace=0.25, wspace=0.25)
-    cbar_ax = fig.add_axes([0.90, 0.22, 0.02, 0.65])
+    fig.tight_layout(rect=[0, 0.01, 0.88, 0.95])
+    cbar_ax = fig.add_axes([0.90, 0.10, 0.02, 0.80])
     fig.colorbar(im, cax=cbar_ax, label="Attention prob")
     fig.suptitle(suptitle, fontsize=12, y=0.985)
-    fig.tight_layout(rect=[0, 0.01, 0.88, 0.95])
     fig.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
     plt.close(fig)
 
@@ -361,6 +407,11 @@ def _pert_suffix(args, include_lower_attn=True):
             segment += f"_stops[{b}-{int(e)-1}]" 
         if args.lower_factor != 0.5:
             segment += f"_x{args.lower_factor}"
+        suffix += "__" + segment
+    if args.window_attn:
+        segment = "window_attn"
+        segment += f"_stop[{int(args.stop_window_layer)}]"
+        segment += f"_size[{int(args.window_size)}]"
         suffix += "__" + segment
     if args.sink_idx != 0:
         suffix += "__" + f"sink[{args.sink_idx}]"
@@ -396,6 +447,10 @@ def main():
     p.add_argument("--only-stop-layer", type=int, nargs="+", default=None, help="Only apply lower attention to these layers (0-indexed)")
     p.add_argument("--lower-factor", type=float, default=0.5, help="Factor to lower attention by")
     p.add_argument("--only-return-sink-value", action="store_true", help="When lowering attention, replace attention sum with only attn_to_sink * V_sink")
+    # window attn metrics
+    p.add_argument("--window-attn", action="store_true", help="Constrain attention to a local window for early layers")
+    p.add_argument("--stop-window-layer", type=int, default=4, help="Apply windowed attention to layers [0, stop] inclusive.")
+    p.add_argument("--window-size", type=int, default=4, help="Local attention window size")
     # output
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
@@ -556,6 +611,8 @@ def main():
             stop_jobs += [("stop", L) for L in range(b, e)]
         else:
             stop_jobs = [("stop", num_layers - 1)]
+    if args.window_attn:
+        stop_jobs = [("window", int(args.stop_window_layer))]
 
     for _job_kind, _job_stop in stop_jobs:
         args._current_stop_layer = _job_stop
@@ -564,6 +621,7 @@ def main():
         cur_suffix = base_suffix if baseline_run else pert_suffix
 
         lower_attn_handles = []
+        window_attn_handles = []
         if args.lower_attn and not baseline_run:
             if args.only_stop_layer is not None:
                 target_layers = [int(L) for L in args.only_stop_layer]
@@ -573,6 +631,14 @@ def main():
                 lower_attn_handles = _install_lower_attn_hooks(
                     model, layers=target_layers, factor=args.lower_factor, sink_k_idx=args.sink_idx,
                     only_return_sink_value=args.only_return_sink_value
+                )
+
+        if args.window_attn and not baseline_run:
+            w_stop = int(getattr(args, "stop_window_layer", 4))
+            w_layers = [L for L in range(num_layers) if L <= w_stop]
+            if w_layers:
+                window_attn_handles = _install_window_attn_hooks(
+                    model, layers=w_layers, window_size=args.window_size
                 )
 
         scan_stats = [] # aggregated per layer
@@ -661,6 +727,8 @@ def main():
                     elif args._current_stop_layer is not None:
                         segment += f" stop[{args._current_stop_layer}]"
                     grid_title += f" - {segment} (x{args.lower_factor})"
+                if args.window_attn and not baseline_run:
+                    grid_title += f" - window_attn stop[{int(args.stop_window_layer)}] w{int(args.window_size)}"
 
                 _plot_heatmap_grid(
                     scan_maps, scan_titles, os.path.join(args.outdir, "scan_heatmaps.png"), rows=4,
@@ -694,7 +762,7 @@ def main():
                         tag = f"PERTURBED rope({ov_str}) "
                     _, _ = _aggregate_attn_score_for_layer(args.layer, args.head, tag=tag, suffix=cur_suffix)
                 
-        for pair in lower_attn_handles:
+        for pair in lower_attn_handles + window_attn_handles:
             for h in pair:
                 try:
                     h.remove()
