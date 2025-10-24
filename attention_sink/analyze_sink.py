@@ -458,7 +458,7 @@ def main():
     _disable_packed_sequence_splitting()
     tok, model = load_model(args.model, args.device, args.dtype, random_init=args.random_init)
 
-    if args.compare and (args.print_mode == "heatmap" or args.lower_attn):
+    if args.compare and (args.print_mode == "heatmap"):
         raise NotImplementedError("--compare is only available for --print qkv with limited perturbation options")
 
     if args.prompt_file:
@@ -603,15 +603,15 @@ def main():
         if args.stop_layers and args.only_stop_layer:
             raise ValueError("--stop-layers and --only-stop-layer cannot be used together.")
         if args.only_stop_layer:
-            stop_jobs = [("stop", int(L)) for L in args.only_stop_layer]
+            stop_jobs = [("lower", int(L)) for L in args.only_stop_layer]
         elif args.stop_layers:
             b, e = args.stop_layers
             b = max(0, int(b))
             e = min(num_layers, int(e))
-            stop_jobs += [("stop", L) for L in range(b, e)]
+            stop_jobs += [("lower", L) for L in range(b, e)]
         else:
-            stop_jobs = [("stop", num_layers - 1)]
-    if args.window_attn:
+            stop_jobs = [("lower", num_layers - 1)]
+    elif args.window_attn:
         stop_jobs = [("window", int(args.stop_window_layer))]
 
     for _job_kind, _job_stop in stop_jobs:
@@ -633,7 +633,7 @@ def main():
                     only_return_sink_value=args.only_return_sink_value
                 )
 
-        if args.window_attn and not baseline_run:
+        elif args.window_attn and not baseline_run:
             w_stop = int(getattr(args, "stop_window_layer", 4))
             w_layers = [L for L in range(num_layers) if L <= w_stop]
             if w_layers:
@@ -671,6 +671,17 @@ def main():
             
             # baseline pass
             if args.compare and args.print_mode == "qkv":
+                for pair in lower_attn_handles + window_attn_handles:
+                    for h in pair:
+                        try:
+                            h.remove()
+                        except Exception:
+                            pass
+                lower_attn_handles = []
+                window_attn_handles = []
+                if hasattr(model, "_lower_attn_cache"):
+                    model._lower_attn_cache = {}
+
                 for L in tqdm(scan_layers, desc="Scanning baseline layers", position=0, leave=False):
                     scan_stats_base.append(_agg_baseline(L, args.head))
 
