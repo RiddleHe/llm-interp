@@ -133,6 +133,7 @@ def _install_window_attn_hooks(model, layers, window_size=4):
     num_heads = model.config.num_attention_heads
     num_kv = model.config.num_key_value_heads
     num_groups = max(1, num_heads // max(1, num_kv))
+    model._window_attn_cache = {}
 
     for L in layers:
         attn = model.model.layers[L].self_attn
@@ -160,6 +161,7 @@ def _install_window_attn_hooks(model, layers, window_size=4):
             ctx = ctx.transpose(1, 2).contiguous().view(B_, Q_, H_ * D)
             new_out = _module.o_proj(ctx)
 
+            model._window_attn_cache[L] = probs.detach().float().cpu()
             out_list = list(output)
             out_list[0] = new_out
             out_list[1] = probs
@@ -238,36 +240,43 @@ def prefill(model, input_ids, position_ids):
     )
     return out.attentions # tuple(len=layers) of [B, H, Q, K]
 
-def _capture_qkv(model, layer_idx, cache):
-    attn = model.model.layers[layer_idx].self_attn
-    num_heads = model.config.num_attention_heads
-    num_kv = model.config.num_key_value_heads
-    num_groups = max(1, num_heads // max(1, num_kv))
-    head_dim = model.config.head_dim
+def _capture_qkv_multi(model, layer_idxs, cache):
+    handles = []
+    for L in layer_idxs:
+        attn = model.model.layers[L].self_attn
+        num_heads = model.config.num_attention_heads
+        num_kv = model.config.num_key_value_heads
+        num_groups = max(1, num_heads // max(1, num_kv))
+        head_dim = model.config.head_dim
 
-    def hook(_module, args, kwargs):
-        hidden_states = kwargs["hidden_states"]
-        cos, sin = kwargs["position_embeddings"]
-        B, S, _ = hidden_states.shape
+        def _mk_hook(L, attn_layer):
+            def hook(_module, args, kwargs):
+                hidden_states = kwargs["hidden_states"]
+                cos, sin = kwargs["position_embeddings"]
+                B, S, _ = hidden_states.shape
 
-        q = attn.q_proj(hidden_states).view(B, S, num_heads, head_dim)
-        k = attn.k_proj(hidden_states).view(B, S, num_kv, head_dim)
-        v = attn.v_proj(hidden_states).view(B, S, num_kv, head_dim)
-        q = attn.q_norm(q).transpose(1, 2).contiguous()
-        k = attn.k_norm(k).transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
+                q = attn_layer.q_proj(hidden_states).view(B, S, num_heads, head_dim)
+                k = attn_layer.k_proj(hidden_states).view(B, S, num_kv, head_dim)
+                v = attn_layer.v_proj(hidden_states).view(B, S, num_kv, head_dim)
+                q = attn_layer.q_norm(q).transpose(1, 2).contiguous()
+                k = attn_layer.k_norm(k).transpose(1, 2).contiguous()
+                v = v.transpose(1, 2).contiguous()
 
-        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        if num_kv != num_heads:
-            k = repeat_kv(k, num_groups)
-            v = repeat_kv(v, num_groups)
-        cache["q"] = q.detach().float().cpu()
-        cache["k"] = k.detach().float().cpu()
-        cache["v"] = v.detach().float().cpu()
+                from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                if num_kv != num_heads:
+                    k = repeat_kv(k, num_groups)
+                    v = repeat_kv(v, num_groups)
+                cache[L] = {
+                    "q": q.detach().float().cpu(),
+                    "k": k.detach().float().cpu(),
+                    "v": v.detach().float().cpu()
+                }
+            return hook
 
-    h = attn.register_forward_pre_hook(hook, with_kwargs=True)
-    cache["_hook"] = h
+        h = attn.register_forward_pre_hook(_mk_hook(L, attn), with_kwargs=True)
+        handles.append(h)
+    return handles
 
 def compute_cosine_series(q, k, head_idx, k_sink_idx, q_positions):
     kv = k[0, head_idx, k_sink_idx]
@@ -286,6 +295,13 @@ def compute_cosine_series(q, k, head_idx, k_sink_idx, q_positions):
 def pick_head(attentions, layer_idx, head_idx):
     attn_l = attentions[layer_idx]
     return attn_l[0, head_idx].detach().float().cpu().numpy()
+
+def _pick_head_with_caches(model, attns, layer_idx, head_idx):
+    if hasattr(model, "_lower_attn_cache") and (layer_idx in model._lower_attn_cache):
+        return pick_head(model._lower_attn_cache, layer_idx, head_idx)
+    if hasattr(model, "_window_attn_cache") and (layer_idx in model._window_attn_cache):
+        return pick_head(model._window_attn_cache, layer_idx, head_idx)
+    return pick_head(attns, layer_idx, head_idx)
 
 # Plotting functions
 
@@ -487,116 +503,73 @@ def main():
     num_heads = model.config.num_attention_heads
     job_summary_stats = []
 
-    def _aggregate_qkv_for_layer(layer, head):
-        cos_list = []
-        k_norms, v_norms = [], []
-        attn_maps = []
-        row_logits_list, row_probs_list = [], []
+    def _run_scan_pass(scan_layers, rope_overrides_local, need_qkv):
+        per_layer_acc = {
+            L: {"k_norm": [], "v_norm": [], "cos": [], "sink_attn": []}
+            for L in scan_layers
+        }
+        per_layer_maps = {
+            L: [] for L in scan_layers
+        }
+        scan_maps, scan_titles = [], []
         min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
         last_q = min_len - 1
-        if args.target_idx is None:
-            target_q = last_q
-        else:
-            target_q = max(0, min(last_q, args.target_idx))
-        sink_idx = max(0, min(last_q, args.sink_idx)) 
-        sink_attn_values = []
-        
-        for input_ids, base_pos in tqdm(tokenized, desc="Aggregating QKV", position=1, leave=False):
-            pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
-            attns, q, k, v, row_logits, row_probs = _forward_attn_and_qkv(
-                model, input_ids, pos_ids_perturbed, layer, need_qkv=True,
-                collect_row=True, row_head=head, row_qidx=target_q
-            )
-            if q is None or k is None:
-                raise RuntimeError("Failed to capture Q/K.")
-            series, k_norm = compute_cosine_series(q, k, head, k_sink_idx=sink_idx, q_positions=[target_q])
-            v_norm = float(v[0, head, sink_idx].norm().item())
+        target_q = last_q if args.target_idx is None else max(0, min(last_q, args.target_idx))
+        sink_idx = max(0, min(last_q, args.sink_idx))
 
-            k_norms.append(k_norm)
-            v_norms.append(v_norm)
-            cos_list.append(series[0][1])
-            if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
-                hm = pick_head(model._lower_attn_cache, layer, head)
-            else:
-                hm = pick_head(attns, layer, head)
-            attn_maps.append(hm[:min_len, :min_len])
-
-            sink_slice = hm[4:, sink_idx] # remove first token because attention is 1.0
-            sink_attn_values.append(float(sink_slice.mean().item())) # average across queries, assuming same sink
-
-            truncate_len = min_len
-            if args.target_idx is not None:
-                truncate_len = max(1, min(min_len, target_q + 1))
-            if row_logits is not None:
-                row_logits_np = row_logits.squeeze(0).numpy()[:truncate_len]
-                row_logits_list.append(row_logits_np)
-            if row_probs is not None:
-                row_probs_np = row_probs.squeeze(0).numpy()[:truncate_len]
-                row_probs_list.append(row_probs_np)
-
-        cos_mean = float(np.mean(np.array(cos_list)))
-        k_mean = float(np.mean(k_norms))
-        v_mean = float(np.mean(v_norms))
-        row_logits_mean = np.mean(np.stack(row_logits_list, axis=0), axis=0) if row_logits_list else None
-        row_probs_mean = np.mean(np.stack(row_probs_list, axis=0), axis=0) if row_probs_list else None
-        sink_mean = float(np.mean(np.array(sink_attn_values))) if sink_attn_values else None
-        return {
-            "k_norm": k_mean, "v_norm": v_mean, "cos": cos_mean, 
-            "layer": layer, "head": head,
-            "row_logits": row_logits_mean, "row_probs": row_probs_mean,
-            "target_q": target_q, "sink_attn": sink_mean
-        }
-
-    def _aggregate_attn_score_for_layer(layer, head, tag="", suffix=""):
-        attn_maps = []
-        min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
-        sink_attn_values = []
-        sink_idx = max(0, min(min_len - 1, args.sink_idx)) 
-        for input_ids, base_pos in tqdm(tokenized, desc="Aggregating attention scores", position=1, leave=False):
-            pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
-            attns, _, _, _, _, _ = _forward_attn_and_qkv(model, input_ids, pos_ids_perturbed, layer, need_qkv=False)
-            if hasattr(model, "_lower_attn_cache") and layer in model._lower_attn_cache:
-                hm = pick_head(model._lower_attn_cache, layer, head)
-            else:
-                hm = pick_head(attns, layer, head)
-            attn_maps.append(hm[:min_len, :min_len])
-
-            sink_slice = hm[4:, sink_idx]
-            sink_attn_values.append(float(sink_slice.mean().item()))
-
-        head_attn = np.mean(np.stack(attn_maps, axis=0), axis=0)
-        sink_mean = float(np.mean(np.array(sink_attn_values))) if sink_attn_values else None
-        result = {"layer": layer, "head": head, "sink_attn": sink_mean, "heatmap": None, "title": None}
-        if args.scan:
-            m, t = _plot_heatmap_with_tag(head_attn, layer, head, args.outdir, tag=tag, return_map=True, suffix=suffix)
-            result["heatmap"] = m
-            result["title"] = t
-        else:
-            _plot_heatmap_with_tag(head_attn, layer, head, args.outdir, tag=tag, return_map=False, suffix=suffix)
-        return result
-
-    def _log_row_summary(prefix, stats_list):
-        for stat in stats_list:
-            logits = stat.get("row_logits")
-            probs = stat.get("row_probs")
-            if logits is None or probs is None:
-                continue
-            layer = stat["layer"]
-            head = stat["head"]
-            target_q = stat["target_q"]
-            logits_list = np.round(np.asarray(logits), 2).tolist()
-            probs_list = np.round(np.asarray(probs), 2).tolist()
-            print(f"{prefix}[layer {layer} head {head}] mean logits[q={target_q}]: {logits_list}")
-            print(f"{prefix}[layer {layer} head {head}] mean probs[q={target_q}]: {probs_list}")
-
-    def _agg_baseline(layer, head):
-        nonlocal rope_overrides
-        tmp = rope_overrides
-        rope_overrides = None
+        store = {}
+        handles = _capture_qkv_multi(model, scan_layers, store) if need_qkv else []
         try:
-            return _aggregate_qkv_for_layer(layer, head)
+            for input_ids, base_pos in tqdm(tokenized, desc="Scanning prompts", position=0, leave=False):
+                if need_qkv:
+                    for L in list(store.keys()):
+                        store[L].clear()
+                pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides_local)
+                attns = prefill(model, input_ids, pos_ids_perturbed)
+
+                for L in scan_layers:
+                    if args.print_mode == "qkv":
+                        qkv = store[L]
+                        q, k, v = qkv["q"], qkv["k"], qkv["v"]
+                        series, k_norm = compute_cosine_series(q, k, args.head, k_sink_idx=sink_idx, q_positions=[target_q])
+                        v_norm = float(v[0, args.head, sink_idx].norm().item())
+                        hm = _pick_head_with_caches(model, attns, L, args.head)
+                        sink_slice = hm[4:, sink_idx]
+                        per_layer_acc[L]["k_norm"].append(k_norm)
+                        per_layer_acc[L]["v_norm"].append(v_norm)
+                        per_layer_acc[L]["cos"].append(series[0][1])
+                        per_layer_acc[L]["sink_attn"].append(float(sink_slice.mean().item()))
+                    else:
+                        hm = _pick_head_with_caches(model, attns, L, args.head)
+                        per_layer_maps[L].append(hm[:min_len, :min_len])
+
         finally:
-            rope_overrides = tmp
+            for h in handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+        
+        if args.print_mode == "qkv":
+            stats = []
+            for L in sorted(per_layer_acc.keys()):
+                acc = per_layer_acc[L]
+                stats.append({
+                    "k_norm": float(np.mean(acc["k_norm"])) if acc["k_norm"] else 0.0,
+                    "v_norm": float(np.mean(acc["v_norm"])) if acc["v_norm"] else 0.0,
+                    "cos": float(np.mean(acc["cos"])) if acc["cos"] else 0.0,
+                    "layer": L, "head": args.head,
+                    "target_q": target_q, 
+                    "sink_attn": float(np.mean(acc["sink_attn"])) if acc["sink_attn"] else 0.0,
+                })
+            return stats, scan_maps, scan_titles
+        else:
+            for L in sorted(per_layer_maps.keys()):
+                if per_layer_maps[L]:
+                    head_attn = np.mean(np.stack(per_layer_maps[L], axis=0), axis=0)
+                    scan_maps.append(head_attn)
+                    scan_titles.append(f"Layer {L} Head {args.head}")
+            return [], scan_maps, scan_titles
 
     stop_jobs = [("baseline", None)]
     if args.lower_attn:
@@ -651,23 +624,12 @@ def main():
             scan_layers = list(range(0, num_layers, args.scan_interval))
             if not scan_layers or scan_layers[-1] != num_layers - 1:
                 scan_layers.append(num_layers - 1)
-            for L in tqdm(scan_layers, desc="Scanning layers", position=0, leave=False):
-                if args.print_mode == "qkv":
-                    stats = _aggregate_qkv_for_layer(L, args.head)                
-                    scan_stats.append(stats)
-                    if stats["layer"] == num_layers - 1 and summary is None:
-                        summary = stats.get("sink_attn")
-                else:
-                    tag = ""
-                    if rope_overrides:
-                        ov_str = ",".join([f"{ti}={rp}" for ti, rp in rope_overrides])
-                        tag = f"PERTURBED rope({ov_str}) "
-                    stats = _aggregate_attn_score_for_layer(L, args.head, tag, suffix=cur_suffix)
-                    if stats["heatmap"] is not None and stats["title"] is not None:
-                        scan_maps.append(stats["heatmap"])
-                        scan_titles.append(stats["title"])
-                    if stats["layer"] == num_layers - 1 and summary is None:
-                        summary = stats.get("sink_attn")
+            per_layer_acc = {
+                L: {"k_norm": [], "v_norm": [], "cos": [], "sink_attn": []}
+                for L in scan_layers
+            }
+            need_qkv = (args.print_mode == "qkv")
+            scan_stats, scan_maps, scan_titles = _run_scan_pass(scan_layers, rope_overrides, need_qkv)
             
             # baseline pass
             if args.compare and args.print_mode == "qkv":
@@ -682,8 +644,7 @@ def main():
                 if hasattr(model, "_lower_attn_cache"):
                     model._lower_attn_cache = {}
 
-                for L in tqdm(scan_layers, desc="Scanning baseline layers", position=0, leave=False):
-                    scan_stats_base.append(_agg_baseline(L, args.head))
+                scan_stats_base, _m, _t = _run_scan_pass(scan_layers, None, True)
 
             if args.print_mode == "qkv" and len(scan_stats) > 0:
                 scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
@@ -755,23 +716,8 @@ def main():
                         job_summary_stats.append({"layer": int(args._current_stop_layer), "sink_attn": float(summary)})
 
         else:
-            if args.print_mode == "qkv":
-                stats = _aggregate_attn_score_for_layer(args.layer, args.head)
-                stats_list = [stats]
-                baseline_stats = []
-                if args.compare:
-                    baseline_stats = [_agg_baseline(args.layer, args.head)]
-                q_label = f"Q[{args.target_idx}]" if args.target_idx is not None else "Q[last]"
-                # _log_row_summary(f"[Perturbed] ", stats_list)
-                if baseline_stats:
-                    pass
-                    # _log_row_summary(f"[Baseline] ", baseline_stats)
-                else:
-                    tag = ""
-                    if rope_overrides:
-                        ov_str = ",".join([f"{ti}={rp}" for ti, rp in rope_overrides])
-                        tag = f"PERTURBED rope({ov_str}) "
-                    _, _ = _aggregate_attn_score_for_layer(args.layer, args.head, tag=tag, suffix=cur_suffix)
+            # TODO: add support for single layer
+            pass
                 
         for pair in lower_attn_handles + window_attn_handles:
             for h in pair:
