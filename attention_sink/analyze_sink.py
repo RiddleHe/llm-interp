@@ -75,14 +75,7 @@ def apply_rope_overrides(position_ids, overrides):
 
 def _make_v_prehook(attn, cache, num_heads, num_kv, num_groups, model_cfg):
     def _prehook(_module, args, kwargs, _cache=cache):
-        hidden_states = kwargs["hidden_states"]
-        B, S, _ = hidden_states.shape
-        head_dim = model_cfg.head_dim
-        v = attn.v_proj(hidden_states).view(B, S, num_kv, head_dim)
-        v = v.transpose(1, 2).contiguous()
-        if num_kv != num_heads:
-            v = v.repeat_interleave(num_groups, dim=1)
-        _cache["v"] = v
+        pass
     return _prehook
 
 def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_return_sink_value=False):
@@ -97,11 +90,19 @@ def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_retu
         attn = model.model.layers[L].self_attn
         cache = {}
 
-        _prehook = _make_v_prehook(attn, cache, num_heads, num_kv, num_groups, model.config)
+        def _prehook(_module, args, kwargs, _cache=cache, 
+                    _num_heads=num_heads, _num_kv=num_kv, _num_groups=num_groups, _head_dim=model.config.head_dim):
+            hidden_states = kwargs["hidden_states"]
+            B, S, _ = hidden_states.shape
+            v = _module.v_proj(hidden_states).view(B, S, _num_kv, _head_dim)
+            v = v.transpose(1, 2).contiguous()
+            if _num_kv != _num_heads:
+                v = v.repeat_interleave(_num_groups, dim=1)
+            _cache["v"] = v
 
-        def _fwdhook(_module, args, output, _cache=cache):
+        def _fwdhook(_module, args, output, _cache=cache, _L=L):
             attn_output, attn_probs = output[0], output[1]
-            model._lower_attn_cache[L] = attn_probs.detach().float().cpu()
+            model._lower_attn_cache[_L] = attn_probs.detach().float().cpu()
             
             probs = attn_probs.clone()
             probs[..., sink_k_idx] *= factor  # we don't renormalize
@@ -304,34 +305,6 @@ def _pick_head_with_caches(model, attns, layer_idx, head_idx):
     return pick_head(attns, layer_idx, head_idx)
 
 # Plotting functions
-
-def _plot_heatmap_with_tag(head_attn, layer, head, outdir, tag="BASE", return_map=False, suffix=""):
-    title = f"Layer {layer} Head {head}" if return_map else f"{tag}Layer {layer} head {head}" 
-    if return_map:
-        return head_attn, title
-    tag_safe = str(tag).lower().replace(" ", "_")
-    _plot_attn(
-        head_attn, 
-        title, 
-        os.path.join(outdir, f"{tag_safe}_layer_{layer}_head_{head}.png"),
-        suffix=suffix
-    )
-    return None, None
-
-def _plot_attn(attn, title, out_path, suffix=""):
-    plt.figure(figsize=(6, 4.5))
-    im = plt.imshow(attn, aspect="auto", origin="lower", interpolation="nearest")
-    ax = plt.gca()
-    ax.invert_yaxis()
-    ax.set_title(title)
-    ax.set_xlabel("K")
-    ax.set_ylabel("Q")
-    ax.xaxis.set_major_locator(ticker.MultipleLocator(5))
-    ax.yaxis.set_major_locator(ticker.MultipleLocator(5))
-    cbar = plt.colorbar(im)
-    cbar.set_label("Attention prob")
-    plt.savefig(_append_suffix(out_path, suffix), bbox_inches="tight", dpi=300)
-    plt.close()
 
 def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", stats_b=None, is_cos=False):
     layers = sorted({s["layer"] for s in stats_a})
@@ -568,7 +541,9 @@ def main():
                 if per_layer_maps[L]:
                     head_attn = np.mean(np.stack(per_layer_maps[L], axis=0), axis=0)
                     scan_maps.append(head_attn)
-                    scan_titles.append(f"Layer {L} Head {args.head}")
+                    # DEBUG
+                    src = "CACHE" if (hasattr(model, "_lower_attn_cache") and L in model._lower_attn_cache) else "ATTNS"
+                    scan_titles.append(f"Layer {L} Head {args.head} [{src}]")
             return [], scan_maps, scan_titles
 
     stop_jobs = [("baseline", None)]
@@ -601,6 +576,7 @@ def main():
             else:
                 target_layers = [L for L in range(num_layers) if L <= _job_stop]
             if target_layers:
+                print(f"[lower_attn] target_layers: {target_layers}")
                 lower_attn_handles = _install_lower_attn_hooks(
                     model, layers=target_layers, factor=args.lower_factor, sink_k_idx=args.sink_idx,
                     only_return_sink_value=args.only_return_sink_value
