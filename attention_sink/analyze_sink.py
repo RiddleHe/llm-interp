@@ -1,12 +1,3 @@
-"""
-python analyze_sink.py --scan \
-    --print [heatmap, qkv] \
-    --rope 0=12,1=13,2=14,3=15 \
-    --random-init \
-    --lower-attn \
-
-"""
-
 import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
@@ -184,6 +175,23 @@ def apply_perturbations(base_pos, rope_overrides=None, mask=None):
         applied["mask"] = True
     return pos_ids, applied
 
+# PCA
+
+def _pca_from_rows(X, k):
+    X = X - X.mean(dim=0)
+    U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+    var = (S ** 2)
+    total = var.sum().clamp_min(EPS)
+    k = min(k, Vh.shape[0])
+    return U[:, :k], S[:k], Vh[:k, :], (var[:k] / total).cpu().numpy()
+
+def _cross_explained_variance(X, B):
+    Xc = X - X.mean(dim=0, keepdim=True)
+    Xproj = (Xc @ B.T) @ B
+    num = (Xproj ** 2).sum()
+    den = (Xc ** 2).sum().clamp_min(EPS)
+    return float((num / den).item())
+
 # Parsing functions
 
 def parse_overrides(s):
@@ -203,31 +211,6 @@ def _append_suffix(path, suffix):
     return f"{root}{suffix}{ext}"
 
 # Forward & capture functions
-
-def _forward_attn_and_qkv(
-    model, input_ids, position_ids, layer, need_qkv=False, 
-    collect_row=False, row_head=0, row_qidx=None
-):
-    cache = {}
-    if need_qkv:
-        _capture_qkv(model, layer, cache)
-    attns = prefill(model, input_ids, position_ids)
-    hook = cache.pop("_hook", None)
-    if hook is not None:
-        hook.remove()
-
-    q, k, v = cache.get("q", None), cache.get("k", None), cache.get("v", None)
-    
-    row_logits = None
-    row_probs = None
-    if collect_row and q is not None and k is not None and row_qidx is not None:
-        head_dim = model.config.head_dim
-        logits = torch.matmul(q[:, row_head], k[:, row_head].transpose(2, 1)) / math.sqrt(head_dim)
-        row_logits = logits[:, row_qidx, :].detach().float().cpu() 
-        probs = attns[layer][:, row_head]
-        row_probs = probs[:, row_qidx, :].detach().float().cpu()
-    
-    return attns, q, k, v, row_logits, row_probs
 
 @torch.no_grad()
 def prefill(model, input_ids, position_ids):
@@ -440,6 +423,9 @@ def main():
     p.add_argument("--window-attn", action="store_true", help="Constrain attention to a local window for early layers")
     p.add_argument("--stop-window-layer", type=int, default=4, help="Apply windowed attention to layers [0, stop] inclusive.")
     p.add_argument("--window-size", type=int, default=4, help="Local attention window size")
+    # subspaces
+    p.add_argument("--find-value-subspace", action="store_true", help="Collect V at token 0 and 8 and run PCA")
+    p.add_argument("--pca-topk", type=int, default=6, help="Top-k PCA for groups of vectors")
     # output
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
@@ -692,8 +678,43 @@ def main():
                         job_summary_stats.append({"layer": int(args._current_stop_layer), "sink_attn": float(summary)})
 
         else:
-            # TODO: add support for single layer
-            pass
+            if args.find_value_subspace:
+                target_layer = int(args.layer)
+                store = {}
+                handles = _capture_qkv_multi(model, [target_layer], store)
+                try:
+                    v_tok0, v_tok8 = [], []
+                    for input_ids, base_pos in tqdm(tokenized, desc="Collecting V for PCA", position=0, leave=False):
+                        _ = prefill(model, input_ids, base_pos)
+                        qkv = store.get(target_layer, None)
+                        if not qkv:
+                            continue
+                        v = qkv["v"]
+                        assert v.shape[2] > 8, "There must be at least 8 tokens in each sequence"
+                        v0 = v[0, args.head, 0]
+                        v8 = v[0, args.head, 8]
+                        v_tok0.append(v0.clone())
+                        v_tok8.append(v8.clone())
+                finally:
+                    for h in handles:
+                        try: h.remove()
+                        except Exception: pass
+                
+                assert len(v_tok0) == len(v_tok8) > 0, "No V vectors found"
+                V0 = torch.stack(v_tok0, dim=0)
+                V8 = torch.stack(v_tok8, dim=0)
+                k = int(args.pca_topk)
+
+                U0, S0, Vh0, var0 = _pca_from_rows(V0, k)
+                U8, S8, Vh8, var8 = _pca_from_rows(V8, k)
+
+                print("[PCA] token 0 (sink) variance explained (top-k): ", np.round(np.cumsum(var0[:k]), 4))
+                print("[PCA] token 8 (non-sink) variance explained (top-k): ", np.round(np.cumsum(var8[:k]), 4))
+
+                r2_8_in_0 = _cross_explained_variance(V8, Vh0[:k])
+                r2_0_in_8 = _cross_explained_variance(V0, Vh8[:k])
+                print(f"[PCA] cross R^2: V8 in span(V0) = {r2_8_in_0:.4f} | V0 in span(V8) = {r2_0_in_8:.4f}")
+
                 
         for pair in lower_attn_handles + window_attn_handles:
             for h in pair:
