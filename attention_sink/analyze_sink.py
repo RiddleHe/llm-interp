@@ -424,7 +424,8 @@ def main():
     p.add_argument("--stop-window-layer", type=int, default=4, help="Apply windowed attention to layers [0, stop] inclusive.")
     p.add_argument("--window-size", type=int, default=4, help="Local attention window size")
     # subspaces
-    p.add_argument("--find-value-subspace", action="store_true", help="Collect V at token 0 and 8 and run PCA")
+    p.add_argument("--find-value-subspace", action="store_true", help="Collect V at token 0 and non-sink positions and run PCA")
+    p.add_argument("--find-key-subspace", action="store_true", help="Collect K at token 0 and non-sink positions and run PCA")
     p.add_argument("--pca-topk", type=int, default=6, help="Top-k PCA for groups of vectors")
     # output
     p.add_argument("--outdir", default="results")
@@ -453,6 +454,10 @@ def main():
     print(f"[Tokenized] Tokens[0, 0] text is {tok.decode(tokenized[0][0][0, 0])}")
 
     os.makedirs(args.outdir, exist_ok=True)
+
+    min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
+    last_q = min_len - 1
+    target_q = last_q if args.target_idx is None else max(0, min(last_q, args.target_idx))
 
     rope_str = args.rope
     rope_overrides = parse_overrides(rope_str) if rope_str else None
@@ -678,43 +683,66 @@ def main():
                         job_summary_stats.append({"layer": int(args._current_stop_layer), "sink_attn": float(summary)})
 
         else:
-            if args.find_value_subspace:
+            if args.find_value_subspace or args.find_key_subspace:
                 target_layer = int(args.layer)
                 store = {}
                 handles = _capture_qkv_multi(model, [target_layer], store)
+                field = "v" if args.find_value_subspace else "k"
+                VAR = "V" if field == "v" else "K"
                 try:
-                    v_tok0, v_tok8 = [], []
-                    for input_ids, base_pos in tqdm(tokenized, desc="Collecting V for PCA", position=0, leave=False):
+                    x_tok0, x_tok1, x_tok8, x_tokq = [], [], [], []
+                    for input_ids, base_pos in tqdm(tokenized, desc=f"Collecting {VAR} for PCA", position=0, leave=False):
                         _ = prefill(model, input_ids, base_pos)
                         qkv = store.get(target_layer, None)
                         if not qkv:
                             continue
-                        v = qkv["v"]
-                        assert v.shape[2] > 8, "There must be at least 8 tokens in each sequence"
-                        v0 = v[0, args.head, 0]
-                        v8 = v[0, args.head, 8]
-                        v_tok0.append(v0.clone())
-                        v_tok8.append(v8.clone())
+                        Q = qkv["q"]
+                        X = qkv[field]
+                        assert X.shape[2] >= 9, "There must be at least 8 tokens in each sequence"
+                        x0 = X[0, args.head, 0]
+                        x1 = X[0, args.head, 1]
+                        x8 = X[0, args.head, 8]
+                        xq = Q[0, args.head, target_q]
+                        x_tok0.append(x0.clone())
+                        x_tok1.append(x1.clone())
+                        x_tok8.append(x8.clone())
+                        x_tokq.append(xq.clone())
                 finally:
                     for h in handles:
                         try: h.remove()
                         except Exception: pass
                 
-                assert len(v_tok0) == len(v_tok8) > 0, "No V vectors found"
-                V0 = torch.stack(v_tok0, dim=0)
-                V8 = torch.stack(v_tok8, dim=0)
+                assert len(x_tok0) == len(x_tok1) == len(x_tok8) > 0, f"No {VAR} vectors found"
+                X0 = torch.stack(x_tok0, dim=0)
+                X1 = torch.stack(x_tok1, dim=0)
+                X8 = torch.stack(x_tok8, dim=0)
+                XQ = torch.stack(x_tokq, dim=0)
                 k = int(args.pca_topk)
 
-                U0, S0, Vh0, var0 = _pca_from_rows(V0, k)
-                U8, S8, Vh8, var8 = _pca_from_rows(V8, k)
+                U0, S0, Vh0, var0 = _pca_from_rows(X0, k)
+                U1, S1, Vh1, var1 = _pca_from_rows(X1, k)
+                U8, S8, Vh8, var8 = _pca_from_rows(X8, k)
+                UQ, SQ, VhQ, varQ = _pca_from_rows(XQ, k)
 
-                print("[PCA] token 0 (sink) variance explained (top-k): ", np.round(np.cumsum(var0[:k]), 4))
-                print("[PCA] token 8 (non-sink) variance explained (top-k): ", np.round(np.cumsum(var8[:k]), 4))
+                print(f"[PCA: {VAR}] token 0 (sink) variance explained (top-k): ", np.round(float(np.cumsum(var0)[k-1]), 4))
+                print(f"[PCA: {VAR}] token 1 (non-sink) variance explained (top-k):", np.round(float(np.cumsum(var1)[k-1]), 4))
+                print(f"[PCA: {VAR}] token 8 (non-sink) variance explained (top-k): ", np.round(float(np.cumsum(var8)[k-1]), 4))
+                print(f"[PCA: Q] targt Q (target_q={target_q}) variance explained (top-k): ", np.round(float(np.cumsum(varQ)[k-1]), 4))
 
-                r2_8_in_0 = _cross_explained_variance(V8, Vh0[:k])
-                r2_0_in_8 = _cross_explained_variance(V0, Vh8[:k])
-                print(f"[PCA] cross R^2: V8 in span(V0) = {r2_8_in_0:.4f} | V0 in span(V8) = {r2_0_in_8:.4f}")
+                r2_1_in_0 = _cross_explained_variance(X1, Vh0[:k]); r2_0_in_1 = _cross_explained_variance(X0, Vh1[:k])
+                r2_8_in_0 = _cross_explained_variance(X8, Vh0[:k]); r2_0_in_8 = _cross_explained_variance(X0, Vh8[:k])
+                r2_8_in_1 = _cross_explained_variance(X8, Vh1[:k]); r2_1_in_8 = _cross_explained_variance(X1, Vh8[:k])
+                print(f"[PCA: {VAR}] cross R^2: {VAR}1 in span({VAR}0) = {r2_1_in_0:.4f} | {VAR}0 in span({VAR}1) = {r2_0_in_1:.4f}")
+                print(f"[PCA: {VAR}] cross R^2: {VAR}8 in span({VAR}0) = {r2_8_in_0:.4f} | {VAR}0 in span({VAR}8) = {r2_0_in_8:.4f}")
+                print(f"[PCA: {VAR}] cross R^2: {VAR}8 in span({VAR}1) = {r2_8_in_1:.4f} | {VAR}1 in span({VAR}8) = {r2_1_in_8:.4f}")
 
+                if args.find_key_subspace: # only compare Q with K, but not V
+                    r2_q_in_0 = _cross_explained_variance(XQ, Vh0[:k]); r2_0_in_q = _cross_explained_variance(X0, VhQ[:k])
+                    r2_q_in_1 = _cross_explained_variance(XQ, Vh1[:k]); r2_1_in_q = _cross_explained_variance(X1, VhQ[:k])
+                    r2_q_in_8 = _cross_explained_variance(XQ, Vh8[:k]); r2_8_in_q = _cross_explained_variance(X8, VhQ[:k])
+                    print(f"[PCA] cross R^2: Q in span(K0) = {r2_q_in_0:.4f} | K0 in span(Q) = {r2_0_in_q:.4f}")
+                    print(f"[PCA] cross R^2: Q in span(K1) = {r2_q_in_1:.4f} | K1 in span(Q) = {r2_1_in_q:.4f}")
+                    print(f"[PCA] cross R^2: Q in span(K8) = {r2_q_in_8:.4f} | K8 in span(Q) = {r2_8_in_q:.4f}")
                 
         for pair in lower_attn_handles + window_attn_handles:
             for h in pair:
