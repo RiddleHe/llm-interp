@@ -3,6 +3,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
 from tqdm import tqdm
 from matplotlib import ticker
+from mpl_toolkits.mplot3d import Axes3D
 
 EPS = 1e-12
 PRINT_CHOICES = ["heatmap", "qkv"]
@@ -183,7 +184,8 @@ def _pca_from_rows(X, k):
     var = (S ** 2)
     total = var.sum().clamp_min(EPS)
     k = min(k, Vh.shape[0])
-    return U[:, :k], S[:k], Vh[:k, :], (var[:k] / total).cpu().numpy()
+    rel = (var[:k] / total).cpu().numpy()
+    return U[:, :k], S[:k], Vh[:k, :], rel, var.sum().item()
 
 def _cross_explained_variance(X, B):
     Xc = X - X.mean(dim=0, keepdim=True)
@@ -294,23 +296,23 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     by_a = {s["layer"]: s for s in stats_a}
     y_a = [by_a[L][key] for L in layers]
     plt.figure(figsize=(7, 3.5))
-    plt.plot(layers, y_a, marker="o", label="Perturbed" if stats_b else None)
+    ax = plt.gca()
+    ax.plot(layers, y_a, marker="o", label="Perturbed" if stats_b else "Norm of K")
 
     if stats_b:
         by_b = {s["layer"]: s for s in stats_b}
         y_b = [by_b[L][key] for L in layers]
-        plt.plot(layers, y_b, marker="s", label="Baseline")
+        ax.plot(layers, y_b, marker="s", label="Baseline")
 
-    plt.xlabel("Layer")
-    plt.ylabel(ylabel)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel(ylabel)
     if len(y_a) > 0:
-        plt.axhline(y_a[-1], color="gray", linestyle="--", linewidth=1.0)
+        ax.axhline(y_a[-1], color="gray", linestyle="--", linewidth=1.0)
     if is_cos:
-        plt.ylim(0, 1)
+        ax.set_ylim(0, 1)
     else:
-        plt.ylim(0, 100)
+        ax.set_ylim(0, 100)
 
-    ax = plt.gca()
     if len(layers) > 0:
         ax.set_xlim(min(layers), max(layers))
         ax.set_xticks(layers)
@@ -319,8 +321,20 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
             ax.xaxis.set_major_locator(ticker.MultipleLocator(2))
 
     plt.title(title)
-    if stats_b:
-        plt.legend()
+
+    has_kvar = bool(stats_a) and ("k_total_var" in stats_a[0])
+    if has_kvar:
+        y2 = [by_a[L]["k_total_var"] for L in layers]
+        ax2 = ax.twinx()
+        ax2.plot(layers, y2, marker="^", linestyle="--", color="tab:red", label="Total variance of K")
+        ax2.set_ylim(0, 20000)
+
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, loc="best")
+    else:
+        if stats_b:
+            ax.legend()
     plt.tight_layout()
     plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
     plt.close()
@@ -472,6 +486,7 @@ def main():
             L: {"k_norm": [], "v_norm": [], "cos": [], "sink_attn": []}
             for L in scan_layers
         }
+        per_layer_kvecs = {L: [] for L in scan_layers}
         per_layer_maps = {
             L: [] for L in scan_layers
         }
@@ -503,6 +518,7 @@ def main():
                         per_layer_acc[L]["v_norm"].append(v_norm)
                         per_layer_acc[L]["cos"].append(series[0][1])
                         per_layer_acc[L]["sink_attn"].append(float(sink_slice.mean().item()))
+                        per_layer_kvecs[L].append(k[0, args.head, sink_idx].detach().cpu())
                     else:
                         hm = _pick_head_with_caches(model, attns, L, args.head)
                         per_layer_maps[L].append(hm[:min_len, :min_len])
@@ -518,6 +534,11 @@ def main():
             stats = []
             for L in sorted(per_layer_acc.keys()):
                 acc = per_layer_acc[L]
+                kvar = 0.0
+                if per_layer_kvecs[L]:
+                    Xk = torch.stack(per_layer_kvecs[L], dim=0)
+                    _U, S_k, _Vh, _var, k_total_var = _pca_from_rows(Xk, k=1)
+                    kvar = float(k_total_var)
                 stats.append({
                     "k_norm": float(np.mean(acc["k_norm"])) if acc["k_norm"] else 0.0,
                     "v_norm": float(np.mean(acc["v_norm"])) if acc["v_norm"] else 0.0,
@@ -525,6 +546,7 @@ def main():
                     "layer": L, "head": args.head,
                     "target_q": target_q, 
                     "sink_attn": float(np.mean(acc["sink_attn"])) if acc["sink_attn"] else 0.0,
+                    "k_total_var": kvar
                 })
             return stats, scan_maps, scan_titles
         else:
@@ -691,6 +713,7 @@ def main():
                 VAR = "V" if field == "v" else "K"
                 try:
                     x_tok0, x_tok1, x_tok8, x_tokq = [], [], [], []
+                    cos0, cos1, cos8 = [], [], []
                     for input_ids, base_pos in tqdm(tokenized, desc=f"Collecting {VAR} for PCA", position=0, leave=False):
                         _ = prefill(model, input_ids, base_pos)
                         qkv = store.get(target_layer, None)
@@ -707,6 +730,12 @@ def main():
                         x_tok1.append(x1.clone())
                         x_tok8.append(x8.clone())
                         x_tokq.append(xq.clone())
+                        if args.find_key_subspace:
+                            for ks, bucket in [(0, cos0), (1, cos1), (8, cos8)]:
+                                series, _ = compute_cosine_series(
+                                    Q, X, args.head, k_sink_idx=ks, q_positions=[target_q]
+                                )
+                                bucket.append(series[0][1])
                 finally:
                     for h in handles:
                         try: h.remove()
@@ -719,15 +748,15 @@ def main():
                 XQ = torch.stack(x_tokq, dim=0)
                 k = int(args.pca_topk)
 
-                U0, S0, Vh0, var0 = _pca_from_rows(X0, k)
-                U1, S1, Vh1, var1 = _pca_from_rows(X1, k)
-                U8, S8, Vh8, var8 = _pca_from_rows(X8, k)
-                UQ, SQ, VhQ, varQ = _pca_from_rows(XQ, k)
+                U0, S0, Vh0, var0, K0_total_var = _pca_from_rows(X0, k)
+                U1, S1, Vh1, var1, K1_total_var = _pca_from_rows(X1, k)
+                U8, S8, Vh8, var8, K8_total_var = _pca_from_rows(X8, k)
+                UQ, SQ, VhQ, varQ, Q_total_var = _pca_from_rows(XQ, k)
 
-                print(f"[PCA: {VAR}] token 0 (sink) variance explained (top-k): ", np.round(float(np.cumsum(var0)[k-1]), 4))
-                print(f"[PCA: {VAR}] token 1 (non-sink) variance explained (top-k):", np.round(float(np.cumsum(var1)[k-1]), 4))
-                print(f"[PCA: {VAR}] token 8 (non-sink) variance explained (top-k): ", np.round(float(np.cumsum(var8)[k-1]), 4))
-                print(f"[PCA: Q] targt Q (target_q={target_q}) variance explained (top-k): ", np.round(float(np.cumsum(varQ)[k-1]), 4))
+                print(f"[PCA: {VAR}] token 0 (sink) total variance: {K0_total_var:.4f}")
+                print(f"[PCA: {VAR}] token 1 (non-sink) total variance: {K1_total_var:.4f}")
+                print(f"[PCA: {VAR}] token 8 (non-sink) total variance: {K8_total_var:.4f}")
+                print(f"[PCA: Q] targt Q (target_q={target_q}) total variance: {Q_total_var:.4f}")
 
                 r2_1_in_0 = _cross_explained_variance(X1, Vh0[:k]); r2_0_in_1 = _cross_explained_variance(X0, Vh1[:k])
                 r2_8_in_0 = _cross_explained_variance(X8, Vh0[:k]); r2_0_in_8 = _cross_explained_variance(X0, Vh8[:k])
@@ -743,6 +772,67 @@ def main():
                     print(f"[PCA] cross R^2: Q in span(K0) = {r2_q_in_0:.4f} | K0 in span(Q) = {r2_0_in_q:.4f}")
                     print(f"[PCA] cross R^2: Q in span(K1) = {r2_q_in_1:.4f} | K1 in span(Q) = {r2_1_in_q:.4f}")
                     print(f"[PCA] cross R^2: Q in span(K8) = {r2_q_in_8:.4f} | K8 in span(Q) = {r2_8_in_q:.4f}")
+
+                    # raw cosine scores
+                    def _mean_or_zero(xs): return float(np.mean(xs)) if xs else 0.0
+                    print(
+                        f"[COS] mean cos(Q, K0) = {_mean_or_zero(cos0):.4f} | "
+                        f"[COS] mean cos(Q, K1) = {_mean_or_zero(cos1):.4f} | "
+                        f"[COS] mean cos(Q, K8) = {_mean_or_zero(cos8):.4f}" 
+                    )
+
+                    # centered cosine scores
+                    XQ_c = XQ - XQ.mean(dim=0, keepdim=True)
+                    X0_c = X0 - X0.mean(dim=0, keepdim=True)
+                    X1_c = X1 - X1.mean(dim=0, keepdim=True)
+                    X8_c = X8 - X8.mean(dim=0, keepdim=True)
+                    cos_c0 = F.cosine_similarity(XQ_c, X0_c, dim=1).numpy()
+                    cos_c1 = F.cosine_similarity(XQ_c, X1_c, dim=1).numpy()
+                    cos_c8 = F.cosine_similarity(XQ_c, X8_c, dim=1).numpy()
+                    print(
+                        f"[COS_centered] mean cos(Q, K0) = {float(cos_c0.mean().item()):.4f} | "
+                        f"[COS_centered] mean cos(Q, K1) = {float(cos_c1.mean().item()):.4f} | "
+                        f"[COS_centered] mean cos(Q, K8) = {float(cos_c8.mean().item()):.4f}"
+                    )
+
+                    # decomposition of Q along mean(K0)
+                    mu0_vec = X0.mean(dim=0)
+                    u0 = F.normalize(mu0_vec, dim=0)
+                    q_energy = (XQ ** 2).sum(dim=1)
+                    sink_energy = (XQ @ u0) ** 2
+                    frac_q_along_mu0 = float((sink_energy.mean() / q_energy.mean()).item())
+                    mu0_norm_sq = float((mu0_vec ** 2).sum().item())
+                    if mu0_norm_sq > 0:
+                        coeff = VhQ @ mu0_vec
+                        frac_mu0_in_Q_topk = float(((coeff ** 2).sum().item()) / mu0_norm_sq)
+                    else:
+                        frac_mu0_in_Q_topk = 0.0
+                    print(
+                        f"[MEAN_DIR] frac of Q energy along mean(K0) = {frac_q_along_mu0:.4f} | "
+                        f"frac of mean(K0) in top-{k} Q PCs = {frac_mu0_in_Q_topk:.4f}"
+                    )
+
+                    # visualize 3D PCA
+                    Y0 = (X0_c @ Vh0[:3].T).numpy()
+                    Y1 = (X1_c @ Vh1[:3].T).numpy()
+                    Y8 = (X8_c @ Vh8[:3].T).numpy()
+
+                    R = max(np.abs(Y0).max(), np.abs(Y1).max(), np.abs(Y8).max())
+
+                    fig = plt.figure(figsize=(9,3))
+                    for idx, (Y, title) in enumerate(
+                        zip([Y0, Y1, Y8], ["K0 subspace", 'K1 subspace', 'K8 subspace'])
+                    ):
+                        ax = fig.add_subplot(1, 3, idx + 1, projection='3d')
+                        ax.scatter(Y[:, 0], Y[:, 1], Y[:, 2], s=5)
+                        ax.set_title(title)
+                        ax.set_xlim(-R, R); ax.set_ylim(-R, R); ax.set_zlim(-R, R)
+                        ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); ax.set_zlabel("PC3")
+
+                    fig.tight_layout()
+                    out_path = os.path.join(args.outdir, f"pca_k_subspaces_L{target_layer}_H{args.head}.png")
+                    fig.savefig(out_path, dpi=300)
+                    plt.close(fig)
                 
         for pair in lower_attn_handles + window_attn_handles:
             for h in pair:
