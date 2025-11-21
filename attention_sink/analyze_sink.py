@@ -194,6 +194,53 @@ def _cross_explained_variance(X, B):
     den = (Xc ** 2).sum().clamp_min(EPS)
     return float((num / den).item())
 
+def _q_bias_3d_projection(XQ, XK, topk=2):
+    mu = XK.mean(dim=0)
+    if float((mu ** 2).sum().item()) <= EPS:
+        return None
+    u = F.normalize(mu, dim=0)
+    q_energy = (XQ ** 2).sum(dim=1, keepdim=True).clamp_min(EPS)
+
+    bias_coord = XQ @ u
+    E_bias = (bias_coord ** 2).unsqueeze(1)
+
+    q_parallel = bias_coord.unsqueeze(1) * u.unsqueeze(0)
+    XQ_res = XQ - q_parallel
+    XQ_res_c = XQ_res - XQ_res.mean(dim=0, keepdim=True)
+
+    _U, _S, Vh = torch.linalg.svd(XQ_res_c, full_matrices=False)
+
+    k = min(topk, Vh.shape[0])
+    if k < 2:
+        return None
+    V_res = Vh[:k]
+    
+    res_coords = XQ_res @ V_res.T
+    E_res = res_coords ** 2
+
+    frac_bias = E_bias / q_energy
+    frac_res = E_res / q_energy
+    frac = torch.cat([frac_bias, frac_res], dim=1)
+    basis = torch.cat([u.unsqueeze(0), Vh[:k]], dim=0)
+    return frac.cpu().numpy()
+
+def _mean_dir_decomposition(XQ, XK, VhQ, label, k):
+    mu = XK.mean(dim=0)
+    mu_norm_sq = float((mu ** 2).sum().item())
+    if mu_norm_sq <= EPS:
+        return 0.0, 0.0
+    u = F.normalize(mu, dim=0)
+    q_energy = (XQ ** 2).sum(dim=1)
+    sink_energy = (XQ @ u) ** 2
+    frac_q_along_mu = float((sink_energy.mean() / q_energy.mean()).item())
+    coeff = VhQ @ mu
+    frac_mu_in_Q_topk = float(((coeff ** 2).sum().item()) / mu_norm_sq)
+    print(
+        f"[MEAN DIRECTION] {label}: frac of Q energy along mean({label}) = {frac_q_along_mu:.4f} | "
+        f"frac of mean({label}) in top-{k} Q PCs = {frac_mu_in_Q_topk:.4f}"
+    )
+    return frac_q_along_mu, frac_mu_in_Q_topk
+
 # Parsing functions
 
 def parse_overrides(s):
@@ -796,21 +843,9 @@ def main():
                     )
 
                     # decomposition of Q along mean(K0)
-                    mu0_vec = X0.mean(dim=0)
-                    u0 = F.normalize(mu0_vec, dim=0)
-                    q_energy = (XQ ** 2).sum(dim=1)
-                    sink_energy = (XQ @ u0) ** 2
-                    frac_q_along_mu0 = float((sink_energy.mean() / q_energy.mean()).item())
-                    mu0_norm_sq = float((mu0_vec ** 2).sum().item())
-                    if mu0_norm_sq > 0:
-                        coeff = VhQ @ mu0_vec
-                        frac_mu0_in_Q_topk = float(((coeff ** 2).sum().item()) / mu0_norm_sq)
-                    else:
-                        frac_mu0_in_Q_topk = 0.0
-                    print(
-                        f"[MEAN_DIR] frac of Q energy along mean(K0) = {frac_q_along_mu0:.4f} | "
-                        f"frac of mean(K0) in top-{k} Q PCs = {frac_mu0_in_Q_topk:.4f}"
-                    )
+                    _mean_dir_decomposition(XQ, X0, VhQ, "K0", k)
+                    _mean_dir_decomposition(XQ, X1, VhQ, "K1", k)
+                    _mean_dir_decomposition(XQ, X8, VhQ, "K8", k)
 
                     # visualize 3D PCA
                     Y0 = (X0_c @ Vh0[:3].T).numpy()
@@ -833,6 +868,41 @@ def main():
                     out_path = os.path.join(args.outdir, f"pca_k_subspaces_L{target_layer}_H{args.head}.png")
                     fig.savefig(out_path, dpi=300)
                     plt.close(fig)
+
+                    # visualize Q in bias direction + residual PC
+                    bias_sets = [
+                        (_q_bias_3d_projection(XQ, X0, topk=2), "Q energy along dimensions of K0"),
+                        (_q_bias_3d_projection(XQ, X1, topk=2), "Q energy along dimensions of K1"),
+                        (_q_bias_3d_projection(XQ, X8, topk=2), "Q energy along dimensions of K8"),
+                    ]
+                    Ys = [Y for (Y, _t) in bias_sets if Y is not None]
+                    if Ys:
+                        max_fb = max(float(Y[:, 0].max()) for Y in Ys)
+                        R_bias = max_fb * 1.05
+                        fig = plt.figure(figsize=(12, 3.5))
+                        for idx, (Y, title) in enumerate(bias_sets):
+                            if Y is None:
+                                continue
+                            ax = fig.add_subplot(1, 3, idx + 1, projection="3d")
+                            frac_bias = Y[:, 0]
+                            ax.scatter(Y[:, 0], Y[:, 1], Y[:, 2], s=8)
+
+                            local_bias_mean = float(frac_bias.mean())
+                            yy, zz = np.meshgrid(
+                                np.linspace(0.0, 1.0, 2),
+                                np.linspace(0.0, 1.0, 2),
+                            )
+                            xx = np.full_like(yy, local_bias_mean)
+                            ax.plot_surface(xx, yy, zz, alpha=0.12, color="gray")
+                            ax.set_title(f"{title}\n(plane: mean bias energy fraction)", fontsize=9)
+
+                            ax.set_xlim(0.0, R_bias); ax.set_ylim(0.0, 1.0); ax.set_zlim(0.0, 1.0)
+                            ax.set_xlabel("K bias"); ax.set_ylabel("residual PC1"); ax.set_zlabel("residual PC2")
+                        fig.subplots_adjust(wspace=0.35, right=0.97, left=0.10)
+                        fig.tight_layout()
+                        out_path = os.path.join(args.outdir, f"pca_q_bias_energy_L{target_layer}_H{args.head}.png")
+                        fig.savefig(out_path, dpi=300)
+                        plt.close(fig)
                 
         for pair in lower_attn_handles + window_attn_handles:
             for h in pair:
