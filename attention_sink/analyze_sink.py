@@ -378,7 +378,7 @@ def _pick_head_with_caches(model, attns, layer_idx, head_idx):
 
 # Plotting functions
 
-def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", stats_b=None, is_cos=False):
+def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", stats_b=None, mode=None):
     layers = sorted({s["layer"] for s in stats_a})
     by_a = {s["layer"]: s for s in stats_a}
     y_a = [by_a[L][key] for L in layers]
@@ -395,8 +395,10 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     ax.set_ylabel(ylabel)
     if len(y_a) > 0:
         ax.axhline(y_a[-1], color="gray", linestyle="--", linewidth=1.0)
-    if is_cos:
+    if mode == "cos":
         ax.set_ylim(0, 1)
+    elif mode == "res":
+        ax.set_ylim(0, 10)
     else:
         ax.set_ylim(0, 100)
 
@@ -636,7 +638,7 @@ def main():
                         H = qkv["residual"]
                         series, k_norm = compute_cosine_series(q, k, args.head, k_sink_idx=sink_idx, q_positions=[target_q])
                         v_norm = float(v[0, args.head, sink_idx].norm().item())
-                        h_norm = float(H[0, args.head, sink_idx].norm().item())
+                        h_norm = float(torch.log(H[0, sink_idx].norm()).item())
                         hm = _pick_head_with_caches(model, attns, L, args.head)
                         sink_slice = hm[4:, sink_idx]
                         per_layer_acc[L]["k_norm"].append(k_norm)
@@ -668,7 +670,7 @@ def main():
                 stats.append({
                     "k_norm": float(np.mean(acc["k_norm"])) if acc["k_norm"] else 0.0,
                     "v_norm": float(np.mean(acc["v_norm"])) if acc["v_norm"] else 0.0,
-                    "res_norm": float(np.mean(acc["res_norm"])) if acc["res_norm"] else 0.0,
+                    "res_norm": float(np.mean(acc["res_norm"])) if acc["res_norm"] else -12.0,
                     "cos": float(np.mean(acc["cos"])) if acc["cos"] else 0.0,
                     "layer": L, "head": args.head,
                     "target_q": target_q, 
@@ -780,12 +782,12 @@ def main():
                     _plot_progression(
                         scan_stats, args.outdir, key="res_norm", ylabel=f"||h[{args.sink_idx}]||",
                         title=f"Residual-norm progression (token={args.sink_idx}) (compare)", fname="scan_residual_norm_compare.png", suffix=cur_suffix,
-                        stats_b=scan_stats_base
+                        stats_b=scan_stats_base, mode="res"
                     )
                     _plot_progression(
                         scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
                         title=f"Cosine to K[{args.sink_idx}] across layers (compare)", fname="scan_cosine_compare.png", suffix=cur_suffix,
-                        stats_b=scan_stats_base, is_cos=True
+                        stats_b=scan_stats_base, mode="cos"
                     )
                     # _log_row_summary("[Perturbed] ", scan_stats)
                     # _log_row_summary("[Baseline] ", scan_stats_base)
@@ -801,10 +803,12 @@ def main():
                     _plot_progression(
                         scan_stats, args.outdir, key="res_norm", ylabel=f"||h[{args.sink_idx}]||",
                         title=f"Residual-norm progression (token={args.sink_idx})", fname="scan_residual_norm.png", suffix=cur_suffix,
+                        mode="res"
                     )
                     _plot_progression(
                         scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
-                        title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=cur_suffix, is_cos=True
+                        title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=cur_suffix,
+                        mode="cos"
                     )
                     # _log_row_summary("[Perturbed] ", scan_stats)
             
@@ -1015,7 +1019,8 @@ def main():
         _plot_progression(
             job_summary_stats, args.outdir, key="sink_attn",
             ylabel="Sink attention score", title=title_str,
-            fname="scan_sink_attn.png", suffix=agg_suffix, is_cos=True
+            fname="scan_sink_attn.png", suffix=agg_suffix,
+            mode="cos"
         )
 
 if __name__ == "__main__":
