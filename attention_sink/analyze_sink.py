@@ -194,34 +194,33 @@ def _cross_explained_variance(X, B):
     den = (Xc ** 2).sum().clamp_min(EPS)
     return float((num / den).item())
 
-def _q_bias_3d_projection(XQ, XK, topk=2):
-    mu = XK.mean(dim=0)
-    if float((mu ** 2).sum().item()) <= EPS:
+def _bias_3d_projection(X, bias_vec, topk=2):
+    if X is None or bias_vec is None:
         return None
-    u = F.normalize(mu, dim=0)
-    q_energy = (XQ ** 2).sum(dim=1, keepdim=True).clamp_min(EPS)
+    b = F.normalize(bias_vec, dim=0)
+    if float((b ** 2).sum().item()) <= EPS:
+        return None
 
-    bias_coord = XQ @ u
+    total_energy = (X ** 2).sum(dim=1, keepdim=True).clamp_min(EPS)
+    bias_coord = X @ b
     E_bias = (bias_coord ** 2).unsqueeze(1)
 
-    q_parallel = bias_coord.unsqueeze(1) * u.unsqueeze(0)
-    XQ_res = XQ - q_parallel
-    XQ_res_c = XQ_res - XQ_res.mean(dim=0, keepdim=True)
+    X_parallel = bias_coord.unsqueeze(1) * b.unsqueeze(0)
+    X_res = X - X_parallel
+    X_res_c = X_res - X_res.mean(dim=0, keepdim=True)
 
-    _U, _S, Vh = torch.linalg.svd(XQ_res_c, full_matrices=False)
-
+    _U, _S, Vh = torch.linalg.svd(X_res_c, full_matrices=False)
     k = min(topk, Vh.shape[0])
     if k < 2:
         return None
     V_res = Vh[:k]
     
-    res_coords = XQ_res @ V_res.T
+    res_coords = X_res @ V_res.T
     E_res = res_coords ** 2
 
-    frac_bias = E_bias / q_energy
-    frac_res = E_res / q_energy
+    frac_bias = E_bias / total_energy
+    frac_res = E_res / total_energy
     frac = torch.cat([frac_bias, frac_res], dim=1)
-    basis = torch.cat([u.unsqueeze(0), Vh[:k]], dim=0)
     return frac.cpu().numpy()
 
 def _mean_dir_decomposition(XQ, XK, VhQ, label, k):
@@ -426,6 +425,42 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     plt.tight_layout()
     plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
     plt.close()
+
+def _plot_bias_energy_3d(bias_sets, out_path, x_label):
+    Ys = [Y for (Y, _t) in bias_sets if Y is not None]
+    if not Ys:
+        return
+    max_fb = max(float(Y[:, 0].max()) for Y in Ys)
+    R_bias = max_fb * 1.05
+    
+    fig = plt.figure(figsize=(12, 3.5))
+    for idx, (Y, title) in enumerate(bias_sets):
+        if Y is None:
+            continue
+        ax = fig.add_subplot(1, 3, idx + 1, projection="3d")
+        frac_bias = Y[:, 0]
+        ax.scatter(Y[:, 0], Y[:, 1], Y[:, 2], s=8)
+
+        local_bias_mean = float(frac_bias.mean())
+        yy, zz = np.meshgrid(
+            np.linspace(0.0, 1.0, 2),
+            np.linspace(0.0, 1.0, 2),
+        )
+        xx = np.full_like(yy, local_bias_mean)
+        ax.plot_surface(xx, yy, zz, alpha=0.12, color="green")
+        ax.set_title(title)
+
+        ax.set_xlim(0.0, R_bias)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_zlim(0.0, 1.0)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("residual PC1")
+        ax.set_zlabel("residual PC2")
+
+    fig.subplots_adjust(wspace=0.35, right=0.97, left=0.10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
 
 def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4, suffix="", suptitle="Attention heatmaps"):
     n = len(attn_maps)
@@ -908,43 +943,19 @@ def main():
 
                     # visualize Q in bias direction + residual PC
                     bias_sets = [
-                        (_q_bias_3d_projection(XQ, X0, topk=2), "Q energy along dimensions of K0"),
-                        (_q_bias_3d_projection(XQ, X1, topk=2), "Q energy along dimensions of K1"),
-                        (_q_bias_3d_projection(XQ, X8, topk=2), "Q energy along dimensions of K8"),
+                        (_bias_3d_projection(XQ, X0.mean(dim=0), topk=2), "Q energy along dimensions of K0"),
+                        (_bias_3d_projection(XQ, X1.mean(dim=0), topk=2), "Q energy along dimensions of K1"),
+                        (_bias_3d_projection(XQ, X8.mean(dim=0), topk=2), "Q energy along dimensions of K8"),
                     ]
-                    Ys = [Y for (Y, _t) in bias_sets if Y is not None]
-                    if Ys:
-                        max_fb = max(float(Y[:, 0].max()) for Y in Ys)
-                        R_bias = max_fb * 1.05
-                        fig = plt.figure(figsize=(12, 3.5))
-                        for idx, (Y, title) in enumerate(bias_sets):
-                            if Y is None:
-                                continue
-                            ax = fig.add_subplot(1, 3, idx + 1, projection="3d")
-                            frac_bias = Y[:, 0]
-                            ax.scatter(Y[:, 0], Y[:, 1], Y[:, 2], s=8)
-
-                            local_bias_mean = float(frac_bias.mean())
-                            yy, zz = np.meshgrid(
-                                np.linspace(0.0, 1.0, 2),
-                                np.linspace(0.0, 1.0, 2),
-                            )
-                            xx = np.full_like(yy, local_bias_mean)
-                            ax.plot_surface(xx, yy, zz, alpha=0.12, color="gray")
-                            ax.set_title(f"{title}\n(plane: mean bias energy fraction)", fontsize=9)
-
-                            ax.set_xlim(0.0, R_bias); ax.set_ylim(0.0, 1.0); ax.set_zlim(0.0, 1.0)
-                            ax.set_xlabel("K bias"); ax.set_ylabel("residual PC1"); ax.set_zlabel("residual PC2")
-                        fig.subplots_adjust(wspace=0.35, right=0.97, left=0.10)
-                        fig.tight_layout()
-                        out_path = os.path.join(args.outdir, f"pca_q_bias_energy_L{target_layer}_H{args.head}.png")
-                        fig.savefig(out_path, dpi=300)
-                        plt.close(fig)
+                    _plot_bias_energy_3d(
+                        bias_sets,
+                        os.path.join(args.outdir, f"pca_q_bias_energy_L{target_layer}_H{args.head}.png"),
+                        x_label="K bias",
+                    )
 
                     # residual decomposition w.r.t K0 mean direction
-                    mu0 = X0.mean(dim=0)
                     r_sink = _compute_residual_sink_direction(
-                        model, target_layer, args.head, mu0
+                        model, target_layer, args.head, X0.mean(dim=0)
                     )
                     frac_R0 = _energy_fraction_along_direction(R0, r_sink); frac_R1 = _energy_fraction_along_direction(R1, r_sink); frac_R8 = _energy_fraction_along_direction(R8, r_sink)
                     m0, s0 = float(frac_R0.mean()), float(frac_R0.std())
@@ -954,6 +965,17 @@ def main():
                         f"[Residual] layer={target_layer} head={args.head} | "
                         f"frac residual energy along canonical sink direction: "
                         f"tok0={m0:.4f}±{s0:.4f} | tok1={m1:.4f}±{s1:.4f} | tok8={m8:.4f}±{s8:.4f}"
+                    )
+
+                    res_bias_sets = [
+                        (_bias_3d_projection(R0, r_sink, topk=2), "Residual energy (tok0)"),
+                        (_bias_3d_projection(R1, r_sink, topk=2), "Residual energy (tok1)"),
+                        (_bias_3d_projection(R8, r_sink, topk=2), "Residual energy (tok8)"),
+                    ]
+                    _plot_bias_energy_3d(
+                        res_bias_sets,
+                        os.path.join(args.outdir, f"pca_residual_bias_energy_L{target_layer}_H{args.head}.png"),
+                        x_label="Residual bias",
                     )
                 
         for pair in lower_attn_handles + window_attn_handles:
