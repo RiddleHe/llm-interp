@@ -606,7 +606,7 @@ def main():
 
     def _run_scan_pass(scan_layers, rope_overrides_local, need_qkv):
         per_layer_acc = {
-            L: {"k_norm": [], "v_norm": [], "cos": [], "sink_attn": []}
+            L: {"k_norm": [], "v_norm": [], "res_norm": [], "cos": [], "sink_attn": []}
             for L in scan_layers
         }
         per_layer_kvecs = {L: [] for L in scan_layers}
@@ -633,12 +633,15 @@ def main():
                     if args.print_mode == "qkv":
                         qkv = store[L]
                         q, k, v = qkv["q"], qkv["k"], qkv["v"]
+                        H = qkv["residual"]
                         series, k_norm = compute_cosine_series(q, k, args.head, k_sink_idx=sink_idx, q_positions=[target_q])
                         v_norm = float(v[0, args.head, sink_idx].norm().item())
+                        h_norm = float(H[0, args.head, sink_idx].norm().item())
                         hm = _pick_head_with_caches(model, attns, L, args.head)
                         sink_slice = hm[4:, sink_idx]
                         per_layer_acc[L]["k_norm"].append(k_norm)
                         per_layer_acc[L]["v_norm"].append(v_norm)
+                        per_layer_acc[L]["res_norm"].append(h_norm)
                         per_layer_acc[L]["cos"].append(series[0][1])
                         per_layer_acc[L]["sink_attn"].append(float(sink_slice.mean().item()))
                         per_layer_kvecs[L].append(k[0, args.head, sink_idx].detach().cpu())
@@ -665,6 +668,7 @@ def main():
                 stats.append({
                     "k_norm": float(np.mean(acc["k_norm"])) if acc["k_norm"] else 0.0,
                     "v_norm": float(np.mean(acc["v_norm"])) if acc["v_norm"] else 0.0,
+                    "res_norm": float(np.mean(acc["res_norm"])) if acc["res_norm"] else 0.0,
                     "cos": float(np.mean(acc["cos"])) if acc["cos"] else 0.0,
                     "layer": L, "head": args.head,
                     "target_q": target_q, 
@@ -774,6 +778,11 @@ def main():
                         stats_b=scan_stats_base
                     )
                     _plot_progression(
+                        scan_stats, args.outdir, key="res_norm", ylabel=f"||h[{args.sink_idx}]||",
+                        title=f"Residual-norm progression (token={args.sink_idx}) (compare)", fname="scan_residual_norm_compare.png", suffix=cur_suffix,
+                        stats_b=scan_stats_base
+                    )
+                    _plot_progression(
                         scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
                         title=f"Cosine to K[{args.sink_idx}] across layers (compare)", fname="scan_cosine_compare.png", suffix=cur_suffix,
                         stats_b=scan_stats_base, is_cos=True
@@ -788,6 +797,10 @@ def main():
                     _plot_progression(
                         scan_stats, args.outdir, key="v_norm", ylabel=f"||V[{args.sink_idx}]||",
                         title=f"V-norm progression (token={args.sink_idx})", fname="scan_vnorm.png", suffix=cur_suffix
+                    )
+                    _plot_progression(
+                        scan_stats, args.outdir, key="res_norm", ylabel=f"||h[{args.sink_idx}]||",
+                        title=f"Residual-norm progression (token={args.sink_idx})", fname="scan_residual_norm.png", suffix=cur_suffix,
                     )
                     _plot_progression(
                         scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
@@ -977,6 +990,13 @@ def main():
                         os.path.join(args.outdir, f"pca_residual_bias_energy_L{target_layer}_H{args.head}.png"),
                         x_label="Residual bias",
                     )
+
+                    _, _, _, _, R0_total_var = _pca_from_rows(R0, k)
+                    _, _, _, _, R1_total_var = _pca_from_rows(R1, k)
+                    _, _, _, _, R8_total_var = _pca_from_rows(R8, k)
+                    print(f"[Residual PCA] token 0 total variance: {R0_total_var:.4f}")
+                    print(f"[Residual PCA] token 1 total variance: {R1_total_var:.4f}")
+                    print(f"[Residual PCA] token 8 total variance: {R8_total_var:.4f}")
                 
         for pair in lower_attn_handles + window_attn_handles:
             for h in pair:
