@@ -2,18 +2,27 @@ import sys
 from PIL import Image
 
 if __name__ == "__main__":
-    imgs = [Image.open(p) for p in sys.argv[1:-1]]
+    direction = sys.argv[1] # vertical or horizontal
+    imgs = [Image.open(p) for p in sys.argv[2:-1]]
     out_path = sys.argv[-1]
 
-    w = max(im.width for im in imgs)
-    h = sum(im.height for im in imgs)
+    if direction == "vertical":
+        w = max(im.width for im in imgs)
+        h = sum(im.height for im in imgs)
+    else:
+        w = sum(im.width for im in imgs)
+        h = max(im.height for im in imgs)
 
     out = Image.new("RGBA", (w, h))
 
-    y = 0
+    offset = 0
     for im in imgs:
-        out.paste(im, (0, y))
-        y += im.height
+        if direction == "vertical":
+            out.paste(im, (0, offset))
+            offset += im.height
+        else:
+            out.paste(im, (offset, 0))
+            offset += im.width
 
     out.save(out_path)
     print(f"Saved to {out_path}")
