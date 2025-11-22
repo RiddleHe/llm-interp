@@ -241,6 +241,46 @@ def _mean_dir_decomposition(XQ, XK, VhQ, label, k):
     )
     return frac_q_along_mu, frac_mu_in_Q_topk
 
+def _get_head_k_proj_matrix(model, layer_idx, head_idx):
+    attn = model.model.layers[layer_idx].self_attn
+    num_heads = model.config.num_attention_heads
+    num_kv = model.config.num_key_value_heads
+    num_groups = max(1, num_heads // max(1, num_kv))
+    head_dim = model.config.head_dim
+
+    kv_idx = head_idx // num_groups
+    k_proj = attn.k_proj
+    W_full = k_proj.weight.detach() # [num_kv * head_dim, d_model]
+    start = kv_idx * head_dim
+    end = start + head_dim
+    return W_full[start:end, :]
+
+def _compute_residual_sink_direction(model, layer_idx, head_idx, mu0):
+    if mu0 is None:
+        return None
+    mu0 = mu0.to(torch.float32)
+    n2 = float((mu0 ** 2).sum().item())
+    if n2 <= EPS:
+        return None
+    u0 = F.normalize(mu0, dim=0)
+    Wk = _get_head_k_proj_matrix(model, layer_idx, head_idx).to(mu0.device, dtype=torch.float32)
+    Wk_pinv = torch.linalg.pinv(Wk) 
+    r_sink = Wk_pinv @ u0
+    if float((r_sink ** 2).sum().item()) <= EPS:
+        return None
+    return F.normalize(r_sink, dim=0)
+
+def _energy_fraction_along_direction(R, direction):
+    if R is None or direction is None:
+        return None
+    if direction.numel() == 0:
+        return None
+    d = F.normalize(direction, dim=0)
+    coords = R @ d
+    sub = coords ** 2
+    tot = (R ** 2).sum(dim=1).clamp_min(EPS)
+    return sub / tot
+
 # Parsing functions
 
 def parse_overrides(s):
@@ -303,7 +343,8 @@ def _capture_qkv_multi(model, layer_idxs, cache):
                 cache[L] = {
                     "q": q.detach().float().cpu(),
                     "k": k.detach().float().cpu(),
-                    "v": v.detach().float().cpu()
+                    "v": v.detach().float().cpu(),
+                    "residual": hidden_states.detach().float().cpu(),
                 }
             return hook
 
@@ -761,6 +802,7 @@ def main():
                 try:
                     x_tok0, x_tok1, x_tok8, x_tokq = [], [], [], []
                     cos0, cos1, cos8 = [], [], []
+                    r_tok0, r_tok1, r_tok8 = [], [], []
                     for input_ids, base_pos in tqdm(tokenized, desc=f"Collecting {VAR} for PCA", position=0, leave=False):
                         _ = prefill(model, input_ids, base_pos)
                         qkv = store.get(target_layer, None)
@@ -768,6 +810,7 @@ def main():
                             continue
                         Q = qkv["q"]
                         X = qkv[field]
+                        H = qkv["residual"]
                         assert X.shape[2] >= 9, "There must be at least 8 tokens in each sequence"
                         x0 = X[0, args.head, 0]
                         x1 = X[0, args.head, 1]
@@ -778,6 +821,10 @@ def main():
                         x_tok8.append(x8.clone())
                         x_tokq.append(xq.clone())
                         if args.find_key_subspace:
+                            # Gather residuals
+                            assert H.shape[1] >= 9, "There must be at least 8 tokens in each sequence for residuals"
+                            r_tok0.append(H[0, 0].clone()); r_tok1.append(H[0, 1].clone()); r_tok8.append(H[0, 8].clone())
+                            # Gather cosines
                             for ks, bucket in [(0, cos0), (1, cos1), (8, cos8)]:
                                 series, _ = compute_cosine_series(
                                     Q, X, args.head, k_sink_idx=ks, q_positions=[target_q]
@@ -789,10 +836,14 @@ def main():
                         except Exception: pass
                 
                 assert len(x_tok0) == len(x_tok1) == len(x_tok8) > 0, f"No {VAR} vectors found"
-                X0 = torch.stack(x_tok0, dim=0)
-                X1 = torch.stack(x_tok1, dim=0)
-                X8 = torch.stack(x_tok8, dim=0)
+                X0 = torch.stack(x_tok0, dim=0); X1 = torch.stack(x_tok1, dim=0); X8 = torch.stack(x_tok8, dim=0)
                 XQ = torch.stack(x_tokq, dim=0)
+                
+                if args.find_key_subspace and r_tok0:
+                    R0 = torch.stack(r_tok0, dim=0); R1 = torch.stack(r_tok1, dim=0); R8 = torch.stack(r_tok8, dim=0)
+                else:
+                    R0 = R1 = R8 = None
+
                 k = int(args.pca_topk)
 
                 U0, S0, Vh0, var0, K0_total_var = _pca_from_rows(X0, k)
@@ -805,21 +856,7 @@ def main():
                 print(f"[PCA: {VAR}] token 8 (non-sink) total variance: {K8_total_var:.4f}")
                 print(f"[PCA: Q] targt Q (target_q={target_q}) total variance: {Q_total_var:.4f}")
 
-                r2_1_in_0 = _cross_explained_variance(X1, Vh0[:k]); r2_0_in_1 = _cross_explained_variance(X0, Vh1[:k])
-                r2_8_in_0 = _cross_explained_variance(X8, Vh0[:k]); r2_0_in_8 = _cross_explained_variance(X0, Vh8[:k])
-                r2_8_in_1 = _cross_explained_variance(X8, Vh1[:k]); r2_1_in_8 = _cross_explained_variance(X1, Vh8[:k])
-                print(f"[PCA: {VAR}] cross R^2: {VAR}1 in span({VAR}0) = {r2_1_in_0:.4f} | {VAR}0 in span({VAR}1) = {r2_0_in_1:.4f}")
-                print(f"[PCA: {VAR}] cross R^2: {VAR}8 in span({VAR}0) = {r2_8_in_0:.4f} | {VAR}0 in span({VAR}8) = {r2_0_in_8:.4f}")
-                print(f"[PCA: {VAR}] cross R^2: {VAR}8 in span({VAR}1) = {r2_8_in_1:.4f} | {VAR}1 in span({VAR}8) = {r2_1_in_8:.4f}")
-
-                if args.find_key_subspace: # only compare Q with K, but not V
-                    r2_q_in_0 = _cross_explained_variance(XQ, Vh0[:k]); r2_0_in_q = _cross_explained_variance(X0, VhQ[:k])
-                    r2_q_in_1 = _cross_explained_variance(XQ, Vh1[:k]); r2_1_in_q = _cross_explained_variance(X1, VhQ[:k])
-                    r2_q_in_8 = _cross_explained_variance(XQ, Vh8[:k]); r2_8_in_q = _cross_explained_variance(X8, VhQ[:k])
-                    print(f"[PCA] cross R^2: Q in span(K0) = {r2_q_in_0:.4f} | K0 in span(Q) = {r2_0_in_q:.4f}")
-                    print(f"[PCA] cross R^2: Q in span(K1) = {r2_q_in_1:.4f} | K1 in span(Q) = {r2_1_in_q:.4f}")
-                    print(f"[PCA] cross R^2: Q in span(K8) = {r2_q_in_8:.4f} | K8 in span(Q) = {r2_8_in_q:.4f}")
-
+                if args.find_key_subspace:
                     # raw cosine scores
                     def _mean_or_zero(xs): return float(np.mean(xs)) if xs else 0.0
                     print(
@@ -903,6 +940,21 @@ def main():
                         out_path = os.path.join(args.outdir, f"pca_q_bias_energy_L{target_layer}_H{args.head}.png")
                         fig.savefig(out_path, dpi=300)
                         plt.close(fig)
+
+                    # residual decomposition w.r.t K0 mean direction
+                    mu0 = X0.mean(dim=0)
+                    r_sink = _compute_residual_sink_direction(
+                        model, target_layer, args.head, mu0
+                    )
+                    frac_R0 = _energy_fraction_along_direction(R0, r_sink); frac_R1 = _energy_fraction_along_direction(R1, r_sink); frac_R8 = _energy_fraction_along_direction(R8, r_sink)
+                    m0, s0 = float(frac_R0.mean()), float(frac_R0.std())
+                    m1, s1 = float(frac_R1.mean()), float(frac_R1.std())
+                    m8, s8 = float(frac_R8.mean()), float(frac_R8.std())
+                    print(
+                        f"[Residual] layer={target_layer} head={args.head} | "
+                        f"frac residual energy along canonical sink direction: "
+                        f"tok0={m0:.4f}±{s0:.4f} | tok1={m1:.4f}±{s1:.4f} | tok8={m8:.4f}±{s8:.4f}"
+                    )
                 
         for pair in lower_attn_handles + window_attn_handles:
             for h in pair:
