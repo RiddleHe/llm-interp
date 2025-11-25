@@ -1,4 +1,4 @@
-import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math
+import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math, copy
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -69,6 +69,11 @@ def _make_v_prehook(attn, cache, num_heads, num_kv, num_groups, model_cfg):
     def _prehook(_module, args, kwargs, _cache=cache):
         pass
     return _prehook
+
+def _get_hidden_from_hook_args(args, kwargs):
+    if kwargs and "hidden_states" in kwargs:
+        return kwargs["hidden_states"]
+    return args[0]
 
 def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_return_sink_value=False):
     handles = []
@@ -176,16 +181,32 @@ def apply_perturbations(base_pos, rope_overrides=None, mask=None):
         applied["mask"] = True
     return pos_ids, applied
 
+def _register_block_raw_captures(model, L, cache):
+    handles = []
+    h = model.model.layers[L].register_forward_pre_hook(
+        lambda m, a, k, _c=cache: _c.setdefault("raw_L", []).append(
+            _get_hidden_from_hook_args(a, k).detach().float().cpu(),
+        ),
+        with_kwargs=True
+    )
+    handles.append(h)
+
+    return handles
+
 # PCA
 
-def _pca_from_rows(X, k):
-    X = X - X.mean(dim=0)
-    U, S, Vh = torch.linalg.svd(X, full_matrices=False)
-    var = (S ** 2)
+def _svd_centered(X, full_matrices=False):
+    Xc = X - X.mean(dim=0, keepdim=True)
+    U, S, Vh = torch.linalg.svd(Xc, full_matrices=full_matrices)
+    var = S ** 2
     total = var.sum().clamp_min(EPS)
+    return U, S, Vh, var, float(total.item())
+
+def _pca_from_rows(X, k):
+    U, S, Vh, var, total = _svd_centered(X, full_matrices=False)
     k = min(k, Vh.shape[0])
     rel = (var[:k] / total).cpu().numpy()
-    return U[:, :k], S[:k], Vh[:k, :], rel, var.sum().item()
+    return U[:, :k], S[:k], Vh[:k, :], rel, total
 
 def _cross_explained_variance(X, B):
     Xc = X - X.mean(dim=0, keepdim=True)
@@ -280,6 +301,178 @@ def _energy_fraction_along_direction(R, direction):
     tot = (R ** 2).sum(dim=1).clamp_min(EPS)
     return sub / tot
 
+def _mean_energy(z):
+    return float((z.pow(2)).sum(dim=-1).mean().item())
+
+def _total_var(Z):
+    Zc = Z - Z.mean(dim=0, keepdim=True)
+    return float((Zc.pow(2)).sum().item())
+
+def _cross_total_cov(U, V):
+    Uc = U - U.mean(dim=0, keepdim=True)
+    Vc = V - V.mean(dim=0, keepdim=True)
+    return float((Uc * Vc).sum().item())
+
+def _directional_concentration(Y):
+    if Y.ndim != 2 or Y.size(0) < 2:
+        return 0.0, None
+    Yu = F.normalize(Y, dim=-1)
+    U, S, Vh, var, total = _svd_centered(Yu, full_matrices=False)
+    ratio = float((var[0] / total).item())
+    bias_dir = F.normalize(Vh[0], dim=0)
+    return ratio, bias_dir
+
+def _component_direction_stats(R, A, M, bias_dir):
+    if bias_dir is None:
+        return {}
+    b = F.normalize(bias_dir, dim=0)
+
+    def _coef(X):
+        return X @ b
+    
+    def _var(x):
+        if x.numel() == 0:
+            return 0.0
+        xm = x - x.mean()
+        return float((xm * xm).mean().item())
+
+    def _cov(x, y):
+        if x.numel() == 0 or y.numel() == 0:
+            return 0.0
+        xm = x - x.mean()
+        ym = y - y.mean()
+        return float((xm * ym).mean().item())
+
+    def _cos_stats(X, coeff):
+        norms = X.norm(dim=-1).clamp_min(EPS)
+        cos = coeff / norms
+        return float(cos.mean().item())
+
+    def _orth_energy(X, coeff):
+        res = X - coeff.unsqueeze(-1) * b
+        return float((res.pow(2).sum(dim=-1)).mean().item())
+
+    alpha = _coef(R); beta = _coef(A); gamma = _coef(M)
+    stats = {
+        "var_residual": _var(alpha),
+        "var_attn": _var(beta),
+        "var_mlp": _var(gamma),
+        "covariance_residual_mlp": _cov(alpha, gamma),
+    }
+
+    mu_r = _cos_stats(R, alpha)
+    mu_a = _cos_stats(A, beta)
+    mu_m = _cos_stats(M, gamma)
+    stats.update({
+        "cos_residual_mean": mu_r,
+        "cos_attn_mean": mu_a,
+        "cos_mlp_mean": mu_m,
+        "orth_energy_residual": _orth_energy(R, alpha),
+        "orth_energy_attn": _orth_energy(A, beta),
+        "orth_energy_mlp": _orth_energy(M, gamma),
+    })
+    return stats
+
+# decomposition of input functions
+
+def _install_zero_attn_hooks(model, layer_idx):
+    attn = model.model.layers[layer_idx].self_attn
+    def _zero_attn_out(_m, _args, output):
+        out = list(output)
+        out[0] = torch.zeros_like(out[0])
+        return tuple(out)
+    h = attn.register_forward_hook(_zero_attn_out)
+    return [h]
+
+def _install_zero_mlp_hooks(model, layer_idx):
+    mlp = model.model.layers[layer_idx].mlp
+    def _zero_mlp_out(_m, _args, output):
+        return torch.zeros_like(output)
+    h = mlp.register_forward_hook(_zero_mlp_out)
+    return [h]
+
+def _rms(x, eps=EPS):
+    return x.pow(2).mean(dim=-1).add_(eps).sqrt()
+
+def _rmsnorm_from_module(Z, ln_mod):
+    eps = float(getattr(ln_mod, "eps", 1e-6))
+    w = ln_mod.weight.detach().to(dtype=Z.dtype, device=Z.device)
+    denom = Z.pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt()
+    return (Z / denom) * w
+
+def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
+    cache_raw = {}
+    store = {}
+    handles = []
+    handles += _register_block_raw_captures(model, layer_idx, cache_raw)
+    handles += _capture_qkv_multi(
+        model,
+        [layer_idx],
+        store,
+        capture_attn_out=True,
+        capture_mlp_out=True,
+    )
+
+    R_tok = {t: [] for t in tok_idxs}
+    A_tok = copy.deepcopy(R_tok); M_tok = copy.deepcopy(R_tok); Y_tok = copy.deepcopy(R_tok)
+
+    try:
+        for input_ids, base_pos in tqdm(
+            tokenized,
+            desc=f"Collecting raw R/A/M at L={layer_idx}",
+            leave=False,
+        ):
+            for L in list(store.keys()):
+                store[L].clear()
+            _ = prefill(model, input_ids, base_pos)
+
+            if "raw_L" not in cache_raw or not cache_raw["raw_L"]:
+                continue
+            raw_L = cache_raw["raw_L"][-1][0]
+
+            entry = store.get(layer_idx, None)
+            if entry is None:
+                continue
+            attn_out = entry.get("attn_out", None)
+            mlp_out = entry.get("mlp_out", None)
+            if attn_out is None or mlp_out is None:
+                continue
+            attn_out = attn_out[0]
+            mlp_out = mlp_out[0]
+
+            S = raw_L.shape[0]
+            for t in tok_idxs:
+                if t >= S:
+                    continue
+                r = raw_L[t].clone()
+                a = attn_out[t].clone()
+                m = mlp_out[t].clone()
+                y = r + a + m
+                R_tok[t].append(r)
+                A_tok[t].append(a)
+                M_tok[t].append(m)
+                Y_tok[t].append(y)
+
+    finally:
+        for h in handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+
+    out = {}
+    for name, bucket in [
+        ("R", R_tok),
+        ("A", A_tok),
+        ("M", M_tok),
+        ("Y", Y_tok),
+    ]:
+        out[name] = {}
+        for t, vecs in bucket.items():
+            if vecs:
+                out[name][t] = torch.stack(vecs, dim=0)
+    return out
+
 # Parsing functions
 
 def parse_overrides(s):
@@ -312,7 +505,7 @@ def prefill(model, input_ids, position_ids):
     )
     return out.attentions # tuple(len=layers) of [B, H, Q, K]
 
-def _capture_qkv_multi(model, layer_idxs, cache):
+def _capture_qkv_multi(model, layer_idxs, cache, capture_attn_out=False, capture_mlp_out=False):
     handles = []
     for L in layer_idxs:
         attn = model.model.layers[L].self_attn
@@ -347,8 +540,28 @@ def _capture_qkv_multi(model, layer_idxs, cache):
                 }
             return hook
 
-        h = attn.register_forward_pre_hook(_mk_hook(L, attn), with_kwargs=True)
-        handles.append(h)
+        h_pre = attn.register_forward_pre_hook(_mk_hook(L, attn), with_kwargs=True)
+        handles.append(h_pre)
+
+        if capture_attn_out:
+            def _mk_fwd_hook(L_):
+                def fwd_hook(_module, args, output):
+                    attn_out = output[0]
+                    cache[L_]["attn_out"] = attn_out.detach().float().cpu()
+                return fwd_hook
+            h_fwd = attn.register_forward_hook(_mk_fwd_hook(L))
+            handles.append(h_fwd)
+
+        if capture_mlp_out:
+            mlp = model.model.layers[L].mlp
+            def _mk_mlp_fwd_hook(L_):
+                def fwd_hook(_module, args, output, _cache=cache):
+                    entry = _cache.setdefault(L_, {})
+                    entry["mlp_out"] = output.detach().float().cpu()
+                return fwd_hook
+            h_mlp = mlp.register_forward_hook(_mk_mlp_fwd_hook(L))
+            handles.append(h_mlp)
+
     return handles
 
 def compute_cosine_series(q, k, head_idx, k_sink_idx, q_positions):
@@ -384,7 +597,7 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     y_a = [by_a[L][key] for L in layers]
     plt.figure(figsize=(7, 3.5))
     ax = plt.gca()
-    ax.plot(layers, y_a, marker="o", label="Perturbed" if stats_b else "Norm of K")
+    ax.plot(layers, y_a, marker="o", label="Perturbed" if stats_b else "Norm")
 
     if stats_b:
         by_b = {s["layer"]: s for s in stats_b}
@@ -415,7 +628,7 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     if has_kvar:
         y2 = [by_a[L]["k_total_var"] for L in layers]
         ax2 = ax.twinx()
-        ax2.plot(layers, y2, marker="^", linestyle="--", color="tab:red", label="Total variance of K")
+        ax2.plot(layers, y2, marker="^", linestyle="--", color="tab:red", label="Total variance")
         ax2.set_ylim(0, 20000)
 
         lines1, labels1 = ax.get_legend_handles_labels()
@@ -566,6 +779,9 @@ def main():
     p.add_argument("--find-value-subspace", action="store_true", help="Collect V at token 0 and non-sink positions and run PCA")
     p.add_argument("--find-key-subspace", action="store_true", help="Collect K at token 0 and non-sink positions and run PCA")
     p.add_argument("--pca-topk", type=int, default=6, help="Top-k PCA for groups of vectors")
+    # decomposition of input
+    p.add_argument("--decompose-ln", action="store_true", help="For --layer L, decompose the norm input LN(residual + attn + mlp) at L")
+    p.add_argument("--decompose-output", action="store_true", help="For --layer L, decompose the output (residual + attn + mlp) at L")
     # output
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
@@ -638,7 +854,7 @@ def main():
                         H = qkv["residual"]
                         series, k_norm = compute_cosine_series(q, k, args.head, k_sink_idx=sink_idx, q_positions=[target_q])
                         v_norm = float(v[0, args.head, sink_idx].norm().item())
-                        h_norm = float(torch.log(H[0, sink_idx].norm()).item())
+                        h_norm = float(torch.log(H[0, sink_idx].norm().clamp_min(EPS)).item())
                         hm = _pick_head_with_caches(model, attns, L, args.head)
                         sink_slice = hm[4:, sink_idx]
                         per_layer_acc[L]["k_norm"].append(k_norm)
@@ -848,7 +1064,13 @@ def main():
             if args.find_value_subspace or args.find_key_subspace:
                 target_layer = int(args.layer)
                 store = {}
-                handles = _capture_qkv_multi(model, [target_layer], store)
+                handles = _capture_qkv_multi(
+                    model, [target_layer], store,
+                    # capture_attn_out=args.find_key_subspace,
+                    # capture_mlp_out=args.find_key_subspace
+                )
+                raw_cache = {}
+                handles += _register_block_raw_captures(model, target_layer, raw_cache)
                 field = "v" if args.find_value_subspace else "k"
                 VAR = "V" if field == "v" else "K"
                 try:
@@ -872,10 +1094,11 @@ def main():
                         x_tok1.append(x1.clone())
                         x_tok8.append(x8.clone())
                         x_tokq.append(xq.clone())
+
+                        # Gather residuals
+                        assert H.shape[1] >= 9, "There must be at least 8 tokens in each sequence for residuals"
+                        r_tok0.append(H[0, 0].clone()); r_tok1.append(H[0, 1].clone()); r_tok8.append(H[0, 8].clone())
                         if args.find_key_subspace:
-                            # Gather residuals
-                            assert H.shape[1] >= 9, "There must be at least 8 tokens in each sequence for residuals"
-                            r_tok0.append(H[0, 0].clone()); r_tok1.append(H[0, 1].clone()); r_tok8.append(H[0, 8].clone())
                             # Gather cosines
                             for ks, bucket in [(0, cos0), (1, cos1), (8, cos8)]:
                                 series, _ = compute_cosine_series(
@@ -890,11 +1113,12 @@ def main():
                 assert len(x_tok0) == len(x_tok1) == len(x_tok8) > 0, f"No {VAR} vectors found"
                 X0 = torch.stack(x_tok0, dim=0); X1 = torch.stack(x_tok1, dim=0); X8 = torch.stack(x_tok8, dim=0)
                 XQ = torch.stack(x_tokq, dim=0)
+
+                min_len = min(t.shape[1] for t in raw_cache["raw_L"])
+                X_raw = torch.stack([t[:, :min_len] for t in raw_cache["raw_L"]], dim=0)[:, 0]
+                assert X_raw.shape[1] >= 9, "There must be at least 8 tokens in each sequence"
                 
-                if args.find_key_subspace and r_tok0:
-                    R0 = torch.stack(r_tok0, dim=0); R1 = torch.stack(r_tok1, dim=0); R8 = torch.stack(r_tok8, dim=0)
-                else:
-                    R0 = R1 = R8 = None
+                R0 = torch.stack(r_tok0, dim=0); R1 = torch.stack(r_tok1, dim=0); R8 = torch.stack(r_tok8, dim=0)
 
                 k = int(args.pca_topk)
 
@@ -995,12 +1219,126 @@ def main():
                         x_label="Residual bias",
                     )
 
-                    _, _, _, _, R0_total_var = _pca_from_rows(R0, k)
-                    _, _, _, _, R1_total_var = _pca_from_rows(R1, k)
-                    _, _, _, _, R8_total_var = _pca_from_rows(R8, k)
-                    print(f"[Residual PCA] token 0 total variance: {R0_total_var:.4f}")
-                    print(f"[Residual PCA] token 1 total variance: {R1_total_var:.4f}")
-                    print(f"[Residual PCA] token 8 total variance: {R8_total_var:.4f}")
+                R0_total_var = _total_var(R0); R1_total_var = _total_var(R1); R8_total_var = _total_var(R8)
+                print(
+                    f"[Block input] Total variance (post-LN): token 0={R0_total_var:.4f} | "
+                    f"token 1={R1_total_var:.4f} | " 
+                    f"token 8={R8_total_var:.4f}"
+                )
+
+                raw0, raw1, raw8 = X_raw[:, 0], X_raw[:, 1], X_raw[:, 8]
+                RAW0_total_var = _total_var(raw0); RAW1_total_var = _total_var(raw1); RAW8_total_var = _total_var(raw8)
+                print(
+                    f"[Block input] Total variance (pre-LN): token 0={RAW0_total_var:.4f} | "
+                    f"token 1={RAW1_total_var:.4f} | "
+                    f"token 8={RAW8_total_var:.4f}"
+                )
+
+                # sanity check
+                ln_mod = model.model.layers[target_layer].input_layernorm
+                recon0 = _rmsnorm_from_module(raw0, ln_mod)
+                print(f"[Sanity check] reconstructed tok0 total variance (pre -> post): {_total_var(recon0):.4f}")
+
+            L = int(args.layer)
+            Lm1 = max(0, L - 1)
+            tok_idxs = [0, 1, 8]
+                    
+            if args.decompose_ln:
+                def _collect_preln_vectors():
+                    _store = {}
+                    _handles = _capture_qkv_multi(model, [L], _store)
+                    vecs = []
+                    try:
+                        for input_ids, base_pos in tqdm(tokenized, desc=f"Collecting pre-L{L} input", leave=False):
+                            _ = prefill(model, input_ids, base_pos)
+                            H = _store[L]["residual"][0]
+                            vecs.append(torch.stack([H[t] for t in tok_idxs], dim=0))
+                    finally:
+                        for h in _handles:
+                            try: h.remove()
+                            except Exception: pass
+                    return torch.stack(vecs, dim=0)
+
+                X = _collect_preln_vectors()
+                hooks_m = _install_zero_mlp_hooks(model, Lm1)
+                X_nm = _collect_preln_vectors()
+                for h in hooks_m: h.remove()
+                hooks_a = _install_zero_attn_hooks(model, Lm1)
+                X_na = _collect_preln_vectors()
+                for h in hooks_a: h.remove()
+
+                M = X - X_nm
+                A = X - X_na
+                R = X_nm + X_na - X
+
+                # shared rmsnorm scaling factor
+                s = 1.0 / _rms(X, eps=EPS)
+                s = s.unsqueeze(-1)
+                Rn, An, Mn = R * s, A * s, M * s
+                Yn = Rn + An + Mn # equal original input
+
+                names = ["tok0", "tok1", "tok8"]
+                for i, name in enumerate(names):
+                    Yr, Ya, Ym = Rn[:, i], An[:, i], Mn[:, i]
+                    Ysum = Yr + Ya + Ym
+                    Er, Ea, Em = _mean_energy(Yr), _mean_energy(Ya), _mean_energy(Ym)
+                    Etot = _mean_energy(Yn[:, i])
+                    print(f"[Decompose L={L} {name}] ||y||^2={Etot:.4f} | r={Er:.4f} a={Ea:.4f} m={Em:.4f}")
+
+                    Tr, Ta, Tm = _total_var(Yr), _total_var(Ya), _total_var(Ym)
+                    Tra, Trm, Tam = _cross_total_cov(Yr, Ya), _cross_total_cov(Yr, Ym), _cross_total_cov(Ya, Ym)
+                    Ttot = _total_var(Ysum)
+                    recon = Tr + Ta + Tm + 2 * Tra + 2 * Trm + 2 * Tam
+                    print(
+                        f"[VarDecomp L={L} {name}] total_var={Ttot:.4f} | "
+                        f"r={Tr:.4f} a={Ta:.4f} m={Tm:.4f} | "
+                        f"2r*a={2*Tra:.4f} 2r*m={2*Trm:.4f} 2a*m={2*Tam:.4f} | "
+                        f"recon_err={Ttot - recon:+.4e}"
+                    )
+
+            if args.decompose_output:
+                raw_components = _collect_raw_components_for_layer(
+                    model, L, tok_idxs, tokenized,
+                )
+
+                names = ["tok0", "tok1", "tok8"]
+                for t, name in zip(tok_idxs, names):
+                    Y = raw_components["Y"].get(t, None)
+                    R_raw = raw_components["R"].get(t, None)
+                    A_raw = raw_components["A"].get(t, None)
+                    M_raw = raw_components["M"].get(t, None)
+                    if (
+                        Y is None or R_raw is None or A_raw is None or M_raw is None
+                    ):
+                        continue
+
+                    dc, bias_dir = _directional_concentration(Y)
+                    print(
+                        f"[Block Output L={L} {name}] directional_concentration={dc:.4f} "
+                        f"(N={Y.shape[0]})"
+                    )
+
+                    stats = _component_direction_stats(R_raw, A_raw, M_raw, bias_dir)
+                    if stats:
+                        print(
+                            f"[Block Output L={L} {name}] "
+                            f"var(residual)={stats['var_residual']:.4e} | "
+                            f"var(attn)={stats['var_attn']:.4e} | "
+                            f"var(mlp)={stats['var_mlp']:.4e} | "
+                            f"cov(residual,mlp)={stats['covariance_residual_mlp']:.4e}"
+                        )
+                        print(
+                            f"[Block Output L={L} {name}] "
+                            f"cos(residual,bias)={stats['cos_residual_mean']:.4f} | "
+                            f"cos(attn,bias)={stats['cos_attn_mean']:.4f} | "
+                            f"cos(mlp,bias)={stats['cos_mlp_mean']:.4f}"
+                        )
+                        print(
+                            f"[Block Output L={L} {name}] "
+                            f"E||R⊥||^2={stats['orth_energy_residual']:.4e} "
+                            f"E||A⊥||^2={stats['orth_energy_attn']:.4e} "
+                            f"E||M⊥||^2={stats['orth_energy_mlp']:.4e}" 
+                        )
                 
         for pair in lower_attn_handles + window_attn_handles:
             for h in pair:
