@@ -1,8 +1,8 @@
 # LLM Brain Surgeon
 
-A collection of lightweight, standalone scripts to visualize the reasoning traces of LLMs. (Help me pick a better repo name!)
+A collection of lightweight, standalone scripts to perform mechanistic interpretability observations on chosen LLMs. Topics include the geometric mechanism of attention sinks, the isolated simulations of non-deterministic attention outputs, etc.
 
-To run any single one, just call `python <script_name>.py` in the subdir.
+In each subdir, which is headed by a research topic, a `readme.md` is (or will be) available for instructions on how to run the single python script.
 
 ## Research topics
 
@@ -10,35 +10,17 @@ To run any single one, just call `python <script_name>.py` in the subdir.
 
 We want to understand when attention sinks occur, and what are some causal factors that contribute to its emergence.
 
-You can now study the effect of RoPE, model weights, and the value of attention scores of sink token on the sink phenomenon.
-
-```
-cd attention_sink
-python analyze_sink.py --scan \
-    --print [heatmap, log] \
-    --rope 0=12,1=13,2=14,3=15 \
-    --random-init \
-    --lower-attn \
-```
+We find that token 0 manipulates a particular layer output to reside in a low-variance manifold, which it can then linearly transform into strong signals for alignment when doing QK computation.
 
 ### Deterministic attention
 
 We want to understand when nondeterministic inference occurs even with temperature=0. 
 
-You can now study the scenario where the variable can be batch size, prefill strategy, or attention implementation.
+We find that by changing the prefilling strategy or batch size, softmax outputs drift from the baseline.
 
-```
-cd attention_nondeterministic
-python analyze_attention_nondeterministic.py \
-    --mode [split_kv, prefill] \
-    --attn_implementation [flash_attention_2, sdpa] \
-    --seq_lens [4096, 6144] \
-    --batch_sizes [1, 2, 4, 8] \
-    --use_fa2_repo --fa2_deterministic --fa2_split_size 1024
-```
 
 ### Thinking budget
 
 We want to study how models track and budget the number of thinking tokens in their CoT, especially for `ByteDance-Seed/Seed-OSS-36B-Instruct` by ByteDance.
 
-You can now swap the RoPE of the budget token, regenerate it again in the decoding step, or do other fun things.
+We find that special layers are activated before the budgeting occurs to only focus its attention on the last two tokens.
