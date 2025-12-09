@@ -6,7 +6,7 @@ In each subdir, which is headed by a research topic, a `readme.md` is (or will b
 
 ## Research topics
 
-### Attention sinks
+### Attention sinks (actively developing)
 
 We want to understand when attention sinks occur, and what are some causal factors that contribute to its emergence.
 
