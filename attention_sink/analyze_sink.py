@@ -313,12 +313,13 @@ def _cross_total_cov(U, V):
     Vc = V - V.mean(dim=0, keepdim=True)
     return float((Uc * Vc).sum().item())
 
-def _directional_concentration(Y):
+def _directional_concentration(Y, topk=3):
     if Y.ndim != 2 or Y.size(0) < 2:
         return 0.0, None
     Yu = F.normalize(Y, dim=-1)
     U, S, Vh, var, total = _svd_centered(Yu, full_matrices=False)
-    ratio = float((var[0] / total).item())
+    k_eff = min(topk, var.shape[0])
+    ratio = float((var[:k_eff].sum() / total).item())
     bias_dir = F.normalize(Vh[0], dim=0)
     return ratio, bias_dir
 
@@ -329,12 +330,6 @@ def _component_direction_stats(R, A, M, bias_dir):
 
     def _coef(X):
         return X @ b
-    
-    def _var(x):
-        if x.numel() == 0:
-            return 0.0
-        xm = x - x.mean()
-        return float((xm * xm).mean().item())
 
     def _cov(x, y):
         if x.numel() == 0 or y.numel() == 0:
@@ -348,29 +343,19 @@ def _component_direction_stats(R, A, M, bias_dir):
         cos = coeff / norms
         return float(cos.mean().item())
 
-    def _orth_energy(X, coeff):
-        res = X - coeff.unsqueeze(-1) * b
-        return float((res.pow(2).sum(dim=-1)).mean().item())
-
     alpha = _coef(R); beta = _coef(A); gamma = _coef(M)
     stats = {
-        "var_residual": _var(alpha),
-        "var_attn": _var(beta),
-        "var_mlp": _var(gamma),
         "covariance_residual_mlp": _cov(alpha, gamma),
+        "total_var_residual": _total_var(R),
+        "total_var_attn": _total_var(A),
+        "total_var_mlp": _total_var(M),
+        "dir_concentration_residual": _directional_concentration(R)[0],
+        "dir_concentration_attn": _directional_concentration(A)[0],
+        "dir_concentration_mlp": _directional_concentration(M)[0],
+        "cos_residual_mean": _cos_stats(R, alpha),
+        "cos_attn_mean": _cos_stats(A, beta),
+        "cos_mlp_mean": _cos_stats(M, gamma),
     }
-
-    mu_r = _cos_stats(R, alpha)
-    mu_a = _cos_stats(A, beta)
-    mu_m = _cos_stats(M, gamma)
-    stats.update({
-        "cos_residual_mean": mu_r,
-        "cos_attn_mean": mu_a,
-        "cos_mlp_mean": mu_m,
-        "orth_energy_residual": _orth_energy(R, alpha),
-        "orth_energy_attn": _orth_energy(A, beta),
-        "orth_energy_mlp": _orth_energy(M, gamma),
-    })
     return stats
 
 # decomposition of input functions
@@ -1313,8 +1298,11 @@ def main():
                         continue
 
                     dc, bias_dir = _directional_concentration(Y)
+                    Y_total_var = _total_var(Y)
                     print(
-                        f"[Block Output L={L} {name}] directional_concentration={dc:.4f} "
+                        f"[Block Output L={L} {name}] "
+                        f"total_var(Y)={Y_total_var:.4e} | "
+                        f"top-3 directional_concentration(Y)={dc:.4f} "
                         f"(N={Y.shape[0]})"
                     )
 
@@ -1322,22 +1310,22 @@ def main():
                     if stats:
                         print(
                             f"[Block Output L={L} {name}] "
-                            f"var(residual)={stats['var_residual']:.4e} | "
-                            f"var(attn)={stats['var_attn']:.4e} | "
-                            f"var(mlp)={stats['var_mlp']:.4e} | "
+                            f"total_var(residual)={stats['total_var_residual']:.4e} | "
+                            f"total_var(attn)={stats['total_var_attn']:.4e} | "
+                            f"total_var(mlp)={stats['total_var_mlp']:.4e}"
+                        )
+                        print(
+                            f"[Block Output L={L} {name}] "
+                            f"top-3 dir_concentration(residual)={stats['dir_concentration_residual']:.4f} | "
+                            f"dir_concentration(attn)={stats['dir_concentration_attn']:.4f} | "
+                            f"dir_concentration(mlp)={stats['dir_concentration_mlp']:.4f} | "
                             f"cov(residual,mlp)={stats['covariance_residual_mlp']:.4e}"
                         )
                         print(
                             f"[Block Output L={L} {name}] "
                             f"cos(residual,bias)={stats['cos_residual_mean']:.4f} | "
                             f"cos(attn,bias)={stats['cos_attn_mean']:.4f} | "
-                            f"cos(mlp,bias)={stats['cos_mlp_mean']:.4f}"
-                        )
-                        print(
-                            f"[Block Output L={L} {name}] "
-                            f"E||R⊥||^2={stats['orth_energy_residual']:.4e} "
-                            f"E||A⊥||^2={stats['orth_energy_attn']:.4e} "
-                            f"E||M⊥||^2={stats['orth_energy_mlp']:.4e}" 
+                            f"cos(mlp,bias)={stats['cos_mlp_mean']:.4f}\n"
                         )
                 
         for pair in lower_attn_handles + window_attn_handles:
