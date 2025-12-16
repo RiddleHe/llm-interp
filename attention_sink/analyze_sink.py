@@ -745,7 +745,6 @@ def main():
     p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print qkv, eg. '256,512,768")
     p.add_argument("--sink-idx", type=int, default=0, help="Index of the sink in qkv mode")
     p.add_argument("--target-idx", type=int, default=None, help="Index of the target token for --print qkv")
-    p.add_argument("--compare", action="store_true", help="Compare perturbed run vs baseline")
     # perturbations
     p.add_argument("--rope", default=None, help="Comma-separated list of token_idx=rope_pos, eg. '12=0,42=1")
     p.add_argument("--mask", default=None, choices=["upper"], help="Causal mask type")
@@ -773,9 +772,6 @@ def main():
 
     _disable_packed_sequence_splitting()
     tok, model = load_model(args.model, args.device, args.dtype, random_init=args.random_init)
-
-    if args.compare and (args.print_mode == "heatmap"):
-        raise NotImplementedError("--compare is only available for --print qkv with limited perturbation options")
 
     if args.prompt_file:
         prompts = _load_prompts_from_file(args.prompt_file)
@@ -844,7 +840,6 @@ def main():
                         sink_slice = hm[4:, sink_idx]
                         per_layer_acc[L]["k_norm"].append(k_norm)
                         per_layer_acc[L]["v_norm"].append(v_norm)
-                        per_layer_acc[L]["res_norm"].append(h_norm)
                         per_layer_acc[L]["cos"].append(series[0][1])
                         per_layer_acc[L]["sink_attn"].append(float(sink_slice.mean().item()))
                         per_layer_kvecs[L].append(k[0, args.head, sink_idx].detach().cpu())
@@ -934,7 +929,6 @@ def main():
                 )
 
         scan_stats = [] # aggregated per layer
-        scan_stats_base = []
         scan_maps, scan_titles = [], []
         summary = None
 
@@ -949,69 +943,24 @@ def main():
             }
             need_qkv = (args.print_mode == "qkv")
             scan_stats, scan_maps, scan_titles = _run_scan_pass(scan_layers, rope_overrides, need_qkv)
-            
-            # baseline pass
-            if args.compare and args.print_mode == "qkv":
-                for pair in lower_attn_handles + window_attn_handles:
-                    for h in pair:
-                        try:
-                            h.remove()
-                        except Exception:
-                            pass
-                lower_attn_handles = []
-                window_attn_handles = []
-                if hasattr(model, "_lower_attn_cache"):
-                    model._lower_attn_cache = {}
-
-                scan_stats_base, _m, _t = _run_scan_pass(scan_layers, None, True)
 
             if args.print_mode == "qkv" and len(scan_stats) > 0:
                 scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
                 q_label = f"Q[{args.target_idx}]" if args.target_idx is not None else "Q[last]"
-                if args.compare and len(scan_stats_base) > 0:
-                    scan_stats_base = sorted(scan_stats_base, key=lambda s: s["layer"])
-                    _plot_progression(
-                        scan_stats, args.outdir, key="k_norm", ylabel=f"||K[{args.sink_idx}]||",
-                        title=f"K-norm progression (token={args.sink_idx}) (compare)", fname="scan_knorm_compare.png", suffix=cur_suffix,
-                        stats_b=scan_stats_base
-                    )
-                    _plot_progression(
-                        scan_stats, args.outdir, key="v_norm", ylabel=f"||V[{args.sink_idx}]||",
-                        title=f"V-norm progression (token={args.sink_idx}) (compare)", fname="scan_vnorm_compare.png", suffix=cur_suffix,
-                        stats_b=scan_stats_base
-                    )
-                    _plot_progression(
-                        scan_stats, args.outdir, key="res_norm", ylabel=f"||h[{args.sink_idx}]||",
-                        title=f"Residual-norm progression (token={args.sink_idx}) (compare)", fname="scan_residual_norm_compare.png", suffix=cur_suffix,
-                        stats_b=scan_stats_base, mode="res"
-                    )
-                    _plot_progression(
-                        scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
-                        title=f"Cosine to K[{args.sink_idx}] across layers (compare)", fname="scan_cosine_compare.png", suffix=cur_suffix,
-                        stats_b=scan_stats_base, mode="cos"
-                    )
-                    # _log_row_summary("[Perturbed] ", scan_stats)
-                    # _log_row_summary("[Baseline] ", scan_stats_base)
-                else:
-                    _plot_progression(
-                        scan_stats, args.outdir, key="k_norm", ylabel=f"||K[{args.sink_idx}]||",
-                        title=f"K-norm progression (token={args.sink_idx})", fname="scan_knorm.png", suffix=cur_suffix
-                    )
-                    _plot_progression(
-                        scan_stats, args.outdir, key="v_norm", ylabel=f"||V[{args.sink_idx}]||",
-                        title=f"V-norm progression (token={args.sink_idx})", fname="scan_vnorm.png", suffix=cur_suffix
-                    )
-                    _plot_progression(
-                        scan_stats, args.outdir, key="res_norm", ylabel=f"||h[{args.sink_idx}]||",
-                        title=f"Residual-norm progression (token={args.sink_idx})", fname="scan_residual_norm.png", suffix=cur_suffix,
-                        mode="res"
-                    )
-                    _plot_progression(
-                        scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
-                        title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=cur_suffix,
-                        mode="cos"
-                    )
-                    # _log_row_summary("[Perturbed] ", scan_stats)
+                _plot_progression(
+                    scan_stats, args.outdir, key="k_norm", ylabel=f"||K[{args.sink_idx}]||",
+                    title=f"K-norm progression (token={args.sink_idx})", fname="scan_knorm.png", suffix=cur_suffix
+                )
+                _plot_progression(
+                    scan_stats, args.outdir, key="v_norm", ylabel=f"||V[{args.sink_idx}]||",
+                    title=f"V-norm progression (token={args.sink_idx})", fname="scan_vnorm.png", suffix=cur_suffix
+                )
+                _plot_progression(
+                    scan_stats, args.outdir, key="cos", ylabel=f"cos({q_label}, K[{args.sink_idx}])",
+                    title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=cur_suffix,
+                    mode="cos"
+                )
+                # _log_row_summary("[Perturbed] ", scan_stats)
             
             elif args.print_mode == "heatmap" and len(scan_maps) > 0:
                 grid_title = "Attention heatmaps"
