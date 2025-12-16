@@ -803,9 +803,9 @@ def main():
     num_heads = model.config.num_attention_heads
     job_summary_stats = []
 
-    def _run_scan_pass(scan_layers, rope_overrides_local, need_qkv):
+    def _run_scan_pass(scan_layers, rope_overrides_local):
         per_layer_acc = {
-            L: {"k_norm": [], "v_norm": [], "res_norm": [], "cos": [], "sink_attn": []}
+            L: {"k_norm": [], "v_norm": [], "res_norm": [], "mlp_out_norm": [], "cos": [], "sink_attn": []}
             for L in scan_layers
         }
         per_layer_kvecs = {L: [] for L in scan_layers}
@@ -819,12 +819,16 @@ def main():
         sink_idx = max(0, min(last_q, args.sink_idx))
 
         store = {}
-        handles = _capture_qkv_multi(model, scan_layers, store) if need_qkv else []
+        handles = _capture_qkv_multi(
+            model, 
+            scan_layers, 
+            store,
+            capture_mlp_out=True,
+        )
         try:
             for input_ids, base_pos in tqdm(tokenized, desc="Scanning prompts", position=0, leave=False):
-                if need_qkv:
-                    for L in list(store.keys()):
-                        store[L].clear()
+                for L in list(store.keys()):
+                    store[L].clear()
                 pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides_local)
                 attns = prefill(model, input_ids, pos_ids_perturbed)
 
@@ -836,13 +840,22 @@ def main():
                         series, k_norm = compute_cosine_series(q, k, args.head, k_sink_idx=sink_idx, q_positions=[target_q])
                         v_norm = float(v[0, args.head, sink_idx].norm().item())
                         h_norm = float(torch.log(H[0, sink_idx].norm().clamp_min(EPS)).item())
+
+                        mlp_out = qkv["mlp_out"]
+                        mlp_out = mlp_out[0]
+                        mlp_norm = float(torch.log(mlp_out[sink_idx].norm().clamp_min(EPS)).item())
+
                         hm = _pick_head_with_caches(model, attns, L, args.head)
                         sink_slice = hm[4:, sink_idx]
+
                         per_layer_acc[L]["k_norm"].append(k_norm)
                         per_layer_acc[L]["v_norm"].append(v_norm)
+                        per_layer_acc[L]["mlp_out_norm"].append(mlp_norm)
+                        per_layer_acc[L]["res_norm"].append(h_norm)
                         per_layer_acc[L]["cos"].append(series[0][1])
                         per_layer_acc[L]["sink_attn"].append(float(sink_slice.mean().item()))
                         per_layer_kvecs[L].append(k[0, args.head, sink_idx].detach().cpu())
+
                     else:
                         hm = _pick_head_with_caches(model, attns, L, args.head)
                         per_layer_maps[L].append(hm[:min_len, :min_len])
@@ -867,6 +880,7 @@ def main():
                     "k_norm": float(np.mean(acc["k_norm"])) if acc["k_norm"] else 0.0,
                     "v_norm": float(np.mean(acc["v_norm"])) if acc["v_norm"] else 0.0,
                     "res_norm": float(np.mean(acc["res_norm"])) if acc["res_norm"] else -12.0,
+                    "mlp_out_norm": float(np.mean(acc["mlp_out_norm"])) if acc["mlp_out_norm"] else -12.0,
                     "cos": float(np.mean(acc["cos"])) if acc["cos"] else 0.0,
                     "layer": L, "head": args.head,
                     "target_q": target_q, 
@@ -941,8 +955,7 @@ def main():
                 L: {"k_norm": [], "v_norm": [], "cos": [], "sink_attn": []}
                 for L in scan_layers
             }
-            need_qkv = (args.print_mode == "qkv")
-            scan_stats, scan_maps, scan_titles = _run_scan_pass(scan_layers, rope_overrides, need_qkv)
+            scan_stats, scan_maps, scan_titles = _run_scan_pass(scan_layers, rope_overrides)
 
             if args.print_mode == "qkv" and len(scan_stats) > 0:
                 scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
@@ -960,7 +973,11 @@ def main():
                     title=f"Cosine to K[{args.sink_idx}] across layers", fname="scan_cosine.png", suffix=cur_suffix,
                     mode="cos"
                 )
-                # _log_row_summary("[Perturbed] ", scan_stats)
+                _plot_progression(
+                    scan_stats, args.outdir, key="mlp_out_norm", ylabel=f"log ||MLP_out[{args.sink_idx}]||",
+                    title=f"MLP output activation norm progression (token={args.sink_idx})", fname="scan_mlp_out_norm.png",
+                    suffix=cur_suffix, mode="res",
+                )
             
             elif args.print_mode == "heatmap" and len(scan_maps) > 0:
                 grid_title = "Attention heatmaps"
