@@ -609,9 +609,11 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
 
     plt.title(title)
 
-    has_kvar = bool(stats_a) and ("k_total_var" in stats_a[0])
-    if has_kvar:
-        y2 = [by_a[L]["k_total_var"] for L in layers]
+    base = f"{key.split('_')[0]}" # k_norm -> k, v_norm -> v, out_norm -> out
+    var_key = f"{base}_total_var"
+    has_var = bool(stats_a) and (var_key in stats_a[0])
+    if has_var:
+        y2 = [by_a[L][var_key] for L in layers]
         ax2 = ax.twinx()
         ax2.plot(layers, y2, marker="^", linestyle="--", color="tab:red", label="Total variance")
         ax2.set_ylim(0, 20000)
@@ -805,13 +807,15 @@ def main():
 
     def _run_scan_pass(scan_layers, rope_overrides_local):
         per_layer_acc = {
-            L: {"k_norm": [], "v_norm": [], "res_norm": [], "mlp_out_norm": [], "cos": [], "sink_attn": []}
+            L: {"k_norm": [], "v_norm": [], "postln_norm": [], "out_norm": [], "cos": [], "sink_attn": []}
             for L in scan_layers
         }
         per_layer_kvecs = {L: [] for L in scan_layers}
-        per_layer_maps = {
-            L: [] for L in scan_layers
-        }
+        per_layer_vvecs = {L: [] for L in scan_layers}
+        per_layer_postlnvecs = {L: [] for L in scan_layers}
+        per_layer_outvecs = {L: [] for L in scan_layers}
+        per_layer_maps = {L: [] for L in scan_layers}
+
         scan_maps, scan_titles = [], []
         min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
         last_q = min_len - 1
@@ -837,24 +841,31 @@ def main():
                         qkv = store[L]
                         q, k, v = qkv["q"], qkv["k"], qkv["v"]
                         H = qkv["residual"]
-                        series, k_norm = compute_cosine_series(q, k, args.head, k_sink_idx=sink_idx, q_positions=[target_q])
-                        v_norm = float(v[0, args.head, sink_idx].norm().item())
-                        h_norm = float(torch.log(H[0, sink_idx].norm().clamp_min(EPS)).item())
-
                         mlp_out = qkv["mlp_out"]
-                        mlp_out = mlp_out[0]
-                        mlp_norm = float(torch.log(mlp_out[sink_idx].norm().clamp_min(EPS)).item())
+                        series, k_norm = compute_cosine_series(q, k, args.head, k_sink_idx=sink_idx, q_positions=[target_q])
+
+                        v_sink = v[0, args.head, sink_idx]
+                        h_sink = H[0, sink_idx]
+                        out_sink = mlp_out[0, sink_idx]
+
+                        v_norm = float(v_sink.norm().item())
+                        postln_norm = float(torch.log(h_sink.norm().clamp_min(EPS)).item())
+                        out_norm = float(torch.log(out_sink.norm().clamp_min(EPS)).item())
 
                         hm = _pick_head_with_caches(model, attns, L, args.head)
                         sink_slice = hm[4:, sink_idx]
 
                         per_layer_acc[L]["k_norm"].append(k_norm)
                         per_layer_acc[L]["v_norm"].append(v_norm)
-                        per_layer_acc[L]["mlp_out_norm"].append(mlp_norm)
-                        per_layer_acc[L]["res_norm"].append(h_norm)
+                        per_layer_acc[L]["postln_norm"].append(postln_norm)
+                        per_layer_acc[L]["out_norm"].append(out_norm)
                         per_layer_acc[L]["cos"].append(series[0][1])
                         per_layer_acc[L]["sink_attn"].append(float(sink_slice.mean().item()))
+
                         per_layer_kvecs[L].append(k[0, args.head, sink_idx].detach().cpu())
+                        per_layer_vvecs[L].append(v_sink.detach().cpu())
+                        per_layer_postlnvecs[L].append(h_sink.detach().cpu())
+                        per_layer_outvecs[L].append(out_sink.detach().cpu())
 
                     else:
                         hm = _pick_head_with_caches(model, attns, L, args.head)
@@ -872,20 +883,40 @@ def main():
             for L in sorted(per_layer_acc.keys()):
                 acc = per_layer_acc[L]
                 kvar = 0.0
+                vvar = 0.0
+                postlnvar = 0.0
+                outvar = 0.0
+
                 if per_layer_kvecs[L]:
                     Xk = torch.stack(per_layer_kvecs[L], dim=0)
                     _U, S_k, _Vh, _var, k_total_var = _pca_from_rows(Xk, k=1)
                     kvar = float(k_total_var)
+                if per_layer_vvecs[L]:
+                    Xv = torch.stack(per_layer_vvecs[L], dim=0)
+                    _U, S_v, _Vh, _var, v_total_var = _pca_from_rows(Xv, k=1)
+                    vvar = float(v_total_var)
+                if per_layer_postlnvecs[L]:
+                    Xh = torch.stack(per_layer_postlnvecs[L], dim=0)
+                    _U, S_h, _Vh, _var, postln_total_var = _pca_from_rows(Xh, k=1)
+                    postlnvar = float(postln_total_var)
+                if per_layer_outvecs[L]:
+                    Xo = torch.stack(per_layer_outvecs[L], dim=0)
+                    _U, S_o, _Vh, _var, out_total_var = _pca_from_rows(Xo, k=1)
+                    outvar = float(out_total_var)
+
                 stats.append({
                     "k_norm": float(np.mean(acc["k_norm"])) if acc["k_norm"] else 0.0,
                     "v_norm": float(np.mean(acc["v_norm"])) if acc["v_norm"] else 0.0,
-                    "res_norm": float(np.mean(acc["res_norm"])) if acc["res_norm"] else -12.0,
-                    "mlp_out_norm": float(np.mean(acc["mlp_out_norm"])) if acc["mlp_out_norm"] else -12.0,
+                    "postln_norm": float(np.mean(acc["postln_norm"])) if acc["postln_norm"] else -12.0,
+                    "out_norm": float(np.mean(acc["out_norm"])) if acc["out_norm"] else -12.0,
                     "cos": float(np.mean(acc["cos"])) if acc["cos"] else 0.0,
                     "layer": L, "head": args.head,
                     "target_q": target_q, 
                     "sink_attn": float(np.mean(acc["sink_attn"])) if acc["sink_attn"] else 0.0,
-                    "k_total_var": kvar
+                    "k_total_var": kvar,
+                    "v_total_var": vvar,
+                    "postln_total_var": postlnvar,
+                    "out_total_var": outvar,
                 })
             return stats, scan_maps, scan_titles
         else:
@@ -951,10 +982,6 @@ def main():
             scan_layers = list(range(0, num_layers, args.scan_interval))
             if not scan_layers or scan_layers[-1] != num_layers - 1:
                 scan_layers.append(num_layers - 1)
-            per_layer_acc = {
-                L: {"k_norm": [], "v_norm": [], "cos": [], "sink_attn": []}
-                for L in scan_layers
-            }
             scan_stats, scan_maps, scan_titles = _run_scan_pass(scan_layers, rope_overrides)
 
             if args.print_mode == "qkv" and len(scan_stats) > 0:
@@ -974,7 +1001,12 @@ def main():
                     mode="cos"
                 )
                 _plot_progression(
-                    scan_stats, args.outdir, key="mlp_out_norm", ylabel=f"log ||MLP_out[{args.sink_idx}]||",
+                    scan_stats, args.outdir, key="postln_norm", ylabel=f"log ||Attention_LN_out[{args.sink_idx}]||",
+                    title=f"Layernorm output to attention norm progression (token={args.sink_idx})", fname="scan_postln_norm.png",
+                    suffix=cur_suffix, mode="res",
+                )
+                _plot_progression(
+                    scan_stats, args.outdir, key="out_norm", ylabel=f"log ||MLP_out[{args.sink_idx}]||",
                     title=f"MLP output activation norm progression (token={args.sink_idx})", fname="scan_mlp_out_norm.png",
                     suffix=cur_suffix, mode="res",
                 )
