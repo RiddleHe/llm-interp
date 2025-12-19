@@ -1,4 +1,5 @@
 import sys
+import os
 from PIL import Image
 
 if __name__ == "__main__":
@@ -23,6 +24,10 @@ if __name__ == "__main__":
         else:
             out.paste(im, (offset, 0))
             offset += im.width
+
+    parent_dir = os.path.dirname(out_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
 
     out.save(out_path)
     print(f"Saved to {out_path}")
