@@ -65,11 +65,6 @@ def apply_rope_overrides(position_ids, overrides):
             raise ValueError(f"token idx {ti} out of range (seq_len={seq_len})")
     return pos
 
-def _make_v_prehook(attn, cache, num_heads, num_kv, num_groups, model_cfg):
-    def _prehook(_module, args, kwargs, _cache=cache):
-        pass
-    return _prehook
-
 def _get_hidden_from_hook_args(args, kwargs):
     if kwargs and "hidden_states" in kwargs:
         return kwargs["hidden_states"]
@@ -124,51 +119,6 @@ def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_retu
         h1 = attn.register_forward_pre_hook(_prehook, with_kwargs=True)
         h2 = attn.register_forward_hook(_fwdhook)
         handles.append([h1, h2])
-    return handles
-
-def _install_window_attn_hooks(model, layers, window_size=4):
-    handles = []
-    num_heads = model.config.num_attention_heads
-    num_kv = model.config.num_key_value_heads
-    num_groups = max(1, num_heads // max(1, num_kv))
-    model._window_attn_cache = {}
-
-    for L in layers:
-        attn = model.model.layers[L].self_attn
-        cache = {}
-
-        _prehook = _make_v_prehook(attn, cache, num_heads, num_kv, num_groups, model.config)
-
-        def _fwdhook(_module, args, output, _cache=cache):
-            attn_output, attn_probs = output[0], output[1]
-            B, H, Q, K = attn_probs.shape
-
-            k_idx = torch.arange(K, device=attn_probs.device).view(1, 1, 1, K)
-            q_idx = torch.arange(Q, device=attn_probs.device).view(1, 1, Q, 1)
-            start = (q_idx - (window_size - 1)).clamp_min(0)
-            mask = (k_idx >= start) & (k_idx <= q_idx)
-            mask = mask.to(attn_probs.dtype)
-
-            probs = attn_probs * mask
-            denom = probs.sum(dim=-1, keepdim=True).clamp_min(EPS)
-            probs = probs / denom
-
-            v = _cache["v"]
-            ctx = torch.matmul(probs, v)
-            B_, H_, Q_, D = ctx.shape
-            ctx = ctx.transpose(1, 2).contiguous().view(B_, Q_, H_ * D)
-            new_out = _module.o_proj(ctx)
-
-            model._window_attn_cache[L] = probs.detach().float().cpu()
-            out_list = list(output)
-            out_list[0] = new_out
-            out_list[1] = probs
-            return tuple(out_list)
-
-        h1 = attn.register_forward_pre_hook(_prehook, with_kwargs=True)
-        h2 = attn.register_forward_hook(_fwdhook)
-        handles.append([h1, h2])
-
     return handles
 
 def apply_perturbations(base_pos, rope_overrides=None, mask=None):
@@ -308,6 +258,16 @@ def _total_var(Z):
     Zc = Z - Z.mean(dim=0, keepdim=True)
     return float((Zc.pow(2)).sum().item())
 
+def _cloud_radius(Z):
+    if Z is None or Z.numel() == 0:
+        return 0.0
+    Z2 = Z.reshape(-1, Z.shape[-1]) # [N, D]
+    if Z2.size(0) < 2 or Z2.size(-1) == 0:
+        return 0.0
+    Zc = Z2 - Z2.mean(dim=0, keepdim=True)
+    D = float(Zc.size(-1)) # D
+    return float((Zc.pow(2).sum(dim=-1).mean() / D).sqrt().item())
+
 def _cross_total_cov(U, V):
     Uc = U - U.mean(dim=0, keepdim=True)
     Vc = V - V.mean(dim=0, keepdim=True)
@@ -346,9 +306,9 @@ def _component_direction_stats(R, A, M, bias_dir):
     alpha = _coef(R); beta = _coef(A); gamma = _coef(M)
     stats = {
         "covariance_residual_mlp": _cov(alpha, gamma),
-        "total_var_residual": _total_var(R),
-        "total_var_attn": _total_var(A),
-        "total_var_mlp": _total_var(M),
+        "spread_residual": _cloud_radius(R),
+        "spread_attn": _cloud_radius(A),
+        "spread_mlp": _cloud_radius(M),
         "dir_concentration_residual": _directional_concentration(R)[0],
         "dir_concentration_attn": _directional_concentration(A)[0],
         "dir_concentration_mlp": _directional_concentration(M)[0],
@@ -570,8 +530,6 @@ def pick_head(attentions, layer_idx, head_idx):
 def _pick_head_with_caches(model, attns, layer_idx, head_idx):
     if hasattr(model, "_lower_attn_cache") and (layer_idx in model._lower_attn_cache):
         return pick_head(model._lower_attn_cache, layer_idx, head_idx)
-    if hasattr(model, "_window_attn_cache") and (layer_idx in model._window_attn_cache):
-        return pick_head(model._window_attn_cache, layer_idx, head_idx)
     return pick_head(attns, layer_idx, head_idx)
 
 # Plotting functions
@@ -610,13 +568,13 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     plt.title(title)
 
     base = f"{key.split('_')[0]}" # k_norm -> k, v_norm -> v, out_norm -> out
-    var_key = f"{base}_total_var"
+    var_key = f"{base}_spread"
     has_var = bool(stats_a) and (var_key in stats_a[0])
     if has_var:
         y2 = [by_a[L][var_key] for L in layers]
         ax2 = ax.twinx()
-        ax2.plot(layers, y2, marker="^", linestyle="--", color="tab:red", label="Total variance")
-        ax2.set_ylim(0, 20000)
+        ax2.plot(layers, y2, marker="^", linestyle="--", color="tab:red", label="Total spread (radius of vector cloud)")
+        ax2.set_ylim(0, 2.0)
 
         lines1, labels1 = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
@@ -719,16 +677,23 @@ def _pert_suffix(args, include_lower_attn=True):
         if args.lower_factor != 0.5:
             segment += f"_x{args.lower_factor}"
         suffix += "__" + segment
-    if args.window_attn:
-        segment = "window_attn"
-        segment += f"_stop[{int(args.stop_window_layer)}]"
-        segment += f"_size[{int(args.window_size)}]"
-        suffix += "__" + segment
     if args.sink_idx != 0:
         suffix += "__" + f"sink[{args.sink_idx}]"
     if args.target_idx is not None:
         suffix += "__" + f"target[{args.target_idx}]"
     return suffix
+
+def _debug_dump(stats, key):
+    base = key.split("_")[0]
+    var_key = f"{base}_spread"
+    print(f"[DEBUG] {key}")
+    for s in stats:
+        v = s.get(var_key, None)
+        print(
+            f"  L={s['layer']:>2d} "
+            f"{key}={s[key]:8.3f} "
+            f"{var_key}={v}"
+        )
 
 def main():
     p = argparse.ArgumentParser()
@@ -741,7 +706,7 @@ def main():
     p.add_argument("--head", type=int, default=0)
     # scanning mode
     p.add_argument("--scan", action="store_true")
-    p.add_argument("--scan-interval", type=int, default=4, help="Interval to scan layers")
+    p.add_argument("--scan-interval", type=int, default=2, help="Interval to scan layers")
     # print mode
     p.add_argument("--print", dest="print_mode", choices=PRINT_CHOICES, default="qkv")
     p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print qkv, eg. '256,512,768")
@@ -757,10 +722,6 @@ def main():
     p.add_argument("--only-stop-layer", type=int, nargs="+", default=None, help="Only apply lower attention to these layers (0-indexed)")
     p.add_argument("--lower-factor", type=float, default=0.5, help="Factor to lower attention by")
     p.add_argument("--only-return-sink-value", action="store_true", help="When lowering attention, replace attention sum with only attn_to_sink * V_sink")
-    # window attn metrics
-    p.add_argument("--window-attn", action="store_true", help="Constrain attention to a local window for early layers")
-    p.add_argument("--stop-window-layer", type=int, default=4, help="Apply windowed attention to layers [0, stop] inclusive.")
-    p.add_argument("--window-size", type=int, default=4, help="Local attention window size")
     # subspaces
     p.add_argument("--find-value-subspace", action="store_true", help="Collect V at token 0 and non-sink positions and run PCA")
     p.add_argument("--find-key-subspace", action="store_true", help="Collect K at token 0 and non-sink positions and run PCA")
@@ -889,20 +850,16 @@ def main():
 
                 if per_layer_kvecs[L]:
                     Xk = torch.stack(per_layer_kvecs[L], dim=0)
-                    _U, S_k, _Vh, _var, k_total_var = _pca_from_rows(Xk, k=1)
-                    kvar = float(k_total_var)
+                    kvar = _cloud_radius(Xk)
                 if per_layer_vvecs[L]:
                     Xv = torch.stack(per_layer_vvecs[L], dim=0)
-                    _U, S_v, _Vh, _var, v_total_var = _pca_from_rows(Xv, k=1)
-                    vvar = float(v_total_var)
+                    vvar = _cloud_radius(Xv)
                 if per_layer_postlnvecs[L]:
                     Xh = torch.stack(per_layer_postlnvecs[L], dim=0)
-                    _U, S_h, _Vh, _var, postln_total_var = _pca_from_rows(Xh, k=1)
-                    postlnvar = float(postln_total_var)
+                    postlnvar = _cloud_radius(Xh)
                 if per_layer_outvecs[L]:
                     Xo = torch.stack(per_layer_outvecs[L], dim=0)
-                    _U, S_o, _Vh, _var, out_total_var = _pca_from_rows(Xo, k=1)
-                    outvar = float(out_total_var)
+                    outvar = _cloud_radius(Xo)
 
                 stats.append({
                     "k_norm": float(np.mean(acc["k_norm"])) if acc["k_norm"] else 0.0,
@@ -913,10 +870,10 @@ def main():
                     "layer": L, "head": args.head,
                     "target_q": target_q, 
                     "sink_attn": float(np.mean(acc["sink_attn"])) if acc["sink_attn"] else 0.0,
-                    "k_total_var": kvar,
-                    "v_total_var": vvar,
-                    "postln_total_var": postlnvar,
-                    "out_total_var": outvar,
+                    "k_spread": kvar,
+                    "v_spread": vvar,
+                    "postln_spread": postlnvar,
+                    "out_spread": outvar,
                 })
             return stats, scan_maps, scan_titles
         else:
@@ -942,8 +899,6 @@ def main():
             stop_jobs += [("lower", L) for L in range(b, e)]
         else:
             stop_jobs = [("lower", num_layers - 1)]
-    elif args.window_attn:
-        stop_jobs = [("window", int(args.stop_window_layer))]
 
     for _job_kind, _job_stop in stop_jobs:
         args._current_stop_layer = _job_stop
@@ -952,7 +907,6 @@ def main():
         cur_suffix = base_suffix if baseline_run else pert_suffix
 
         lower_attn_handles = []
-        window_attn_handles = []
         if args.lower_attn and not baseline_run:
             if args.only_stop_layer is not None:
                 target_layers = [int(L) for L in args.only_stop_layer]
@@ -965,14 +919,6 @@ def main():
                     only_return_sink_value=args.only_return_sink_value
                 )
 
-        elif args.window_attn and not baseline_run:
-            w_stop = int(getattr(args, "stop_window_layer", 4))
-            w_layers = [L for L in range(num_layers) if L <= w_stop]
-            if w_layers:
-                window_attn_handles = _install_window_attn_hooks(
-                    model, layers=w_layers, window_size=args.window_size
-                )
-
         scan_stats = [] # aggregated per layer
         scan_maps, scan_titles = [], []
         summary = None
@@ -980,8 +926,6 @@ def main():
         if args.scan:
             # perturbed pass
             scan_layers = list(range(0, num_layers, args.scan_interval))
-            if not scan_layers or scan_layers[-1] != num_layers - 1:
-                scan_layers.append(num_layers - 1)
             scan_stats, scan_maps, scan_titles = _run_scan_pass(scan_layers, rope_overrides)
 
             if args.print_mode == "qkv" and len(scan_stats) > 0:
@@ -1027,8 +971,6 @@ def main():
                     elif args._current_stop_layer is not None:
                         segment += f" stop[{args._current_stop_layer}]"
                     grid_title += f" - {segment} (x{args.lower_factor})"
-                if args.window_attn and not baseline_run:
-                    grid_title += f" - window_attn stop[{int(args.stop_window_layer)}] w{int(args.window_size)}"
 
                 _plot_heatmap_grid(
                     scan_maps, scan_titles, os.path.join(args.outdir, "scan_heatmaps.png"), rows=4,
@@ -1296,10 +1238,10 @@ def main():
                         continue
 
                     dc, bias_dir = _directional_concentration(Y)
-                    Y_total_var = _total_var(Y)
+                    Y_spread = _cloud_radius(Y)
                     print(
                         f"[Block Output L={L} {name}] "
-                        f"total_var(Y)={Y_total_var:.4e} | "
+                        f"spread(Y)={Y_spread:.4e} | "
                         f"top-3 directional_concentration(Y)={dc:.4f} "
                         f"(N={Y.shape[0]})"
                     )
@@ -1308,9 +1250,9 @@ def main():
                     if stats:
                         print(
                             f"[Block Output L={L} {name}] "
-                            f"total_var(residual)={stats['total_var_residual']:.4e} | "
-                            f"total_var(attn)={stats['total_var_attn']:.4e} | "
-                            f"total_var(mlp)={stats['total_var_mlp']:.4e}"
+                            f"spread(residual)={stats['spread_residual']:.4e} | "
+                            f"spread(attn)={stats['spread_attn']:.4e} | "
+                            f"spread(mlp)={stats['spread_mlp']:.4e}"
                         )
                         print(
                             f"[Block Output L={L} {name}] "
@@ -1326,7 +1268,7 @@ def main():
                             f"cos(mlp,bias)={stats['cos_mlp_mean']:.4f}\n"
                         )
                 
-        for pair in lower_attn_handles + window_attn_handles:
+        for pair in lower_attn_handles:
             for h in pair:
                 try:
                     h.remove()
