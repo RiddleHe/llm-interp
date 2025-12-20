@@ -203,9 +203,7 @@ def _mean_dir_decomposition(XQ, XK, VhQ, label, k):
     q_energy = (XQ ** 2).sum(dim=1).clamp_min(EPS)
     sink_energy = (XQ @ u) ** 2
     frac_q_along_mu = float((sink_energy / q_energy).mean().item()) # mean of ratios
-    coeff = VhQ @ mu
-    frac_mu_in_Q_topk = float(((coeff ** 2).sum().item()) / mu_norm_sq)
-    return frac_q_along_mu, frac_mu_in_Q_topk
+    return frac_q_along_mu
 
 def _get_head_k_proj_matrix(model, layer_idx, head_idx):
     attn = model.model.layers[layer_idx].self_attn
@@ -277,7 +275,7 @@ def _cross_total_cov(U, V):
     Vc = V - V.mean(dim=0, keepdim=True)
     return float((Uc * Vc).sum().item())
 
-def _directional_concentration(Y, topk=3):
+def _directional_concentration(Y, topk=3): # on unit vectors
     if Y.ndim != 2 or Y.size(0) < 2:
         return 0.0, None
     Yu = F.normalize(Y, dim=-1)
@@ -1084,17 +1082,16 @@ def main():
                 cos_c8 = F.cosine_similarity(XQ_c, X8_c, dim=1).detach().cpu().numpy()
 
                 # frac of energy along dim
-                frac_q_mu0, frac_mu0_in_qpcs = _mean_dir_decomposition(XQ, X0, VhQ, "k0", k)
-                frac_q_mu1, frac_mu1_in_qpcs = _mean_dir_decomposition(XQ, X1, VhQ, "k1", k)
-                frac_q_mu8, frac_mu8_in_qpcs = _mean_dir_decomposition(XQ, X8, VhQ, "k8", k)
+                frac_q_mu0 = _mean_dir_decomposition(XQ, X0, VhQ, "k0", k)
+                frac_q_mu1 = _mean_dir_decomposition(XQ, X1, VhQ, "k1", k)
+                frac_q_mu8 = _mean_dir_decomposition(XQ, X8, VhQ, "k8", k)
 
                 metrics = [
                     ("spread_radius", [_cloud_radius(X0), _cloud_radius(X1), _cloud_radius(X8)], "sci"),
                     ("mean_norm", [_mean_vec_norm(X0), _mean_vec_norm(X1), _mean_vec_norm(X8)], "sci"),
                     ("cos(Q, K)", [_mean_or_zero(cos0), _mean_or_zero(cos1), _mean_or_zero(cos8)], "float"),
                     ("cos_centered(Q, K)", [float(np.mean(cos_c0)), float(np.mean(cos_c1)), float(np.mean(cos_c8))], "float"),
-                    (f"frac_Q_along_mean_K topk={k}", [frac_q_mu0, frac_q_mu1, frac_q_mu8], "float"),
-                    (f"frac_mean_K_in_Q_PCs topk={k}", [frac_mu0_in_qpcs, frac_mu1_in_qpcs, frac_mu8_in_qpcs], "float")
+                    (f"frac_Q_along_mean_K", [frac_q_mu0, frac_q_mu1, frac_q_mu8], "float"),
                 ]
                 col_names = ["tok0", "tok1", "tok8"]
                 title = f"[K metrics] layer={target_layer} head={args.head} target_q={target_q}"
