@@ -200,15 +200,11 @@ def _mean_dir_decomposition(XQ, XK, VhQ, label, k):
     if mu_norm_sq <= EPS:
         return 0.0, 0.0
     u = F.normalize(mu, dim=0)
-    q_energy = (XQ ** 2).sum(dim=1)
+    q_energy = (XQ ** 2).sum(dim=1).clamp_min(EPS)
     sink_energy = (XQ @ u) ** 2
-    frac_q_along_mu = float((sink_energy.mean() / q_energy.mean()).item())
+    frac_q_along_mu = float((sink_energy / q_energy).mean().item()) # mean of ratios
     coeff = VhQ @ mu
     frac_mu_in_Q_topk = float(((coeff ** 2).sum().item()) / mu_norm_sq)
-    print(
-        f"[MEAN DIRECTION] {label}: frac of Q energy along mean({label}) = {frac_q_along_mu:.4f} | "
-        f"frac of mean({label}) in top-{k} Q PCs = {frac_mu_in_Q_topk:.4f}"
-    )
     return frac_q_along_mu, frac_mu_in_Q_topk
 
 def _get_head_k_proj_matrix(model, layer_idx, head_idx):
@@ -258,12 +254,20 @@ def _total_var(Z):
     Zc = Z - Z.mean(dim=0, keepdim=True)
     return float((Zc.pow(2)).sum().item())
 
+def _mean_vec_norm(X):
+    if X is None or X.numel() == 0:
+        return 0.0
+    return float(X.norm(dim=-1).mean().item())
+
+def _mean_or_zero(xs): return float(np.mean(xs)) if xs else 0.0
+
 def _cloud_radius(Z):
     if Z is None or Z.numel() == 0:
         return 0.0
     Z2 = Z.reshape(-1, Z.shape[-1]) # [N, D]
     if Z2.size(0) < 2 or Z2.size(-1) == 0:
         return 0.0
+    Z2 = F.normalize(Z2, dim=-1) # discard influence of length
     Zc = Z2 - Z2.mean(dim=0, keepdim=True)
     D = float(Zc.size(-1)) # D
     return float((Zc.pow(2).sum(dim=-1).mean() / D).sqrt().item())
@@ -573,7 +577,10 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     if has_var:
         y2 = [by_a[L][var_key] for L in layers]
         ax2 = ax.twinx()
-        ax2.plot(layers, y2, marker="^", linestyle="--", color="tab:red", label="Total spread (radius of vector cloud)")
+        ax2.plot(
+            layers, y2, marker="^", linestyle="--", color="tab:red", 
+            label="Normalized spread (radius of normalized vector cloud)"
+        )
         ax2.set_ylim(0, 2.0)
 
         lines1, labels1 = ax.get_legend_handles_labels()
@@ -694,6 +701,28 @@ def _debug_dump(stats, key):
             f"{key}={s[key]:8.3f} "
             f"{var_key}={v}"
         )
+
+def _print_metrics_table(metrics, col_names, title=None, col_w=14):
+    if title:
+        print(title)
+    if not metrics:
+        print("[metrics] (empty)")
+        return
+    assert all(len(vals) == len(col_names) for _rn, vals, _k in metrics), \
+        "Each metrics row must have the same number of values as col_names"
+    
+    row_name_w = max(len(r[0]) for r in metrics)
+    print(" " * (row_name_w + 2) + "".join(name.rjust(col_w) for name in col_names))
+    for row_name, vals, kind in metrics:
+        print(row_name.ljust(row_name_w) + "  " + "".join(_fmt(v, kind).rjust(col_w) for v in vals))
+
+def _fmt(v, kind):
+    if kind == "sci":
+        return f"{float(v):.4e}"
+    return f"{float(v):.4f}"
+
+def _get(key, comp):
+    return [float(s[key]) for s in comp]
 
 def main():
     p = argparse.ArgumentParser()
@@ -986,7 +1015,7 @@ def main():
                         job_summary_stats.append({"layer": int(args._current_stop_layer), "sink_attn": float(summary)})
 
         else:
-            if args.find_value_subspace or args.find_key_subspace:
+            if args.find_key_subspace:
                 target_layer = int(args.layer)
                 store = {}
                 handles = _capture_qkv_multi(
@@ -996,19 +1025,18 @@ def main():
                 )
                 raw_cache = {}
                 handles += _register_block_raw_captures(model, target_layer, raw_cache)
-                field = "v" if args.find_value_subspace else "k"
-                VAR = "V" if field == "v" else "K"
+                VAR = "K"
                 try:
                     x_tok0, x_tok1, x_tok8, x_tokq = [], [], [], []
                     cos0, cos1, cos8 = [], [], []
                     r_tok0, r_tok1, r_tok8 = [], [], []
-                    for input_ids, base_pos in tqdm(tokenized, desc=f"Collecting {VAR} for PCA", position=0, leave=False):
+                    for input_ids, base_pos in tqdm(tokenized, desc=f"Collecting k for PCA", position=0, leave=False):
                         _ = prefill(model, input_ids, base_pos)
                         qkv = store.get(target_layer, None)
                         if not qkv:
                             continue
                         Q = qkv["q"]
-                        X = qkv[field]
+                        X = qkv["k"]
                         H = qkv["residual"]
                         assert X.shape[2] >= 9, "There must be at least 8 tokens in each sequence"
                         x0 = X[0, args.head, 0]
@@ -1023,13 +1051,12 @@ def main():
                         # Gather residuals
                         assert H.shape[1] >= 9, "There must be at least 8 tokens in each sequence for residuals"
                         r_tok0.append(H[0, 0].clone()); r_tok1.append(H[0, 1].clone()); r_tok8.append(H[0, 8].clone())
-                        if args.find_key_subspace:
-                            # Gather cosines
-                            for ks, bucket in [(0, cos0), (1, cos1), (8, cos8)]:
-                                series, _ = compute_cosine_series(
-                                    Q, X, args.head, k_sink_idx=ks, q_positions=[target_q]
-                                )
-                                bucket.append(series[0][1])
+                        # Gather cosines
+                        for ks, bucket in [(0, cos0), (1, cos1), (8, cos8)]:
+                            series, _ = compute_cosine_series(
+                                Q, X, args.head, k_sink_idx=ks, q_positions=[target_q]
+                            )
+                            bucket.append(series[0][1])
                 finally:
                     for h in handles:
                         try: h.remove()
@@ -1047,102 +1074,70 @@ def main():
 
                 k = int(args.pca_topk)
 
-                U0, S0, Vh0, var0, K0_total_var = _pca_from_rows(X0, k)
-                U1, S1, Vh1, var1, K1_total_var = _pca_from_rows(X1, k)
-                U8, S8, Vh8, var8, K8_total_var = _pca_from_rows(X8, k)
                 UQ, SQ, VhQ, varQ, Q_total_var = _pca_from_rows(XQ, k)
 
-                print(f"[PCA: {VAR}] token 0 (sink) total variance: {K0_total_var:.4f}")
-                print(f"[PCA: {VAR}] token 1 (non-sink) total variance: {K1_total_var:.4f}")
-                print(f"[PCA: {VAR}] token 8 (non-sink) total variance: {K8_total_var:.4f}")
-                print(f"[PCA: Q] targt Q (target_q={target_q}) total variance: {Q_total_var:.4f}")
+                # centered cosine scores
+                XQ_c = XQ - XQ.mean(dim=0, keepdim=True)
+                X0_c = X0 - X0.mean(dim=0, keepdim=True)
+                X1_c = X1 - X1.mean(dim=0, keepdim=True)
+                X8_c = X8 - X8.mean(dim=0, keepdim=True)
+                cos_c0 = F.cosine_similarity(XQ_c, X0_c, dim=1).detach().cpu().numpy()
+                cos_c1 = F.cosine_similarity(XQ_c, X1_c, dim=1).detach().cpu().numpy()
+                cos_c8 = F.cosine_similarity(XQ_c, X8_c, dim=1).detach().cpu().numpy()
 
-                if args.find_key_subspace:
-                    # raw cosine scores
-                    def _mean_or_zero(xs): return float(np.mean(xs)) if xs else 0.0
-                    print(
-                        f"[COS] mean cos(Q, K0) = {_mean_or_zero(cos0):.4f} | "
-                        f"[COS] mean cos(Q, K1) = {_mean_or_zero(cos1):.4f} | "
-                        f"[COS] mean cos(Q, K8) = {_mean_or_zero(cos8):.4f}" 
-                    )
+                # frac of energy along dim
+                frac_q_mu0, frac_mu0_in_qpcs = _mean_dir_decomposition(XQ, X0, VhQ, "k0", k)
+                frac_q_mu1, frac_mu1_in_qpcs = _mean_dir_decomposition(XQ, X1, VhQ, "k1", k)
+                frac_q_mu8, frac_mu8_in_qpcs = _mean_dir_decomposition(XQ, X8, VhQ, "k8", k)
 
-                    # centered cosine scores
-                    XQ_c = XQ - XQ.mean(dim=0, keepdim=True)
-                    X0_c = X0 - X0.mean(dim=0, keepdim=True)
-                    X1_c = X1 - X1.mean(dim=0, keepdim=True)
-                    X8_c = X8 - X8.mean(dim=0, keepdim=True)
-                    cos_c0 = F.cosine_similarity(XQ_c, X0_c, dim=1).numpy()
-                    cos_c1 = F.cosine_similarity(XQ_c, X1_c, dim=1).numpy()
-                    cos_c8 = F.cosine_similarity(XQ_c, X8_c, dim=1).numpy()
-                    print(
-                        f"[COS_centered] mean cos(Q, K0) = {float(cos_c0.mean().item()):.4f} | "
-                        f"[COS_centered] mean cos(Q, K1) = {float(cos_c1.mean().item()):.4f} | "
-                        f"[COS_centered] mean cos(Q, K8) = {float(cos_c8.mean().item()):.4f}"
-                    )
+                metrics = [
+                    ("spread_radius", [_cloud_radius(X0), _cloud_radius(X1), _cloud_radius(X8)], "sci"),
+                    ("mean_norm", [_mean_vec_norm(X0), _mean_vec_norm(X1), _mean_vec_norm(X8)], "sci"),
+                    ("cos(Q, K)", [_mean_or_zero(cos0), _mean_or_zero(cos1), _mean_or_zero(cos8)], "float"),
+                    ("cos_centered(Q, K)", [float(np.mean(cos_c0)), float(np.mean(cos_c1)), float(np.mean(cos_c8))], "float"),
+                    (f"frac_Q_along_mean_K topk={k}", [frac_q_mu0, frac_q_mu1, frac_q_mu8], "float"),
+                    (f"frac_mean_K_in_Q_PCs topk={k}", [frac_mu0_in_qpcs, frac_mu1_in_qpcs, frac_mu8_in_qpcs], "float")
+                ]
+                col_names = ["tok0", "tok1", "tok8"]
+                title = f"[K metrics] layer={target_layer} head={args.head} target_q={target_q}"
+                _print_metrics_table(metrics, col_names, title=title, col_w=14)
 
-                    # decomposition of Q along mean(K0)
-                    _mean_dir_decomposition(XQ, X0, VhQ, "K0", k)
-                    _mean_dir_decomposition(XQ, X1, VhQ, "K1", k)
-                    _mean_dir_decomposition(XQ, X8, VhQ, "K8", k)
+                # visualize Q in bias direction + residual PC
+                bias_sets = [
+                    (_bias_3d_projection(XQ, X0.mean(dim=0), topk=2), "Q energy along dimensions of K0"),
+                    (_bias_3d_projection(XQ, X1.mean(dim=0), topk=2), "Q energy along dimensions of K1"),
+                    (_bias_3d_projection(XQ, X8.mean(dim=0), topk=2), "Q energy along dimensions of K8"),
+                ]
+                _plot_bias_energy_3d(
+                    bias_sets,
+                    os.path.join(args.outdir, f"pca_q_bias_energy_L{target_layer}_H{args.head}.png"),
+                    x_label="K bias",
+                )
 
-                    # visualize 3D PCA
-                    Y0 = (X0_c @ Vh0[:3].T).numpy()
-                    Y1 = (X1_c @ Vh1[:3].T).numpy()
-                    Y8 = (X8_c @ Vh8[:3].T).numpy()
+                # residual decomposition w.r.t K0 mean direction
+                r_sink = _compute_residual_sink_direction(
+                    model, target_layer, args.head, X0.mean(dim=0)
+                )
+                frac_R0 = _energy_fraction_along_direction(R0, r_sink); frac_R1 = _energy_fraction_along_direction(R1, r_sink); frac_R8 = _energy_fraction_along_direction(R8, r_sink)
+                m0, s0 = float(frac_R0.mean()), float(frac_R0.std())
+                m1, s1 = float(frac_R1.mean()), float(frac_R1.std())
+                m8, s8 = float(frac_R8.mean()), float(frac_R8.std())
+                print(
+                    f"[Residual] layer={target_layer} head={args.head} | "
+                    f"frac residual energy along canonical sink direction: "
+                    f"tok0={m0:.4f}±{s0:.4f} | tok1={m1:.4f}±{s1:.4f} | tok8={m8:.4f}±{s8:.4f}"
+                )
 
-                    R = max(np.abs(Y0).max(), np.abs(Y1).max(), np.abs(Y8).max())
-
-                    fig = plt.figure(figsize=(9,3))
-                    for idx, (Y, title) in enumerate(
-                        zip([Y0, Y1, Y8], ["K0 subspace", 'K1 subspace', 'K8 subspace'])
-                    ):
-                        ax = fig.add_subplot(1, 3, idx + 1, projection='3d')
-                        ax.scatter(Y[:, 0], Y[:, 1], Y[:, 2], s=5)
-                        ax.set_title(title)
-                        ax.set_xlim(-R, R); ax.set_ylim(-R, R); ax.set_zlim(-R, R)
-                        ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); ax.set_zlabel("PC3")
-
-                    fig.tight_layout()
-                    out_path = os.path.join(args.outdir, f"pca_k_subspaces_L{target_layer}_H{args.head}.png")
-                    fig.savefig(out_path, dpi=300)
-                    plt.close(fig)
-
-                    # visualize Q in bias direction + residual PC
-                    bias_sets = [
-                        (_bias_3d_projection(XQ, X0.mean(dim=0), topk=2), "Q energy along dimensions of K0"),
-                        (_bias_3d_projection(XQ, X1.mean(dim=0), topk=2), "Q energy along dimensions of K1"),
-                        (_bias_3d_projection(XQ, X8.mean(dim=0), topk=2), "Q energy along dimensions of K8"),
-                    ]
-                    _plot_bias_energy_3d(
-                        bias_sets,
-                        os.path.join(args.outdir, f"pca_q_bias_energy_L{target_layer}_H{args.head}.png"),
-                        x_label="K bias",
-                    )
-
-                    # residual decomposition w.r.t K0 mean direction
-                    r_sink = _compute_residual_sink_direction(
-                        model, target_layer, args.head, X0.mean(dim=0)
-                    )
-                    frac_R0 = _energy_fraction_along_direction(R0, r_sink); frac_R1 = _energy_fraction_along_direction(R1, r_sink); frac_R8 = _energy_fraction_along_direction(R8, r_sink)
-                    m0, s0 = float(frac_R0.mean()), float(frac_R0.std())
-                    m1, s1 = float(frac_R1.mean()), float(frac_R1.std())
-                    m8, s8 = float(frac_R8.mean()), float(frac_R8.std())
-                    print(
-                        f"[Residual] layer={target_layer} head={args.head} | "
-                        f"frac residual energy along canonical sink direction: "
-                        f"tok0={m0:.4f}±{s0:.4f} | tok1={m1:.4f}±{s1:.4f} | tok8={m8:.4f}±{s8:.4f}"
-                    )
-
-                    res_bias_sets = [
-                        (_bias_3d_projection(R0, r_sink, topk=2), "Residual energy (tok0)"),
-                        (_bias_3d_projection(R1, r_sink, topk=2), "Residual energy (tok1)"),
-                        (_bias_3d_projection(R8, r_sink, topk=2), "Residual energy (tok8)"),
-                    ]
-                    _plot_bias_energy_3d(
-                        res_bias_sets,
-                        os.path.join(args.outdir, f"pca_residual_bias_energy_L{target_layer}_H{args.head}.png"),
-                        x_label="Residual bias",
-                    )
+                res_bias_sets = [
+                    (_bias_3d_projection(R0, r_sink, topk=2), "Residual energy (tok0)"),
+                    (_bias_3d_projection(R1, r_sink, topk=2), "Residual energy (tok1)"),
+                    (_bias_3d_projection(R8, r_sink, topk=2), "Residual energy (tok8)"),
+                ]
+                _plot_bias_energy_3d(
+                    res_bias_sets,
+                    os.path.join(args.outdir, f"pca_residual_bias_energy_L{target_layer}_H{args.head}.png"),
+                    x_label="Residual bias",
+                )
 
                 R0_total_var = _total_var(R0); R1_total_var = _total_var(R1); R8_total_var = _total_var(R8)
                 print(
@@ -1226,47 +1221,51 @@ def main():
                     model, L, tok_idxs, tokenized,
                 )
 
-                names = ["tok0", "tok1", "tok8"]
-                for t, name in zip(tok_idxs, names):
-                    Y = raw_components["Y"].get(t, None)
-                    R_raw = raw_components["R"].get(t, None)
-                    A_raw = raw_components["A"].get(t, None)
-                    M_raw = raw_components["M"].get(t, None)
-                    if (
-                        Y is None or R_raw is None or A_raw is None or M_raw is None
-                    ):
-                        continue
+                col_names = ["tok0", "tok1", "tok8"]
+                Ys, Rs, As, Ms = [], [], [], []
+                for t in tok_idxs:
+                    Y = raw_components["Y"][t]
+                    R_raw = raw_components["R"][t]
+                    A_raw = raw_components["A"][t]
+                    M_raw = raw_components["M"][t]
+                    Ys.append(Y); Rs.append(R_raw); As.append(A_raw); Ms.append(M_raw)
+                    assert Y is not None and Y.ndim == 2 and Y.shape[0] >= 2
 
-                    dc, bias_dir = _directional_concentration(Y)
-                    Y_spread = _cloud_radius(Y)
-                    print(
-                        f"[Block Output L={L} {name}] "
-                        f"spread(Y)={Y_spread:.4e} | "
-                        f"top-3 directional_concentration(Y)={dc:.4f} "
-                        f"(N={Y.shape[0]})"
-                    )
+                Y_norm = []; Y_spread = []; Y_dir_conc = []; bias_dirs = []
+                for Y in Ys:
+                    dc, bdir = _directional_concentration(Y)
+                    assert bdir is not None
+                    Y_norm.append(_mean_vec_norm(Y))
+                    Y_spread.append(_cloud_radius(Y))
+                    Y_dir_conc.append(float(dc))
+                    bias_dirs.append(bdir)
 
-                    stats = _component_direction_stats(R_raw, A_raw, M_raw, bias_dir)
-                    if stats:
-                        print(
-                            f"[Block Output L={L} {name}] "
-                            f"spread(residual)={stats['spread_residual']:.4e} | "
-                            f"spread(attn)={stats['spread_attn']:.4e} | "
-                            f"spread(mlp)={stats['spread_mlp']:.4e}"
-                        )
-                        print(
-                            f"[Block Output L={L} {name}] "
-                            f"top-3 dir_concentration(residual)={stats['dir_concentration_residual']:.4f} | "
-                            f"dir_concentration(attn)={stats['dir_concentration_attn']:.4f} | "
-                            f"dir_concentration(mlp)={stats['dir_concentration_mlp']:.4f} | "
-                            f"cov(residual,mlp)={stats['covariance_residual_mlp']:.4e}"
-                        )
-                        print(
-                            f"[Block Output L={L} {name}] "
-                            f"cos(residual,bias)={stats['cos_residual_mean']:.4f} | "
-                            f"cos(attn,bias)={stats['cos_attn_mean']:.4f} | "
-                            f"cos(mlp,bias)={stats['cos_mlp_mean']:.4f}\n"
-                        )
+                comp = [] # component breakdown R/A/M
+                for i in range(len(tok_idxs)):
+                    comp_stats = _component_direction_stats(Rs[i], As[i], Ms[i], bias_dirs[i])
+                    comp_stats.update({
+                        "norm_residual": _mean_vec_norm(Rs[i]),
+                        "norm_attn": _mean_vec_norm(As[i]),
+                        "norm_mlp": _mean_vec_norm(Ms[i]),
+                    })
+                    comp.append(comp_stats)
+
+                metrics = [
+                    ("norm_Y", Y_norm, "sci"),
+                    ("spread_Y", Y_spread, "sci"),
+                    ("concentration_Y topk=3", Y_dir_conc, "float"),
+                    ("norm_residual", _get("norm_residual", comp), "sci"),
+                    ("norm_attn", _get("norm_attn", comp), "sci"),
+                    ("norm_mlp", _get("norm_mlp", comp), "sci"),
+                    ("spread_residual", _get("spread_residual", comp), "sci"),
+                    ("spread_attn", _get("spread_attn", comp), "sci"),
+                    ("spread_mlp", _get("spread_mlp", comp), "sci"),
+                    ("concentration_residual topk=3", _get("dir_concentration_residual", comp), "float"),
+                    ("concentration_attn topk=3", _get("dir_concentration_attn", comp), "float"),
+                    ("concentration_mlp topk=3", _get("dir_concentration_mlp", comp), "float"),
+                    # TODO: plot cos and covariance
+                ]
+                _print_metrics_table(metrics, col_names, title=f"[Block Output L={L}]", col_w=14)
                 
         for pair in lower_attn_handles:
             for h in pair:
