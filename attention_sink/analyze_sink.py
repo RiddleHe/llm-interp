@@ -553,8 +553,6 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
 
     ax.set_xlabel("Layer")
     ax.set_ylabel(ylabel)
-    if len(y_a) > 0:
-        ax.axhline(y_a[-1], color="gray", linestyle="--", linewidth=1.0)
     if mode == "cos":
         ax.set_ylim(0, 1)
     elif mode == "res":
@@ -581,7 +579,7 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
             layers, y2, marker="^", linestyle="--", color="tab:red", 
             label="Normalized spread (radius of normalized vector cloud)"
         )
-        ax2.set_ylim(0, 2.0)
+        ax2.set_ylim(0, 1e-1)
 
         lines1, labels1 = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
