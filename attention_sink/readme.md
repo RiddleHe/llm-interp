@@ -19,16 +19,35 @@ python analyze_sink.py --scan --print qkv --prompt-file prompts.txt --outdir [ou
 
 ### Key vectors in a specific layer
 
-Descriptions needed.
-
 ```bash
 python analyze_sink.py --prompt-file prompts.txt --find-key-subspace --layer [layer_idx] --head [head_idx] --outdir [outdir]
 ```
 
-### Output decomposition
+The output will have the following features:
 
-Running the following command will print the total variance, direction concentration on top-3 PC, and the cosine similarity with the mean output vector of the residual, attention, and MLP outputs for token 0 (sink) vs token 1 and token 8.
+|                   | tok0 | tok1 | tok8 |
+|-------------------|------|------|------|
+|spread_radius      |      |      |      |
+|mean_norm          |      |      |      |
+|cos(Q, K)          |      |      |      |
+|cos_centered(Q, K) |      |      |      |
+|frac_Q_along_mean_K|      |      |      |
+
+### Output activation in a specific layer
 
 ```bash
 python analyze_sink.py --prompt-file prompts.txt --decompose-output --layer [layer_idx]
 ```
+
+The output will have the following features:
+
+|                   | tok0 | tok1 | tok8 |
+|-------------------|------|------|------|
+|norm_Y             |      |      |      |
+|spread_Y           |      |      |      |
+|norm_residual      |      |      |      |
+|norm_attn          |      |      |      |
+|norm_mlp           |      |      |      |
+|spread_residual    |      |      |      |
+|spread_attn        |      |      |      |
+|spread_mlp         |      |      |      |
