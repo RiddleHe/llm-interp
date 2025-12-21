@@ -205,6 +205,32 @@ def _mean_dir_decomposition(XQ, XK, VhQ, label, k):
     frac_q_along_mu = float((sink_energy / q_energy).mean().item()) # mean of ratios
     return frac_q_along_mu
 
+def _set_overlap_ratio(A, B, k):
+    k = int(k)
+    if k <= 0:
+        return 0.0
+    if not A or not B:
+        return 0.0
+    return float(len(A & B) / float(k))
+
+def _fracmass_on_set(Z, idx_set):
+    if Z is None or Z.numel() == 0 or (not idx_set):
+        return 0.0
+    Z = Z.to(dtype=torch.float32)
+    denom = (Z ** 2).sum(dim=-1).clamp_min(EPS)
+    idx = torch.tensor(sorted(idx_set), dtype=torch.long, device=Z.device)
+    num = (Z[:, idx] ** 2).sum(dim=1)
+    return float((num / denom).mean().item())
+
+def _topk_set_from_scores(scores, k):
+    if scores is None or scores.numel() == 0:
+        return set()
+    k = int(max(0, min(int(k), int(scores.numel()))))
+    if k <= 0:
+        return set()
+    idx = torch.topk(scores, k=k, largest=True).indices.detach().cpu().tolist()
+    return set(int(i) for i in idx)
+
 def _get_head_k_proj_matrix(model, layer_idx, head_idx):
     attn = model.model.layers[layer_idx].self_attn
     num_heads = model.config.num_attention_heads
@@ -381,6 +407,80 @@ def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
         for t, vecs in bucket.items():
             if vecs:
                 out[name][t] = torch.stack(vecs, dim=0)
+    return out
+
+def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
+    mlp = model.model.layers[layer_idx].mlp
+    cache = {}
+
+    def _mlp_hook(_module, inputs, output, _cache=cache):
+        x = inputs[0]
+        with torch.no_grad():
+            g = _module.gate_proj(x)
+            u = _module.up_proj(x)
+            a = _module.act_fn(g)
+            z = a * u
+            _cache["x"] = x.detach().float().cpu()
+            _cache["g"] = g.detach().float().cpu()
+            _cache["u"] = u.detach().float().cpu()
+            _cache["a"] = a.detach().float().cpu()
+            _cache["z"] = z.detach().float().cpu()
+            _cache["y"] = output.detach().float().cpu()
+
+    h = mlp.register_forward_hook(_mlp_hook)
+
+    X_tok = {t: [] for t in tok_idxs}
+    G_tok = copy.deepcopy(X_tok)
+    U_tok = copy.deepcopy(X_tok)
+    A_tok = copy.deepcopy(X_tok)
+    Z_tok = copy.deepcopy(X_tok)
+    Y_tok = copy.deepcopy(X_tok)
+
+    try:
+        for input_ids, base_pos in tqdm(
+            tokenized,
+            desc=f"Collecting MLP internals at L={layer_idx}",
+            leave=False,
+        ):
+            cache.clear()
+            _ = prefill(model, input_ids, base_pos)
+            assert all(k in cache for k in ["x", "g", "u", "a", "z", "y"])
+
+            x = cache["x"][0]
+            g = cache["g"][0]
+            u = cache["u"][0]
+            a = cache["a"][0]
+            z = cache["z"][0]
+            y = cache["y"][0]
+            S = int(x.shape[0])
+            for t in tok_idxs:
+                assert t < S
+                X_tok[t].append(x[t].clone())
+                G_tok[t].append(g[t].clone())
+                U_tok[t].append(u[t].clone())
+                A_tok[t].append(a[t].clone())
+                Z_tok[t].append(z[t].clone())
+                Y_tok[t].append(y[t].clone())
+
+    finally:
+        try:
+            h.remove()
+        except Exception:
+            pass
+
+    out = {"X": {}, "G": {}, "U": {}, "A": {}, "Z": {}, "Y": {}}
+    for name, bucket in [
+        ("X", X_tok),
+        ("G", G_tok),
+        ("U", U_tok),
+        ("A", A_tok),
+        ("Z", Z_tok),
+        ("Y", Y_tok),
+    ]:
+        for t, vecs in bucket.items():
+            if vecs:
+                out[name][t] = torch.stack(vecs, dim=0)
+
     return out
 
 # Parsing functions
@@ -711,8 +811,9 @@ def main():
     p.add_argument("--lower-factor", type=float, default=0.5, help="Factor to lower attention by")
     p.add_argument("--only-return-sink-value", action="store_true", help="When lowering attention, replace attention sum with only attn_to_sink * V_sink")
     # subspaces
-    p.add_argument("--find-value-subspace", action="store_true", help="Collect V at token 0 and non-sink positions and run PCA")
-    p.add_argument("--find-key-subspace", action="store_true", help="Collect K at token 0 and non-sink positions and run PCA")
+    p.add_argument("--find-value-subspace", action="store_true", help="Collect V at token 0 and non-sink positions")
+    p.add_argument("--find-key-subspace", action="store_true", help="Collect K at token 0 and non-sink positions")
+    p.add_argument("--find-mlp-subspace", action="store_true", help="Collect MLP internals at token 0 and non-sink positions")
     p.add_argument("--pca-topk", type=int, default=6, help="Top-k PCA for groups of vectors")
     # decomposition of input
     p.add_argument("--decompose-ln", action="store_true", help="For --layer L, decompose the norm input LN(residual + attn + mlp) at L")
@@ -1060,7 +1161,7 @@ def main():
                 title = f"[K metrics] layer={target_layer} head={args.head} target_q={target_q}"
                 _print_metrics_table(metrics, col_names, title=title, col_w=14)
 
-                # visualize Q in bias direction + residual PC
+                # visualize Q in bias direction
                 bias_sets = [
                     (_bias_3d_projection(XQ, X0.mean(dim=0), topk=2), "Q energy along dimensions of K0"),
                     (_bias_3d_projection(XQ, X1.mean(dim=0), topk=2), "Q energy along dimensions of K1"),
@@ -1072,54 +1173,67 @@ def main():
                     x_label="K bias",
                 )
 
-                # residual decomposition w.r.t K0 mean direction
-                r_sink = _compute_residual_sink_direction(
-                    model, target_layer, args.head, X0.mean(dim=0)
-                )
-                frac_R0 = _energy_fraction_along_direction(R0, r_sink); frac_R1 = _energy_fraction_along_direction(R1, r_sink); frac_R8 = _energy_fraction_along_direction(R8, r_sink)
-                m0, s0 = float(frac_R0.mean()), float(frac_R0.std())
-                m1, s1 = float(frac_R1.mean()), float(frac_R1.std())
-                m8, s8 = float(frac_R8.mean()), float(frac_R8.std())
-                print(
-                    f"[Residual] layer={target_layer} head={args.head} | "
-                    f"frac residual energy along canonical sink direction: "
-                    f"tok0={m0:.4f}±{s0:.4f} | tok1={m1:.4f}±{s1:.4f} | tok8={m8:.4f}±{s8:.4f}"
-                )
-
-                res_bias_sets = [
-                    (_bias_3d_projection(R0, r_sink, topk=2), "Residual energy (tok0)"),
-                    (_bias_3d_projection(R1, r_sink, topk=2), "Residual energy (tok1)"),
-                    (_bias_3d_projection(R8, r_sink, topk=2), "Residual energy (tok8)"),
-                ]
-                _plot_bias_energy_3d(
-                    res_bias_sets,
-                    os.path.join(args.outdir, f"pca_residual_bias_energy_L{target_layer}_H{args.head}.png"),
-                    x_label="Residual bias",
-                )
-
-                R0_total_var = _total_var(R0); R1_total_var = _total_var(R1); R8_total_var = _total_var(R8)
-                print(
-                    f"[Block input] Total variance (post-LN): token 0={R0_total_var:.4f} | "
-                    f"token 1={R1_total_var:.4f} | " 
-                    f"token 8={R8_total_var:.4f}"
-                )
-
-                raw0, raw1, raw8 = X_raw[:, 0], X_raw[:, 1], X_raw[:, 8]
-                RAW0_total_var = _total_var(raw0); RAW1_total_var = _total_var(raw1); RAW8_total_var = _total_var(raw8)
-                print(
-                    f"[Block input] Total variance (pre-LN): token 0={RAW0_total_var:.4f} | "
-                    f"token 1={RAW1_total_var:.4f} | "
-                    f"token 8={RAW8_total_var:.4f}"
-                )
-
-                # sanity check
-                ln_mod = model.model.layers[target_layer].input_layernorm
-                recon0 = _rmsnorm_from_module(raw0, ln_mod)
-                print(f"[Sanity check] reconstructed tok0 total variance (pre -> post): {_total_var(recon0):.4f}")
-
             L = int(args.layer)
             Lm1 = max(0, L - 1)
             tok_idxs = [0, 1, 8]
+
+            if args.find_mlp_subspace:
+                mlp_data = _collect_mlp_internals_for_layer(model, L, tok_idxs, tokenized)
+                assert 0 in mlp_data["Y"]
+
+                # fetch down projection column vectors
+                mlp = model.model.layers[L].mlp
+                Wd = mlp.down_proj.weight.detach().to(dtype=torch.float32).cpu()
+                d_model, d_mlp = int(Wd.shape[0]), int(Wd.shape[1])
+
+                # fetch mean output direction
+                Y0 = mlp_data["Y"][0].to(dtype=torch.float32)
+                mu_y = Y0.mean(dim=0)
+                u_hat = F.normalize(mu_y, dim=0)
+
+                # calculate column scores
+                col_norm = Wd.norm(dim=0)
+                alpha = (u_hat.unsqueeze(0) @ Wd).squeeze(0)
+                alpha_abs = alpha.abs()
+
+                k_grid = [8, 16, 32, 64]
+                k_grid = [k for k in k_grid if k <= d_mlp]
+                assert len(k_grid) > 0
+
+                sets_norm = {}
+                sets_proj = {}
+                for k in k_grid:
+                    sets_norm[k] = _topk_set_from_scores(col_norm, k)
+                    sets_proj[k] = _topk_set_from_scores(alpha_abs, k)
+
+                col_names = [f"k{k}" for k in k_grid]
+                overlap_vals = []
+                fm0_vals, fm1_vals, fm8_vals = [], [], []
+
+                Z0 = mlp_data["Z"][0]
+                Z1 = mlp_data["Z"][1]
+                Z8 = mlp_data["Z"][8] 
+
+                for k in k_grid:
+                    Sn = sets_norm[k]
+                    Sp = sets_proj[k]  
+                    overlap_vals.append(_set_overlap_ratio(Sn, Sp, k))
+                    fm0_vals.append(_fracmass_on_set(Z0, Sp))
+                    fm1_vals.append(_fracmass_on_set(Z1, Sp))
+                    fm8_vals.append(_fracmass_on_set(Z8, Sp))
+
+                metrics = [
+                    ("overlap(norm, proj)", overlap_vals, "float"),
+                    ("frac_mass_on_proj(tok0)", fm0_vals, "float"),
+                    ("frac_mass_on_proj(tok1)", fm1_vals, "float"),
+                    ("frac_mass_on_proj(tok8)", fm8_vals, "float"),
+                ]
+
+                _print_metrics_table(
+                    metrics,
+                    col_names,
+                    title=f"[MLP subspace] layer={L} | sets from W_down columns"
+                )        
                     
             if args.decompose_ln:
                 def _collect_preln_vectors():
