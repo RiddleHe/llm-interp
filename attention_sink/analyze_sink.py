@@ -275,48 +275,11 @@ def _cross_total_cov(U, V):
     Vc = V - V.mean(dim=0, keepdim=True)
     return float((Uc * Vc).sum().item())
 
-def _directional_concentration(Y, topk=3): # on unit vectors
-    if Y.ndim != 2 or Y.size(0) < 2:
-        return 0.0, None
-    Yu = F.normalize(Y, dim=-1)
-    U, S, Vh, var, total = _svd_centered(Yu, full_matrices=False)
-    k_eff = min(topk, var.shape[0])
-    ratio = float((var[:k_eff].sum() / total).item())
-    bias_dir = F.normalize(Vh[0], dim=0)
-    return ratio, bias_dir
-
-def _component_direction_stats(R, A, M, bias_dir):
-    if bias_dir is None:
-        return {}
-    b = F.normalize(bias_dir, dim=0)
-
-    def _coef(X):
-        return X @ b
-
-    def _cov(x, y):
-        if x.numel() == 0 or y.numel() == 0:
-            return 0.0
-        xm = x - x.mean()
-        ym = y - y.mean()
-        return float((xm * ym).mean().item())
-
-    def _cos_stats(X, coeff):
-        norms = X.norm(dim=-1).clamp_min(EPS)
-        cos = coeff / norms
-        return float(cos.mean().item())
-
-    alpha = _coef(R); beta = _coef(A); gamma = _coef(M)
+def _component_direction_stats(R, A, M):
     stats = {
-        "covariance_residual_mlp": _cov(alpha, gamma),
         "spread_residual": _cloud_radius(R),
         "spread_attn": _cloud_radius(A),
         "spread_mlp": _cloud_radius(M),
-        "dir_concentration_residual": _directional_concentration(R)[0],
-        "dir_concentration_attn": _directional_concentration(A)[0],
-        "dir_concentration_mlp": _directional_concentration(M)[0],
-        "cos_residual_mean": _cos_stats(R, alpha),
-        "cos_attn_mean": _cos_stats(A, beta),
-        "cos_mlp_mean": _cos_stats(M, gamma),
     }
     return stats
 
@@ -1226,18 +1189,14 @@ def main():
                     Ys.append(Y); Rs.append(R_raw); As.append(A_raw); Ms.append(M_raw)
                     assert Y is not None and Y.ndim == 2 and Y.shape[0] >= 2
 
-                Y_norm = []; Y_spread = []; Y_dir_conc = []; bias_dirs = []
+                Y_norm = []; Y_spread = []
                 for Y in Ys:
-                    dc, bdir = _directional_concentration(Y)
-                    assert bdir is not None
                     Y_norm.append(_mean_vec_norm(Y))
                     Y_spread.append(_cloud_radius(Y))
-                    Y_dir_conc.append(float(dc))
-                    bias_dirs.append(bdir)
 
                 comp = [] # component breakdown R/A/M
                 for i in range(len(tok_idxs)):
-                    comp_stats = _component_direction_stats(Rs[i], As[i], Ms[i], bias_dirs[i])
+                    comp_stats = _component_direction_stats(Rs[i], As[i], Ms[i])
                     comp_stats.update({
                         "norm_residual": _mean_vec_norm(Rs[i]),
                         "norm_attn": _mean_vec_norm(As[i]),
@@ -1248,16 +1207,12 @@ def main():
                 metrics = [
                     ("norm_Y", Y_norm, "sci"),
                     ("spread_Y", Y_spread, "sci"),
-                    ("concentration_Y topk=3", Y_dir_conc, "float"),
                     ("norm_residual", _get("norm_residual", comp), "sci"),
                     ("norm_attn", _get("norm_attn", comp), "sci"),
                     ("norm_mlp", _get("norm_mlp", comp), "sci"),
                     ("spread_residual", _get("spread_residual", comp), "sci"),
                     ("spread_attn", _get("spread_attn", comp), "sci"),
                     ("spread_mlp", _get("spread_mlp", comp), "sci"),
-                    ("concentration_residual topk=3", _get("dir_concentration_residual", comp), "float"),
-                    ("concentration_attn topk=3", _get("dir_concentration_attn", comp), "float"),
-                    ("concentration_mlp topk=3", _get("dir_concentration_mlp", comp), "float"),
                     # TODO: plot cos and covariance
                 ]
                 _print_metrics_table(metrics, col_names, title=f"[Block Output L={L}]", col_w=14)
