@@ -158,13 +158,6 @@ def _pca_from_rows(X, k):
     rel = (var[:k] / total).cpu().numpy()
     return U[:, :k], S[:k], Vh[:k, :], rel, total
 
-def _cross_explained_variance(X, B):
-    Xc = X - X.mean(dim=0, keepdim=True)
-    Xproj = (Xc @ B.T) @ B
-    num = (Xproj ** 2).sum()
-    den = (Xc ** 2).sum().clamp_min(EPS)
-    return float((num / den).item())
-
 def _bias_3d_projection(X, bias_vec, topk=2):
     if X is None or bias_vec is None:
         return None
@@ -194,16 +187,22 @@ def _bias_3d_projection(X, bias_vec, topk=2):
     frac = torch.cat([frac_bias, frac_res], dim=1)
     return frac.cpu().numpy()
 
+def _frac_energy_on_direction(X, u):
+    if X is None or X.numel() == 0:
+        return 0.0
+    X = X.to(dtype=torch.float32)
+    u = u.to(dtype=torch.float32, device=X.device)
+    u = F.normalize(u, dim=0)
+    denom = (X ** 2).sum(dim=1).clamp_min(EPS)
+    num = (X @ u) ** 2
+    return float((num / denom).mean().item())
+
 def _mean_dir_decomposition(XQ, XK, VhQ, label, k):
     mu = XK.mean(dim=0)
     mu_norm_sq = float((mu ** 2).sum().item())
     if mu_norm_sq <= EPS:
-        return 0.0, 0.0
-    u = F.normalize(mu, dim=0)
-    q_energy = (XQ ** 2).sum(dim=1).clamp_min(EPS)
-    sink_energy = (XQ @ u) ** 2
-    frac_q_along_mu = float((sink_energy / q_energy).mean().item()) # mean of ratios
-    return frac_q_along_mu
+        return 0.0
+    return _frac_energy_on_direction(XQ, mu)
 
 def _set_overlap_ratio(A, B, k):
     k = int(k)
@@ -222,61 +221,32 @@ def _fracmass_on_set(Z, idx_set):
     num = (Z[:, idx] ** 2).sum(dim=1)
     return float((num / denom).mean().item())
 
-def _topk_set_from_scores(scores, k):
+def _topk_list_from_scores(scores, k):
     if scores is None or scores.numel() == 0:
-        return set()
+        return []
     k = int(max(0, min(int(k), int(scores.numel()))))
     if k <= 0:
-        return set()
+        return []
     idx = torch.topk(scores, k=k, largest=True).indices.detach().cpu().tolist()
-    return set(int(i) for i in idx)
+    return [int(i) for i in idx]
 
-def _get_head_k_proj_matrix(model, layer_idx, head_idx):
-    attn = model.model.layers[layer_idx].self_attn
-    num_heads = model.config.num_attention_heads
-    num_kv = model.config.num_key_value_heads
-    num_groups = max(1, num_heads // max(1, num_kv))
-    head_dim = model.config.head_dim
+def _topk_set_from_scores(scores, k):
+    return set(_topk_list_from_scores(scores, k))
+    
+def _topk_activated_set(Z, k):
+    if Z is None or Z.numel() == 0:
+        return set()
+    scores = (Z.to(dtype=torch.float32) ** 2).mean(dim=0)
+    return _topk_set_from_scores(scores, k)
 
-    kv_idx = head_idx // num_groups
-    k_proj = attn.k_proj
-    W_full = k_proj.weight.detach() # [num_kv * head_dim, d_model]
-    start = kv_idx * head_dim
-    end = start + head_dim
-    return W_full[start:end, :]
+def _topk_activated_list_abs(Z, k):
+    if Z is None or Z.numel() == 0:
+        return []
+    scores = Z.to(dtype=torch.float32).abs().mean(dim=0)
+    return _topk_list_from_scores(scores, k)
 
-def _compute_residual_sink_direction(model, layer_idx, head_idx, mu0):
-    if mu0 is None:
-        return None
-    mu0 = mu0.to(torch.float32)
-    n2 = float((mu0 ** 2).sum().item())
-    if n2 <= EPS:
-        return None
-    u0 = F.normalize(mu0, dim=0)
-    Wk = _get_head_k_proj_matrix(model, layer_idx, head_idx).to(mu0.device, dtype=torch.float32)
-    Wk_pinv = torch.linalg.pinv(Wk) 
-    r_sink = Wk_pinv @ u0
-    if float((r_sink ** 2).sum().item()) <= EPS:
-        return None
-    return F.normalize(r_sink, dim=0)
-
-def _energy_fraction_along_direction(R, direction):
-    if R is None or direction is None:
-        return None
-    if direction.numel() == 0:
-        return None
-    d = F.normalize(direction, dim=0)
-    coords = R @ d
-    sub = coords ** 2
-    tot = (R ** 2).sum(dim=1).clamp_min(EPS)
-    return sub / tot
-
-def _mean_energy(z):
-    return float((z.pow(2)).sum(dim=-1).mean().item())
-
-def _total_var(Z):
-    Zc = Z - Z.mean(dim=0, keepdim=True)
-    return float((Zc.pow(2)).sum().item())
+def _pos_ratio(Z):
+    return float((Z > 0).to(torch.float32).mean().item())
 
 def _mean_vec_norm(X):
     if X is None or X.numel() == 0:
@@ -296,11 +266,6 @@ def _cloud_radius(Z):
     D = float(Zc.size(-1)) # D
     return float((Zc.pow(2).sum(dim=-1).mean() / D).sqrt().item())
 
-def _cross_total_cov(U, V):
-    Uc = U - U.mean(dim=0, keepdim=True)
-    Vc = V - V.mean(dim=0, keepdim=True)
-    return float((Uc * Vc).sum().item())
-
 def _component_direction_stats(R, A, M):
     stats = {
         "spread_residual": _cloud_radius(R),
@@ -309,32 +274,18 @@ def _component_direction_stats(R, A, M):
     }
     return stats
 
+def _activation_entropy(Z):
+    Z2 = (Z ** 2).mean(dim=0)
+    p = Z2 / Z2.sum().clamp_min(EPS)
+    return float(-(p * (p + EPS).log()).sum().item())
+
+def _mean_topk_column_norm(Wd, idx_set):
+    if not idx_set:
+        return 0.0
+    idx = torch.tensor(sorted(idx_set), dtype=torch.long, device=Wd.device)
+    return float(Wd[:, idx].norm(dim=0).mean().item())
+
 # decomposition of input functions
-
-def _install_zero_attn_hooks(model, layer_idx):
-    attn = model.model.layers[layer_idx].self_attn
-    def _zero_attn_out(_m, _args, output):
-        out = list(output)
-        out[0] = torch.zeros_like(out[0])
-        return tuple(out)
-    h = attn.register_forward_hook(_zero_attn_out)
-    return [h]
-
-def _install_zero_mlp_hooks(model, layer_idx):
-    mlp = model.model.layers[layer_idx].mlp
-    def _zero_mlp_out(_m, _args, output):
-        return torch.zeros_like(output)
-    h = mlp.register_forward_hook(_zero_mlp_out)
-    return [h]
-
-def _rms(x, eps=EPS):
-    return x.pow(2).mean(dim=-1).add_(eps).sqrt()
-
-def _rmsnorm_from_module(Z, ln_mod):
-    eps = float(getattr(ln_mod, "eps", 1e-6))
-    w = ln_mod.weight.detach().to(dtype=Z.dtype, device=Z.device)
-    denom = Z.pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt()
-    return (Z / denom) * w
 
 def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
     cache_raw = {}
@@ -776,6 +727,10 @@ def _print_metrics_table(metrics, col_names, title=None, col_w=14):
         print(row_name.ljust(row_name_w) + "  " + "".join(_fmt(v, kind).rjust(col_w) for v in vals))
 
 def _fmt(v, kind):
+    if v is None:
+        return "N/A"
+    if isinstance(v, str):
+        return v
     if kind == "sci":
         return f"{float(v):.4e}"
     return f"{float(v):.4f}"
@@ -1184,6 +1139,7 @@ def main():
                 # fetch down projection column vectors
                 mlp = model.model.layers[L].mlp
                 Wd = mlp.down_proj.weight.detach().to(dtype=torch.float32).cpu()
+                Wg = mlp.gate_proj.weight.detach().to(dtype=torch.float32).cpu()
                 d_model, d_mlp = int(Wd.shape[0]), int(Wd.shape[1])
 
                 # fetch mean output direction
@@ -1192,101 +1148,144 @@ def main():
                 u_hat = F.normalize(mu_y, dim=0)
 
                 # calculate column scores
-                col_norm = Wd.norm(dim=0)
                 alpha = (u_hat.unsqueeze(0) @ Wd).squeeze(0)
                 alpha_abs = alpha.abs()
 
-                k_grid = [8, 16, 32, 64]
-                k_grid = [k for k in k_grid if k <= d_mlp]
-                assert len(k_grid) > 0
+                k = 3
+                S_proj = _topk_set_from_scores(alpha_abs, k) # topk indices that align with mu_y
 
-                sets_norm = {}
-                sets_proj = {}
-                for k in k_grid:
-                    sets_norm[k] = _topk_set_from_scores(col_norm, k)
-                    sets_proj[k] = _topk_set_from_scores(alpha_abs, k)
+                col_names = ["tok0", "tok1", "tok8"]
 
-                col_names = [f"k{k}" for k in k_grid]
-                overlap_vals = []
-                fm0_vals, fm1_vals, fm8_vals = [], [], []
+                Z0 = mlp_data["Z"][0]; Z1 = mlp_data["Z"][1]; Z8 = mlp_data["Z"][8] 
+                G0 = mlp_data["G"][0]; G1 = mlp_data["G"][1]; G8 = mlp_data["G"][8]
+                U0 = mlp_data["U"][0]; U1 = mlp_data["U"][1]; U8 = mlp_data["U"][8]
+                A0 = mlp_data["A"][0]; A1 = mlp_data["A"][1]; A8 = mlp_data["A"][8]
+                X0 = mlp_data["X"][0]; X1 = mlp_data["X"][1]; X8 = mlp_data["X"][8]
 
-                Z0 = mlp_data["Z"][0]
-                Z1 = mlp_data["Z"][1]
-                Z8 = mlp_data["Z"][8] 
+                # sanity checks
+                diff0 = Z0 - A0 * U0
+                z0_rel_l2 = float((
+                    diff0.norm(dim=1) / Z0.norm(dim=1).clamp_min(EPS)
+                ).mean().item())
+                print(f"[Sanity check] reconstruction mean_rel_l2={z0_rel_l2:.4e}")
 
-                for k in k_grid:
-                    Sn = sets_norm[k]
-                    Sp = sets_proj[k]  
-                    overlap_vals.append(_set_overlap_ratio(Sn, Sp, k))
-                    fm0_vals.append(_fracmass_on_set(Z0, Sp))
-                    fm1_vals.append(_fracmass_on_set(Z1, Sp))
-                    fm8_vals.append(_fracmass_on_set(Z8, Sp))
+                S_act0 = _topk_activated_set(Z0, k) # should be the same as S_proj
+                S_act1 = _topk_activated_set(Z1, k)
+                S_act8 = _topk_activated_set(Z8, k)
+
+                S_u0 = _topk_activated_set(U0, k)
+                S_a0 = _topk_activated_set(A0, k)
+
+                frac_mass_vals = [
+                    _fracmass_on_set(Z0, S_proj),
+                    _fracmass_on_set(Z1, S_proj),
+                    _fracmass_on_set(Z8, S_proj),
+                ]
+                z_norm_vals = [
+                    float(Z0.norm(dim=1).mean().item()),
+                    float(Z1.norm(dim=1).mean().item()),
+                    float(Z8.norm(dim=1).mean().item()),
+                ]
+                entropy_vals = [
+                    _activation_entropy(Z0),
+                    _activation_entropy(Z1),
+                    _activation_entropy(Z8),
+                ]
+                colnorm_vals = [
+                    _mean_topk_column_norm(Wd, S_act0),
+                    _mean_topk_column_norm(Wd, S_act1),
+                    _mean_topk_column_norm(Wd, S_act8),
+                ]
+                g_entropy_vals = [
+                    _activation_entropy(G0),
+                    _activation_entropy(G1),
+                    _activation_entropy(G8),
+                ]
+                a_entropy_vals = [
+                    _activation_entropy(A0),
+                    _activation_entropy(A1),
+                    _activation_entropy(A8),
+                ]
+                g_pos_ratio_vals = [
+                    _pos_ratio(G0),
+                    _pos_ratio(G1),
+                    _pos_ratio(G8),
+                ]
+                u_norm_vals = [
+                    float(U0.norm(dim=1).mean().item()),
+                    float(U1.norm(dim=1).mean().item()),
+                    float(U8.norm(dim=1).mean().item()),
+                ]
+                a_norm_vals = [
+                    float(A0.norm(dim=1).mean().item()),
+                    float(A1.norm(dim=1).mean().item()),
+                    float(A8.norm(dim=1).mean().item()),
+                ]
+                ua_topk_overlap_vals = [
+                    _set_overlap_ratio(S_u0, S_a0, k),
+                    None,
+                    None,
+                ]
 
                 metrics = [
-                    ("overlap(norm, proj)", overlap_vals, "float"),
-                    ("frac_mass_on_proj(tok0)", fm0_vals, "float"),
-                    ("frac_mass_on_proj(tok1)", fm1_vals, "float"),
-                    ("frac_mass_on_proj(tok8)", fm8_vals, "float"),
+                    (f"frac_sq_activation_on_aligned_vec k={k}", frac_mass_vals, "float"),
+                    ("intermediate_z_norm", z_norm_vals, "sci"),
+                    ("intermeidate_z_entropy", entropy_vals, "float"),
+                    (f"downproj_col_mean_norm k={k}", colnorm_vals, "float"),
+                    ("gate_g_entropy", g_entropy_vals, "float"),
+                    ("act_a_entropy", a_entropy_vals, "float"),
+                    ("gate_g_pos_ratio", g_pos_ratio_vals, "float"),
+                    ("up_u_norm", u_norm_vals, "sci"),
+                    ("act_a_norm", a_norm_vals, "sci"),
+                    (f"top_activation_overlap_u_vs_a k={k}", ua_topk_overlap_vals, "float"),
                 ]
 
                 _print_metrics_table(
                     metrics,
                     col_names,
-                    title=f"[MLP subspace] layer={L} | sets from W_down columns"
-                )        
-                    
-            if args.decompose_ln:
-                def _collect_preln_vectors():
-                    _store = {}
-                    _handles = _capture_qkv_multi(model, [L], _store)
-                    vecs = []
-                    try:
-                        for input_ids, base_pos in tqdm(tokenized, desc=f"Collecting pre-L{L} input", leave=False):
-                            _ = prefill(model, input_ids, base_pos)
-                            H = _store[L]["residual"][0]
-                            vecs.append(torch.stack([H[t] for t in tok_idxs], dim=0))
-                    finally:
-                        for h in _handles:
-                            try: h.remove()
-                            except Exception: pass
-                    return torch.stack(vecs, dim=0)
+                    title=f"[MLP subspace] layer={L}"
+                )   
 
-                X = _collect_preln_vectors()
-                hooks_m = _install_zero_mlp_hooks(model, Lm1)
-                X_nm = _collect_preln_vectors()
-                for h in hooks_m: h.remove()
-                hooks_a = _install_zero_attn_hooks(model, Lm1)
-                X_na = _collect_preln_vectors()
-                for h in hooks_a: h.remove()
+                idx_sorted = sorted(S_proj)
+                z_abs_mean = (Z0[:, idx_sorted].abs().mean(dim=0)).cpu().tolist()
+                pairs = sorted(
+                    zip(idx_sorted, z_abs_mean),
+                    key=lambda x: -x[1],
+                )   
+                ref_idx = pairs[0][0]
+                w_ref = F.normalize(Wd[:, ref_idx], dim=0)
+                print()
+                print(f"[Intermediate activation subspace] layer={L}")
+                for i, v in pairs:
+                    wi = F.normalize(Wd[:, i], dim=0)
+                    cos_i = float(torch.dot(wi, w_ref).item())
+                    col_norm_i = float(Wd[:, i].norm(dim=0).item())
+                    print(f"  idx={i:5d} | mean|z|={v:.4e} | cos_to_top1={cos_i:+.4f} | ||w||={col_norm_i:.4e}")
 
-                M = X - X_nm
-                A = X - X_na
-                R = X_nm + X_na - X
+                g_top_idx = _topk_activated_list_abs(G0, k)
+                gate_row_norms, frac_x0, frac_x1, frac_x8 = [], [], [], []
+                for ii in g_top_idx:
+                    w = Wg[ii, :]
+                    gate_row_norms.append(float(w.norm().item()))
+                    frac_x0.append(_frac_energy_on_direction(X0, w))
+                    frac_x1.append(_frac_energy_on_direction(X1, w))
+                    frac_x8.append(_frac_energy_on_direction(X8, w))
 
-                # shared rmsnorm scaling factor
-                s = 1.0 / _rms(X, eps=EPS)
-                s = s.unsqueeze(-1)
-                Rn, An, Mn = R * s, A * s, M * s
-                Yn = Rn + An + Mn # equal original input
-
-                names = ["tok0", "tok1", "tok8"]
-                for i, name in enumerate(names):
-                    Yr, Ya, Ym = Rn[:, i], An[:, i], Mn[:, i]
-                    Ysum = Yr + Ya + Ym
-                    Er, Ea, Em = _mean_energy(Yr), _mean_energy(Ya), _mean_energy(Ym)
-                    Etot = _mean_energy(Yn[:, i])
-                    print(f"[Decompose L={L} {name}] ||y||^2={Etot:.4f} | r={Er:.4f} a={Ea:.4f} m={Em:.4f}")
-
-                    Tr, Ta, Tm = _total_var(Yr), _total_var(Ya), _total_var(Ym)
-                    Tra, Trm, Tam = _cross_total_cov(Yr, Ya), _cross_total_cov(Yr, Ym), _cross_total_cov(Ya, Ym)
-                    Ttot = _total_var(Ysum)
-                    recon = Tr + Ta + Tm + 2 * Tra + 2 * Trm + 2 * Tam
-                    print(
-                        f"[VarDecomp L={L} {name}] total_var={Ttot:.4f} | "
-                        f"r={Tr:.4f} a={Ta:.4f} m={Tm:.4f} | "
-                        f"2r*a={2*Tra:.4f} 2r*m={2*Trm:.4f} 2a*m={2*Tam:.4f} | "
-                        f"recon_err={Ttot - recon:+.4e}"
-                    )
+                col_names_g = [f"top{j+1} row" for j in range(len(g_top_idx))]
+                idx_str = [str(i) for i in g_top_idx]
+                metrics_g = [
+                    ("idx", idx_str, ""),
+                    ("||w||", gate_row_norms, "sci"),
+                    ("frac_energy_X_tok0_on_vec", frac_x0, "float"),
+                    ("frac_energy_X_tok1_on_vec", frac_x1, "float"),
+                    ("frac_energy_X_tok8_on_vec", frac_x8, "float"),
+                ]
+                _print_metrics_table(
+                    metrics_g,
+                    col_names_g,
+                    title=f"[Gate subspace] layer={L}",
+                    col_w=14,
+                )
 
             if args.decompose_output:
                 raw_components = _collect_raw_components_for_layer(
