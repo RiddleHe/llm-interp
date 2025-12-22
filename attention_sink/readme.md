@@ -51,3 +51,9 @@ The output will have the following features:
 |spread_residual    |      |      |      |
 |spread_attn        |      |      |      |
 |spread_mlp         |      |      |      |
+
+### MLP module outputs in a specific layer
+
+```bash
+python analyze_sink.py --prompt-file prompts.txt --find-mlp-subspace --layer [layer_idx]
+```
