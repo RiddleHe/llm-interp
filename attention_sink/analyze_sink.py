@@ -329,6 +329,13 @@ def _mean_cos_row_vs_X(w_row, X):
     Xu = F.normalize(X.to(dtype=torch.float32), dim=1)
     return float((Xu @ w).mean().item())
 
+def _mean_frac_energy_on_dir(X, w_dir):
+    X = X.to(dtype=torch.float32)
+    u = F.normalize(w_dir.to(dtype=torch.float32), dim=0).to(device=X.device)
+    denom = (X ** 2).sum(dim=1).clamp_min(EPS)
+    num = (X @ u).pow(2)
+    return float((num / denom).mean().item())
+
 # decomposition of input functions
 
 def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
@@ -406,7 +413,18 @@ def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
 
 def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
     mlp = model.model.layers[layer_idx].mlp
+    attn = model.model.layers[layer_idx].self_attn
     cache = {}
+
+    h_blk = model.model.layers[layer_idx].register_forward_pre_hook(
+        lambda m, a, k, _c=cache: _c.__setitem__("attn_in", _get_hidden_from_hook_args(a, k).detach().float().cpu()),
+        with_kwargs=True,
+    ) # capture attn input
+    def _attn_hook(_module, args, output, _cache=cache):
+        attn_out = output[0]
+        _cache["attn_out"] = attn_out.detach().float().cpu()
+    h_attn = attn.register_forward_hook(_attn_hook) # capture attn output
+    # attn output + attn input -> MLP input
 
     def _mlp_hook(_module, inputs, output, _cache=cache):
         x = inputs[0]
@@ -430,6 +448,8 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
     A_tok = copy.deepcopy(X_tok)
     Z_tok = copy.deepcopy(X_tok)
     Y_tok = copy.deepcopy(X_tok)
+    Attn_in_tok = copy.deepcopy(X_tok)
+    Attn_out_tok = copy.deepcopy(X_tok)
 
     try:
         for input_ids, base_pos in tqdm(
@@ -439,7 +459,7 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
         ):
             cache.clear()
             _ = prefill(model, input_ids, base_pos)
-            assert all(k in cache for k in ["x", "g", "u", "a", "z", "y"])
+            assert all(k in cache for k in ["x", "g", "u", "a", "z", "y", "attn_in", "attn_out"])
 
             x = cache["x"][0]
             g = cache["g"][0]
@@ -447,6 +467,8 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
             a = cache["a"][0]
             z = cache["z"][0]
             y = cache["y"][0]
+            attn_in = cache["attn_in"][0]
+            attn_out = cache["attn_out"][0]
             S = int(x.shape[0])
             for t in tok_idxs:
                 assert t < S
@@ -456,14 +478,17 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
                 A_tok[t].append(a[t].clone())
                 Z_tok[t].append(z[t].clone())
                 Y_tok[t].append(y[t].clone())
+                Attn_in_tok[t].append(attn_in[t].clone())
+                Attn_out_tok[t].append(attn_out[t].clone())
 
     finally:
-        try:
-            h.remove()
-        except Exception:
-            pass
+        for _h in [h, h_attn, h_blk]:
+            try:
+                _h.remove()
+            except Exception:
+                pass
 
-    out = {"X": {}, "G": {}, "U": {}, "A": {}, "Z": {}, "Y": {}}
+    out = {"X": {}, "G": {}, "U": {}, "A": {}, "Z": {}, "Y": {}, "Attn_in": {}, "Attn_out": {}}
     for name, bucket in [
         ("X", X_tok),
         ("G", G_tok),
@@ -471,6 +496,8 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
         ("A", A_tok),
         ("Z", Z_tok),
         ("Y", Y_tok),
+        ("Attn_in", Attn_in_tok),
+        ("Attn_out", Attn_out_tok),
     ]:
         for t, vecs in bucket.items():
             if vecs:
@@ -1177,18 +1204,8 @@ def main():
                 Wg = mlp.gate_proj.weight.detach().to(dtype=torch.float32).cpu()
                 d_model, d_mlp = int(Wd.shape[0]), int(Wd.shape[1])
 
-                # fetch mean output direction
-                Y0 = mlp_data["Y"][0].to(dtype=torch.float32)
-                mu_y = Y0.mean(dim=0)
-                u_hat = F.normalize(mu_y, dim=0)
-
-                # calculate column scores
-                alpha = (u_hat.unsqueeze(0) @ Wd).squeeze(0)
-                alpha_abs = alpha.abs()
-
                 k = 3
                 k_fracs = (0.25, 0.75, 0.99)
-                S_proj = _topk_set_from_scores(alpha_abs, k) # topk indices that align with mu_y
 
                 col_names = ["tok0", "tok1", "tok8"]
 
@@ -1197,18 +1214,13 @@ def main():
                 U0 = mlp_data["U"][0]; U1 = mlp_data["U"][1]; U8 = mlp_data["U"][8]
                 A0 = mlp_data["A"][0]; A1 = mlp_data["A"][1]; A8 = mlp_data["A"][8]
                 X0 = mlp_data["X"][0]; X1 = mlp_data["X"][1]; X8 = mlp_data["X"][8]
+                AttnIn0 = mlp_data["Attn_in"][0]
+                AttnOut0 = mlp_data["Attn_out"][0]
 
-                idx_sorted = sorted(S_proj)
-                z_abs_mean = (Z0[:, idx_sorted].abs().mean(dim=0)).cpu().tolist()
-                pairs = sorted(
-                    zip(idx_sorted, z_abs_mean),
-                    key=lambda x: -x[1],
-                )   
-                ref_idx = pairs[0][0]
-                w_ref = F.normalize(Wd[:, ref_idx], dim=0)
-
+                z0_topk_act_idx = _topk_activated_list_abs(Z0, k)
+                w_ref = F.normalize(Wd[:, z0_topk_act_idx[0]], dim=0)
                 wdown_cos_to_top1 = []
-                for i, _ in pairs:
+                for i in z0_topk_act_idx:
                     wi = F.normalize(Wd[:, i], dim=0)
                     wdown_cos_to_top1.append(float(torch.dot(wi, w_ref).item()))
 
@@ -1241,25 +1253,10 @@ def main():
                     _print_list(map(str, _topk_activated_list_abs(Z1, k))),
                     _print_list(map(str, _topk_activated_list_abs(Z8, k))),
                 ]
-                wd_aligned_topk_idx_vals = [
-                    _print_list(map(str, sorted(S_proj))),
-                    None,
-                    None,
-                ]
                 wdown_cos_to_top1_vals = [
                     _print_list(f"{v:.2f}" for v in wdown_cos_to_top1),
                     None,
                     None,
-                ]
-                frac_mass_vals = [
-                    _fracmass_on_set(Z0, S_proj),
-                    _fracmass_on_set(Z1, S_proj),
-                    _fracmass_on_set(Z8, S_proj),
-                ]
-                entropy_vals = [
-                    _activation_entropy(Z0),
-                    _activation_entropy(Z1),
-                    _activation_entropy(Z8),
                 ]
                 colnorm_vals = [
                     _mean_topk_column_norm(Wd, S_act0),
@@ -1309,11 +1306,8 @@ def main():
 
                 metrics_z = [
                     ("inter_z_norm", z_norm_vals, "sci"),
-                    ("inter_z_entropy", entropy_vals, "float"),
                     ("inter_z_k@frac_energy [.25, .75, .99]", z_kfrac_vals, ""),
                     (f"inter_z_topk_act_idx k={k}", z_topk_idx_vals, ""),
-                    (f"W_down_topk_aligned_vec_idx k={k}", wd_aligned_topk_idx_vals, ""),
-                    (f"frac_act_on_aligned_vec k={k} (sq)", frac_mass_vals, "float"),
                     (f"W_down_cos_to_top1_aligned_vec k={k}", wdown_cos_to_top1_vals, ""),
                     (f"W_down_topk_act_norm k={k}", colnorm_vals, "float"),
                 ]
@@ -1343,6 +1337,8 @@ def main():
                 cos_tok0, cos_tok1, cos_tok8 = [], [], []
                 w_norms, w_ranks = [], []
                 cos_to_top1 = []
+                frac_e_tok0, frac_e_tok1, frac_e_tok8 = [], [], []
+                cos_attnin_tok0, cos_attnout_tok0 = [], []
 
                 w_ref = F.normalize(Wg[probe_idx[0], :].to(dtype=torch.float32), dim=0)
 
@@ -1351,6 +1347,11 @@ def main():
                     cos_tok0.append(_mean_cos_row_vs_X(wi, X0))
                     cos_tok1.append(_mean_cos_row_vs_X(wi, X1))
                     cos_tok8.append(_mean_cos_row_vs_X(wi, X8))
+                    cos_attnin_tok0.append(_mean_cos_row_vs_X(wi, AttnIn0))
+                    cos_attnout_tok0.append(_mean_cos_row_vs_X(wi, AttnOut0))
+                    frac_e_tok0.append(_mean_frac_energy_on_dir(X0, wi))
+                    frac_e_tok1.append(_mean_frac_energy_on_dir(X1, wi))
+                    frac_e_tok8.append(_mean_frac_energy_on_dir(X8, wi))
                     w_norms.append(float(norms_all[ii].item()))
                     w_ranks.append(str(int(ranks_all[ii].item())))
                     
@@ -1361,6 +1362,11 @@ def main():
                     ("cos(w_i, X_tok0)", cos_tok0, "float"),
                     ("cos(w_i, X_tok1)", cos_tok1, "float"),
                     ("cos(w_i, X_tok8)", cos_tok8, "float"),
+                    ("cos(w_i, AttnIn_tok0)", cos_attnin_tok0, "float"),
+                    ("cos(w_i, AttnOut_tok0)", cos_attnout_tok0, "float"),
+                    ("frac_energy(X_tok0 -> w_i)", frac_e_tok0, "float"),
+                    ("frac_energy(X_tok1 -> w_i)", frac_e_tok1, "float"),
+                    ("frac_energy(X_tok8 -> w_i)", frac_e_tok8, "float"),
                     ("||w_i||", w_norms, "sci"),
                     ("rank(||w||) (1=largest)", w_ranks, ""),
                     ("cos(w_i, w_top1)", cos_to_top1, "float"),
