@@ -316,6 +316,19 @@ def _mean_topk_column_norm(Wd, idx_set):
     idx = torch.tensor(sorted(idx_set), dtype=torch.long, device=Wd.device)
     return float(Wd[:, idx].norm(dim=0).mean().item())
 
+def _row_norm_rank_desc(W):
+    W = W.to(dtype=torch.float32)
+    norms = W.norm(dim=1)
+    order = torch.argsort(norms, descending=True)
+    rank = torch.empty_like(order)
+    rank[order] = torch.arange(1, order.numel() + 1, device=order.device)
+    return norms, rank
+
+def _mean_cos_row_vs_X(w_row, X):
+    w = F.normalize(w_row.to(dtype=torch.float32), dim=0)
+    Xu = F.normalize(X.to(dtype=torch.float32), dim=1)
+    return float((Xu @ w).mean().item())
+
 # decomposition of input functions
 
 def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
@@ -1323,6 +1336,37 @@ def main():
                 _print_metrics_table(metrics_ga, col_names, title=f"[MLP subspace: G/A] layer={L}")
                 print()
                 _print_metrics_table(metrics_u, col_names, title=f"[MLP subspace: U] layer={L}")  
+
+                probe_idx = [5723, 8518, 422]
+                probe_cols = [f"idx_{i}" for i in probe_idx]
+                norms_all, ranks_all = _row_norm_rank_desc(Wg)
+                cos_tok0, cos_tok1, cos_tok8 = [], [], []
+                w_norms, w_ranks = [], []
+                cos_to_top1 = []
+
+                w_ref = F.normalize(Wg[probe_idx[0], :].to(dtype=torch.float32), dim=0)
+
+                for ii in probe_idx:
+                    wi = Wg[ii, :].to(dtype=torch.float32)
+                    cos_tok0.append(_mean_cos_row_vs_X(wi, X0))
+                    cos_tok1.append(_mean_cos_row_vs_X(wi, X1))
+                    cos_tok8.append(_mean_cos_row_vs_X(wi, X8))
+                    w_norms.append(float(norms_all[ii].item()))
+                    w_ranks.append(str(int(ranks_all[ii].item())))
+                    
+                    wi_normed = F.normalize(wi, dim=0)
+                    cos_to_top1.append(float(torch.dot(wi_normed, w_ref).item()))
+
+                metrics_g_vecs = [
+                    ("cos(w_i, X_tok0)", cos_tok0, "float"),
+                    ("cos(w_i, X_tok1)", cos_tok1, "float"),
+                    ("cos(w_i, X_tok8)", cos_tok8, "float"),
+                    ("||w_i||", w_norms, "sci"),
+                    ("rank(||w||) (1=largest)", w_ranks, ""),
+                    ("cos(w_i, w_top1)", cos_to_top1, "float"),
+                ]
+                print()
+                _print_metrics_table(metrics_g_vecs, probe_cols, title=f"[MLP gate row vectors] layer={L}")
 
                 g_top_idx = _topk_activated_list_abs(G0, k)
                 gate_row_norms, frac_x0, frac_x1, frac_x8 = [], [], [], []
