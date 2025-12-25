@@ -1,4 +1,4 @@
-import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math, copy
+import argparse, os, json, numpy as np, torch, matplotlib.pyplot as plt, math, copy
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -41,9 +41,37 @@ def load_model(model_name, device, dtype, random_init=False):
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     return tok, model
 
-def tokenize(tok, text):
-    enc = tok(text, return_tensors="pt", add_special_tokens=True)
+def tokenize(tok, text, add_special_tokens=True):
+    enc = tok(text, return_tensors="pt", add_special_tokens=add_special_tokens)
     return enc["input_ids"]
+
+def _apply_input_id_edits(input_ids, set_pairs=None, swap_pair=None):
+    """
+    Apply simple, position-indexed edits to a 1D sequence (batched as [1, S]).
+
+    - set_pairs: list[(pos, token_id)] to overwrite
+    - swap_pair: tuple(pos_a, pos_b) to swap
+    """
+    if (set_pairs is None or len(set_pairs) == 0) and (swap_pair is None):
+        return input_ids
+    ids = input_ids.clone()
+    S = int(ids.shape[1])
+
+    if set_pairs:
+        for pos, tid in set_pairs:
+            if 0 <= pos < S:
+                ids[0, pos] = int(tid)
+            else:
+                raise ValueError(f"[set-token-ids] position {pos} out of range (seq_len={S})")
+
+    if swap_pair is not None:
+        a, b = int(swap_pair[0]), int(swap_pair[1])
+        if not (0 <= a < S and 0 <= b < S):
+            raise ValueError(f"[swap-token-positions] positions {a}, {b} out of range (seq_len={S})")
+        tmp = ids[0, a].clone()
+        ids[0, a] = ids[0, b]
+        ids[0, b] = tmp
+    return ids
 
 def _load_prompts_from_file(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -119,6 +147,86 @@ def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_retu
         h1 = attn.register_forward_pre_hook(_prehook, with_kwargs=True)
         h2 = attn.register_forward_hook(_fwdhook)
         handles.append([h1, h2])
+    return handles
+
+def _install_sink_key_ablation_hooks(
+    model,
+    layers,
+    head_idxs,
+    sink_k_idx=0,
+    factor=0.0,
+    renorm=True,
+    q_start=None,
+    q_end=None,
+):
+    """
+    Selectively scale attention probability to a specific key index (sink_k_idx)
+    for a subset of heads at specific layers, optionally re-normalizing rows.
+
+    This is intended for causal tests: does removing attn-to-key0 in a small set
+    of "registration heads" eliminate the sink-attention jump?
+    """
+    head_idxs = [int(h) for h in head_idxs]
+    layers = [int(L) for L in layers]
+    factor = float(factor)
+    renorm = bool(renorm)
+
+    handles = []
+    num_heads = model.config.num_attention_heads
+    num_kv = model.config.num_key_value_heads
+    num_groups = max(1, num_heads // max(1, num_kv))
+
+    model._lower_attn_cache = {}  # reuse existing cache reader paths
+
+    for L in layers:
+        attn = model.model.layers[L].self_attn
+        cache = {}
+
+        def _prehook(_module, args, kwargs, _cache=cache,
+                     _num_heads=num_heads, _num_kv=num_kv, _num_groups=num_groups, _head_dim=model.config.head_dim):
+            hidden_states = kwargs["hidden_states"]
+            B, S, _ = hidden_states.shape
+            v = _module.v_proj(hidden_states).view(B, S, _num_kv, _head_dim)
+            v = v.transpose(1, 2).contiguous()
+            if _num_kv != _num_heads:
+                v = v.repeat_interleave(_num_groups, dim=1)
+            _cache["v"] = v
+
+        def _fwdhook(_module, args, output, _cache=cache, _L=L):
+            attn_output, attn_probs = output[0], output[1]  # [B,H,Q,K]
+            probs = attn_probs.clone()
+
+            B, H, Q, K = probs.shape
+            hs = [h for h in head_idxs if 0 <= h < H]
+            if not hs:
+                return output
+            qs = 0 if q_start is None else max(0, min(int(q_start), Q))
+            qe = Q if q_end is None else max(0, min(int(q_end), Q))
+            if qe <= qs:
+                qs, qe = 0, Q
+
+            probs[:, hs, qs:qe, sink_k_idx] *= factor
+            if renorm:
+                sub = probs[:, hs, qs:qe, :]
+                denom = sub.sum(dim=-1, keepdim=True).clamp_min(EPS)
+                probs[:, hs, qs:qe, :] = sub / denom
+
+            v = _cache["v"]
+            ctx = torch.matmul(probs, v)  # [B,H,Q,D]
+            ctx = ctx.transpose(1, 2).contiguous().view(B, Q, -1)
+            new_out = _module.o_proj(ctx)
+
+            model._lower_attn_cache[_L] = probs.detach().float().cpu()
+
+            out_list = list(output)
+            out_list[0] = new_out
+            out_list[1] = probs
+            return tuple(out_list)
+
+        h1 = attn.register_forward_pre_hook(_prehook, with_kwargs=True)
+        h2 = attn.register_forward_hook(_fwdhook)
+        handles.append([h1, h2])
+
     return handles
 
 def apply_perturbations(base_pos, rope_overrides=None, mask=None):
@@ -517,6 +625,17 @@ def parse_overrides(s):
         out.append((int(ti), int(rp)))
     return out
 
+def parse_int_list(s):
+    """'6,23,5' -> [6, 23, 5]"""
+    if not s:
+        return []
+    out = []
+    for part in str(s).split(","):
+        part = part.strip()
+        if part:
+            out.append(int(part))
+    return out
+
 def _append_suffix(path, suffix):
     if not suffix:
         return path
@@ -614,10 +733,26 @@ def pick_head(attentions, layer_idx, head_idx):
     attn_l = attentions[layer_idx]
     return attn_l[0, head_idx].detach().float().cpu().numpy()
 
+def pick_head_or_mean(attentions, layer_idx, head_idx):
+    """
+    head_idx:
+      - int >= 0: pick that head
+      - -1: mean over heads
+    """
+    attn_l = attentions[layer_idx]
+    if int(head_idx) == -1:
+        return attn_l[0].mean(dim=0).detach().float().cpu().numpy()
+    return attn_l[0, int(head_idx)].detach().float().cpu().numpy()
+
 def _pick_head_with_caches(model, attns, layer_idx, head_idx):
     if hasattr(model, "_lower_attn_cache") and (layer_idx in model._lower_attn_cache):
         return pick_head(model._lower_attn_cache, layer_idx, head_idx)
     return pick_head(attns, layer_idx, head_idx)
+
+def _pick_head_or_mean_with_caches(model, attns, layer_idx, head_idx):
+    if hasattr(model, "_lower_attn_cache") and (layer_idx in model._lower_attn_cache):
+        return pick_head_or_mean(model._lower_attn_cache, layer_idx, head_idx)
+    return pick_head_or_mean(attns, layer_idx, head_idx)
 
 # Plotting functions
 
@@ -670,6 +805,32 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     else:
         if stats_b:
             ax.legend()
+    plt.tight_layout()
+    plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
+    plt.close()
+
+def _plot_sink_attn_heads(head_means_by_layer, outdir, fname, top_heads, title, suffix=""):
+    """
+    Plot sink-attention (mean prob to a fixed key) across layers for multiple heads.
+
+    head_means_by_layer: dict[layer -> np.ndarray shape [H]]
+    top_heads: list[int]
+    """
+    if not head_means_by_layer or not top_heads:
+        return
+    layers = sorted(head_means_by_layer.keys())
+    plt.figure(figsize=(8.5, 3.8))
+    ax = plt.gca()
+    for h in top_heads:
+        y = [float(head_means_by_layer[L][h]) for L in layers]
+        ax.plot(layers, y, marker="o", linewidth=1.4, label=f"H{h}")
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("mean attn prob to sink key")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlim(min(layers), max(layers))
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(2))
+    ax.set_title(title)
+    ax.legend(loc="best", ncols=2, fontsize=8)
     plt.tight_layout()
     plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
     plt.close()
@@ -807,11 +968,41 @@ def main():
     p.add_argument("--dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32"])
     p.add_argument("--prompt", default=None)
     p.add_argument("--prompt-file", default=None)
+    p.add_argument("--max-prompts", type=int, default=None, help="Only use the first N prompts (useful for quick runs)")
+    # index-shift controls (registration vs causal boundary)
+    p.add_argument("--prepend-text", default=None, help="Prepend this text (tokenized without special tokens) to every prompt before analysis")
+    # input controls (position/content tests)
+    p.add_argument("--no-special-tokens", action="store_true", help="Tokenize without adding special tokens (BOS/EOS)")
+    p.add_argument("--set-token-ids", default=None, help="Comma-separated list of pos=token_id to overwrite input_ids, eg. '0=151643,1=42'")
+    p.add_argument("--swap-token-positions", type=int, nargs=2, default=None, help="Swap token ids at two positions, eg. '--swap-token-positions 0 1'")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--head", type=int, default=0)
     # scanning mode
     p.add_argument("--scan", action="store_true")
     p.add_argument("--scan-interval", type=int, default=2, help="Interval to scan layers")
+    p.add_argument("--dump-scan-stats", action="store_true", help="Dump scan_stats as JSON to outdir for programmatic comparison")
+    # registration metrics (attention sink onset)
+    p.add_argument("--plot-sink-attn", action="store_true", help="In --scan qkv mode, plot mean attention mass to --sink-idx across layers")
+    p.add_argument("--sink-attn-head", type=int, default=None, help="Which head to use for sink-attn. Use -1 for mean over heads. Default: --head")
+    p.add_argument("--sink-attn-q-start", type=int, default=4, help="Start query index (inclusive) when averaging sink attention")
+    p.add_argument("--sink-attn-q-end", type=int, default=None, help="End query index (exclusive) when averaging sink attention (default: end)")
+    p.add_argument("--plot-sink-attn-heads", action="store_true", help="In --scan qkv mode, plot sink-attn progression for top-k heads (by rank metric)")
+    p.add_argument("--sink-attn-head-topk", type=int, default=8, help="Top-k heads to display when using --plot-sink-attn-heads")
+    p.add_argument("--sink-attn-head-rank-layer", type=int, default=7, help="Layer to rank heads by (default: 7)")
+    p.add_argument("--sink-attn-head-rank-metric", choices=["jump", "value"], default="jump", help="How to rank heads: jump=L-Lprev, value=at rank layer")
+    # Experiment 2: Q/K metrics for multiple heads & layers (multi-query)
+    p.add_argument("--k-metrics-headscan", action="store_true", help="Print K-metrics tables for multiple heads & layers using many query positions (q in [sink-attn-q-start, sink-attn-q-end))")
+    p.add_argument("--k-metrics-heads", default=None, help="Comma-separated head indices, e.g. '6,23,5,9,22,4,20,7' (default: use --head)")
+    p.add_argument("--k-metrics-layers", default="6,7", help="Comma-separated layer indices, default '6,7'")
+    p.add_argument("--k-metrics-tok-idxs", default="0,1,8", help="Comma-separated token indices to compare, default '0,1,8'")
+    # Experiment 3: causal ablation of sink attention in selected heads at selected layers
+    p.add_argument("--ablate-sink-key", action="store_true", help="Ablate attn prob to --sink-idx for selected heads/layers (causal test)")
+    p.add_argument("--ablate-layers", default="7", help="Comma-separated layer indices to ablate (default: '7')")
+    p.add_argument("--ablate-heads", default="6,23,5,9,22,4,20,7", help="Comma-separated head indices to ablate (default: registration heads)")
+    p.add_argument("--ablate-factor", type=float, default=0.0, help="Multiply attn prob to sink key by this factor (default: 0.0)")
+    p.add_argument("--ablate-renorm", action="store_true", help="Re-normalize attention rows after ablation (recommended)")
+    p.add_argument("--ablate-q-start", type=int, default=None, help="Only ablate queries q in [start,end); default: all")
+    p.add_argument("--ablate-q-end", type=int, default=None, help="Only ablate queries q in [start,end); default: all")
     # print mode
     p.add_argument("--print", dest="print_mode", choices=PRINT_CHOICES, default="qkv")
     p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print qkv, eg. '256,512,768")
@@ -844,19 +1035,44 @@ def main():
 
     if args.prompt_file:
         prompts = _load_prompts_from_file(args.prompt_file)
+        if args.max_prompts is not None:
+            prompts = prompts[:max(0, int(args.max_prompts))]
     else:
         if args.prompt:
             prompts = [args.prompt]
         else:
             prompts = ["To understand the failure of window attention, we find an interesting phenomenon of autoregressive LLMs: a surprisingly large amount of attention score is allocated to the initial tokens, irrespective of their relevance to the language modeling task"]
 
+    set_token_pairs = parse_overrides(args.set_token_ids) if args.set_token_ids else None
+    add_special = (not args.no_special_tokens)
+    prepend_ids = None
+    if args.prepend_text:
+        enc = tok(args.prepend_text, return_tensors="pt", add_special_tokens=False)
+        prepend_ids = enc["input_ids"]
+        if prepend_ids is not None and int(prepend_ids.shape[1]) == 0:
+            prepend_ids = None
+
     tokenized = []
     for text in prompts:
-        input_ids = tokenize(tok, text)
+        input_ids = tokenize(tok, text, add_special_tokens=add_special)
+        if prepend_ids is not None:
+            input_ids = torch.cat([prepend_ids, input_ids], dim=1)
+        input_ids = _apply_input_id_edits(
+            input_ids,
+            set_pairs=set_token_pairs,
+            swap_pair=tuple(args.swap_token_positions) if args.swap_token_positions is not None else None,
+        )
         base_pos = make_position_ids(input_ids.shape[1])
         tokenized.append((input_ids, base_pos))
     print(f"[Tokenized] Tokens[0, 0] is {tokenized[0][0][0, 0]}")
     print(f"[Tokenized] Tokens[0, 0] text is {tok.decode(tokenized[0][0][0, 0])}")
+    if args.swap_token_positions is not None:
+        a, b = int(args.swap_token_positions[0]), int(args.swap_token_positions[1])
+        if 0 <= a < tokenized[0][0].shape[1] and 0 <= b < tokenized[0][0].shape[1]:
+            print(f"[Tokenized] swap_token_positions={a}<->{b} now tok[{a}]='{tok.decode(tokenized[0][0][0, a])}', tok[{b}]='{tok.decode(tokenized[0][0][0, b])}'")
+    if set_token_pairs:
+        spec = ",".join(f"{pos}={tid}" for pos, tid in set_token_pairs)
+        print(f"[Tokenized] set_token_ids={spec}")
 
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -872,9 +1088,126 @@ def main():
     num_heads = model.config.num_attention_heads
     job_summary_stats = []
 
+    # -------------------------
+    # Experiment 2: head-level Q/K metrics across many queries
+    # -------------------------
+    if args.k_metrics_headscan:
+        heads = parse_int_list(args.k_metrics_heads) if args.k_metrics_heads else [int(args.head)]
+        layers = parse_int_list(args.k_metrics_layers)
+        tok_idxs = parse_int_list(args.k_metrics_tok_idxs)
+
+        if not layers:
+            raise ValueError("--k-metrics-layers must be non-empty")
+        if not heads:
+            raise ValueError("--k-metrics-heads must be non-empty (or provide --head)")
+        if not tok_idxs:
+            raise ValueError("--k-metrics-tok-idxs must be non-empty")
+
+        min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
+        q0 = max(0, min(int(args.sink_attn_q_start), min_len))
+        q1 = min_len if args.sink_attn_q_end is None else max(0, min(int(args.sink_attn_q_end), min_len))
+        if q1 <= q0:
+            q0, q1 = 0, min_len
+        q_count = int(q1 - q0)
+
+        for t in tok_idxs:
+            if not (0 <= int(t) < min_len):
+                raise ValueError(f"[k-metrics-headscan] token idx {t} out of range for min_len={min_len}")
+        for L in layers:
+            if not (0 <= int(L) < num_layers):
+                raise ValueError(f"[k-metrics-headscan] layer {L} out of range (num_layers={num_layers})")
+        for h in heads:
+            if not (-1 <= int(h) < num_heads):
+                raise ValueError(f"[k-metrics-headscan] head {h} out of range (num_heads={num_heads})")
+        if any(int(h) == -1 for h in heads):
+            raise ValueError("[k-metrics-headscan] head=-1 (mean over heads) is not supported here; provide explicit head indices")
+
+        # accumulators: per layer -> per head -> lists
+        K_vecs = {L: {h: {t: [] for t in tok_idxs} for h in heads} for L in layers}
+        Q_vecs = {L: {h: [] for h in heads} for L in layers}
+        COS = {L: {h: {t: [] for t in tok_idxs} for h in heads} for L in layers}
+
+        store = {}
+        handles = _capture_qkv_multi(model, layers, store)
+        try:
+            for input_ids, base_pos in tqdm(tokenized, desc=f"[k-metrics] Collecting Q/K (layers={layers})", position=0, leave=False):
+                for L in list(store.keys()):
+                    store[L].clear()
+                _ = prefill(model, input_ids, base_pos)
+
+                for L in layers:
+                    qkv = store.get(L, None)
+                    if not qkv:
+                        continue
+                    Q = qkv["q"]  # [B,H,S,D] cpu float
+                    K = qkv["k"]
+                    for h in heads:
+                        q_mat = Q[0, int(h), q0:q1].to(dtype=torch.float32)  # [Q,D]
+                        Q_vecs[L][h].append(q_mat)
+                        for t in tok_idxs:
+                            k_vec = K[0, int(h), int(t)].to(dtype=torch.float32)  # [D]
+                            K_vecs[L][h][t].append(k_vec)
+                            cos = F.cosine_similarity(q_mat, k_vec.unsqueeze(0).expand_as(q_mat), dim=1)
+                            COS[L][h][t].append(cos.detach().cpu())
+        finally:
+            for h in handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+
+        col_names = [f"tok{t}" for t in tok_idxs]
+        print()
+        print(f"[K metrics headscan] q_range=[{q0},{q1}) q_count={q_count} prompts={len(tokenized)} layers={layers} heads={heads}")
+
+        for L in layers:
+            for h in heads:
+                XQ = torch.cat(Q_vecs[L][h], dim=0) if Q_vecs[L][h] else None  # [P*Q,D]
+                if XQ is None or XQ.numel() == 0:
+                    continue
+                XQ_c = XQ - XQ.mean(dim=0, keepdim=True)
+
+                spread_vals = []
+                norm_vals = []
+                cos_vals = []
+                cos_c_vals = []
+                frac_vals = []
+
+                for t in tok_idxs:
+                    Xk = torch.stack(K_vecs[L][h][t], dim=0)  # [P,D]
+                    spread_vals.append(_cloud_radius(Xk))
+                    norm_vals.append(_mean_vec_norm(Xk))
+
+                    # cos(Q, K): average over prompts and query positions (paired by prompt via concatenation order)
+                    cs = torch.cat(COS[L][h][t], dim=0) if COS[L][h][t] else torch.tensor([])
+                    cos_vals.append(float(cs.mean().item()) if cs.numel() > 0 else 0.0)
+
+                    # centered cosine: pair each query with its prompt's K (repeat_interleave by q_count)
+                    Xk_c = Xk - Xk.mean(dim=0, keepdim=True)
+                    Xk_rep_c = Xk_c.repeat_interleave(q_count, dim=0)
+                    cc = F.cosine_similarity(XQ_c, Xk_rep_c, dim=1)
+                    cos_c_vals.append(float(cc.mean().item()))
+
+                    # frac of Q energy along mean(K)
+                    mu = Xk.mean(dim=0)
+                    frac_vals.append(_frac_energy_on_direction(XQ, mu))
+
+                metrics = [
+                    ("spread_radius", spread_vals, "sci"),
+                    ("mean_norm", norm_vals, "sci"),
+                    ("cos(Q, K)", cos_vals, "float"),
+                    ("cos_centered(Q, K)", cos_c_vals, "float"),
+                    ("frac_Q_along_mean_K", frac_vals, "float"),
+                ]
+                title = f"[K metrics multiQ] layer={int(L)} head={int(h)} q=[{q0},{q1})"
+                _print_metrics_table(metrics, col_names, title=title)
+                print()
+
+        return
+
     def _run_scan_pass(scan_layers, rope_overrides_local):
         per_layer_acc = {
-            L: {"k_norm": [], "v_norm": [], "postln_norm": [], "out_norm": [], "cos": [], "sink_attn": []}
+            L: {"k_norm": [], "v_norm": [], "postln_norm": [], "out_norm": [], "cos": [], "sink_attn": [], "sink_attn_heads": []}
             for L in scan_layers
         }
         per_layer_kvecs = {L: [] for L in scan_layers}
@@ -919,15 +1252,32 @@ def main():
                         postln_norm = float(torch.log(h_sink.norm().clamp_min(EPS)).item())
                         out_norm = float(torch.log(out_sink.norm().clamp_min(EPS)).item())
 
-                        hm = _pick_head_with_caches(model, attns, L, args.head)
-                        sink_slice = hm[4:, sink_idx]
+                        q0 = max(0, min(int(args.sink_attn_q_start), min_len))
+                        q1 = min_len if args.sink_attn_q_end is None else max(0, min(int(args.sink_attn_q_end), min_len))
+                        if q1 <= q0:
+                            q0, q1 = 0, min_len
+                        sink_head = args.head if args.sink_attn_head is None else int(args.sink_attn_head)
+                        # Compute sink-attn per head (robust to lower-attn cache)
+                        if hasattr(model, "_lower_attn_cache") and (L in model._lower_attn_cache):
+                            attn_full = model._lower_attn_cache[L]  # already cpu float
+                        else:
+                            attn_full = attns[L]
+                        attn_full = attn_full.detach().float().cpu()  # [B, H, Q, K]
+                        sink_probs = attn_full[0, :, q0:q1, sink_idx]  # [H, Q]
+                        sink_attn_heads = sink_probs.mean(dim=1).numpy()  # [H]
+                        if sink_head == -1:
+                            sink_attn_val = float(sink_attn_heads.mean())
+                        else:
+                            sink_attn_val = float(sink_attn_heads[int(sink_head)])
 
                         per_layer_acc[L]["k_norm"].append(k_norm)
                         per_layer_acc[L]["v_norm"].append(v_norm)
                         per_layer_acc[L]["postln_norm"].append(postln_norm)
                         per_layer_acc[L]["out_norm"].append(out_norm)
                         per_layer_acc[L]["cos"].append(series[0][1])
-                        per_layer_acc[L]["sink_attn"].append(float(sink_slice.mean().item()))
+                        per_layer_acc[L]["sink_attn"].append(sink_attn_val)
+                        if args.plot_sink_attn_heads:
+                            per_layer_acc[L]["sink_attn_heads"].append(sink_attn_heads)
 
                         per_layer_kvecs[L].append(k[0, args.head, sink_idx].detach().cpu())
                         per_layer_vvecs[L].append(v_sink.detach().cpu())
@@ -947,6 +1297,7 @@ def main():
         
         if args.print_mode == "qkv":
             stats = []
+            sink_attn_heads_by_layer = {}
             for L in sorted(per_layer_acc.keys()):
                 acc = per_layer_acc[L]
                 kvar = 0.0
@@ -967,6 +1318,10 @@ def main():
                     Xo = torch.stack(per_layer_outvecs[L], dim=0)
                     outvar = _cloud_radius(Xo)
 
+                if args.plot_sink_attn_heads and acc["sink_attn_heads"]:
+                    Xh = np.stack(acc["sink_attn_heads"], axis=0)  # [N, H]
+                    sink_attn_heads_by_layer[L] = Xh.mean(axis=0)  # [H]
+
                 stats.append({
                     "k_norm": float(np.mean(acc["k_norm"])) if acc["k_norm"] else 0.0,
                     "v_norm": float(np.mean(acc["v_norm"])) if acc["v_norm"] else 0.0,
@@ -981,7 +1336,7 @@ def main():
                     "postln_spread": postlnvar,
                     "out_spread": outvar,
                 })
-            return stats, scan_maps, scan_titles
+            return stats, scan_maps, scan_titles, sink_attn_heads_by_layer
         else:
             for L in sorted(per_layer_maps.keys()):
                 if per_layer_maps[L]:
@@ -990,7 +1345,7 @@ def main():
                     # DEBUG
                     src = "CACHE" if (hasattr(model, "_lower_attn_cache") and L in model._lower_attn_cache) else "ATTNS"
                     scan_titles.append(f"Layer {L} Head {args.head} [{src}]")
-            return [], scan_maps, scan_titles
+            return [], scan_maps, scan_titles, {}
 
     stop_jobs = [("baseline", None)]
     if args.lower_attn:
@@ -1025,6 +1380,24 @@ def main():
                     only_return_sink_value=args.only_return_sink_value
                 )
 
+        ablate_handles = []
+        if args.ablate_sink_key:
+            if args.lower_attn:
+                raise ValueError("--ablate-sink-key cannot be combined with --lower-attn in the same run.")
+            ablate_layers = parse_int_list(args.ablate_layers)
+            ablate_heads = parse_int_list(args.ablate_heads)
+            print(f"[ablate_sink_key] layers={ablate_layers} heads={ablate_heads} sink_idx={args.sink_idx} factor={args.ablate_factor} renorm={args.ablate_renorm}")
+            ablate_handles = _install_sink_key_ablation_hooks(
+                model,
+                layers=ablate_layers,
+                head_idxs=ablate_heads,
+                sink_k_idx=int(args.sink_idx),
+                factor=float(args.ablate_factor),
+                renorm=bool(args.ablate_renorm),
+                q_start=args.ablate_q_start,
+                q_end=args.ablate_q_end,
+            )
+
         scan_stats = [] # aggregated per layer
         scan_maps, scan_titles = [], []
         summary = None
@@ -1032,10 +1405,15 @@ def main():
         if args.scan:
             # perturbed pass
             scan_layers = list(range(0, num_layers, args.scan_interval))
-            scan_stats, scan_maps, scan_titles = _run_scan_pass(scan_layers, rope_overrides)
+            scan_stats, scan_maps, scan_titles, sink_attn_heads_by_layer = _run_scan_pass(scan_layers, rope_overrides)
 
             if args.print_mode == "qkv" and len(scan_stats) > 0:
                 scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
+                if args.dump_scan_stats:
+                    out_path = _append_suffix(os.path.join(args.outdir, "scan_stats.json"), cur_suffix)
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        json.dump(scan_stats, f, indent=2)
+                    print(f"[dump] wrote scan_stats -> {out_path}")
                 q_label = f"Q[{args.target_idx}]" if args.target_idx is not None else "Q[last]"
                 _plot_progression(
                     scan_stats, args.outdir, key="k_norm", ylabel=f"||K[{args.sink_idx}]||",
@@ -1081,6 +1459,52 @@ def main():
                 _plot_heatmap_grid(
                     scan_maps, scan_titles, os.path.join(args.outdir, "scan_heatmaps.png"), rows=4,
                     suffix=cur_suffix, suptitle=grid_title,
+                )
+
+            # registration metric: attention sink onset curve
+            if args.print_mode == "qkv" and args.plot_sink_attn and len(scan_stats) > 0:
+                _plot_progression(
+                    scan_stats, args.outdir, key="sink_attn",
+                    ylabel=f"mean attn prob to K[{args.sink_idx}]",
+                    title=f"Sink-attention progression (sink_idx={args.sink_idx}, head={args.sink_attn_head if args.sink_attn_head is not None else args.head})",
+                    fname="scan_sink_attn.png", suffix=cur_suffix,
+                    mode="cos",
+                )
+
+            # registration metric: head-level decomposition
+            if args.print_mode == "qkv" and args.plot_sink_attn_heads and sink_attn_heads_by_layer:
+                layers_avail = sorted(sink_attn_heads_by_layer.keys())
+                rank_layer = int(args.sink_attn_head_rank_layer)
+                if rank_layer not in sink_attn_heads_by_layer:
+                    # pick closest available layer
+                    rank_layer = min(layers_avail, key=lambda L: abs(L - rank_layer))
+                prev_layer = max(layers_avail[0], rank_layer - 1)
+                if prev_layer not in sink_attn_heads_by_layer and layers_avail:
+                    prev_layer = layers_avail[max(0, layers_avail.index(rank_layer) - 1)]
+
+                v_rank = sink_attn_heads_by_layer[rank_layer]
+                if args.sink_attn_head_rank_metric == "jump" and prev_layer in sink_attn_heads_by_layer:
+                    v_prev = sink_attn_heads_by_layer[prev_layer]
+                    scores = v_rank - v_prev
+                    metric_str = f"jump(L{rank_layer}-L{prev_layer})"
+                else:
+                    scores = v_rank
+                    metric_str = f"value@L{rank_layer}"
+
+                topk = int(max(1, min(int(args.sink_attn_head_topk), scores.shape[0])))
+                order = np.argsort(scores)[::-1]
+                top_heads = [int(i) for i in order[:topk]]
+                print(f"[sink_attn heads] rank_metric={metric_str} top{topk}={top_heads}")
+                for h in top_heads:
+                    print(f"  head {h:>2d}: score={float(scores[h]):.4f}  value@L{rank_layer}={float(v_rank[h]):.4f}")
+
+                _plot_sink_attn_heads(
+                    sink_attn_heads_by_layer,
+                    args.outdir,
+                    fname="scan_sink_attn_heads_topk.png",
+                    top_heads=top_heads,
+                    title=f"Sink-attn by head (sink_idx={args.sink_idx}, top{topk} by {metric_str})",
+                    suffix=cur_suffix,
                 )
             
             if summary is not None:
@@ -1442,6 +1866,13 @@ def main():
                 _print_metrics_table(metrics, col_names, title=f"[Block Output L={L}]")
                 
         for pair in lower_attn_handles:
+            for h in pair:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+
+        for pair in ablate_handles:
             for h in pair:
                 try:
                     h.remove()

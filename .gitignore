@@ -3,3 +3,6 @@ __pycache__/
 attention_sink/results
 
 **/*_old.py
+
+# Local virtualenv (do not commit)
+sink_env/
