@@ -273,11 +273,49 @@ def _k_for_energy_frac_str(X, fracs=(0.25, 0.75, 0.99)):
     ks = _k_for_energy_frac(X, fracs=fracs)
     return _print_list(str(int(k)) for k in ks)
 
-def _pos_count(Z):
-    return float((Z > 0).sum(dim=1).float().mean().item())
+def _topk_1d(x, k=3, mode="pos"):
+    x = x.to(dtype=torch.float32)
+    k = int(max(0, min(int(k), int(x.numel()))))
+    if k <= 0:
+        return [], []
+    if mode == "pos":
+        score = torch.clamp(x, min=0.0)
+        vals, idx = torch.topk(score, k)
+        return idx.detach().cpu().tolist(), vals.detach().cpu().tolist()
+    if mode == "abs":
+        score = x.abs()
+        _, idx = torch.topk(score, k)
+        vals = x[idx]
+        return idx.detach().cpu().tolist(), vals.detach().cpu().tolist()
+    raise ValueError(f"Invalid mode: {mode}")
 
-def _pos_ratio(Z):
-    return float((Z > 0).to(torch.float32).mean().item())
+def _rank_in_row_abs(w, idx):
+    absw = w.abs()
+    order = torch.argsort(absw, descending=True)
+    return int((order == int(idx)).nonzero(as_tuple=False).item()) + 1
+
+def _rank_val_in_row_abs(w, idx):
+    w = w.to(dtype=torch.float32)
+    r = _rank_in_row_abs(w, int(idx))
+    v = float(w[int(idx)].item())
+    return int(r), v
+
+def _pos_count_in_row(w): # [D]
+    w = w.to(dtype=torch.float32)
+    return int((w > 0).sum().item())
+
+def _rms(x, dim=-1, keepdim=False, eps=EPS):
+    return (x.pow(2).mean(dim=dim, keepdim=keepdim) + eps).sqrt()
+
+def _val_quantiles_in_row(w, qs=(0.25, 0.75), descending=False):
+    w = w.to(dtype=torch.float32)
+    q = torch.tensor(list(qs), dtype=torch.float32, device=w.device)
+    vals = torch.quantile(w, q).detach().cpu().tolist()
+    out = [float(v) for v in vals]
+    return out[::-1] if descending else out
+
+def _pos_count(Z): # [N, D]
+    return float((Z > 0).sum(dim=1).float().mean().item())
 
 def _mean_vec_norm(X):
     if X is None or X.numel() == 0:
@@ -831,6 +869,7 @@ def main():
     p.add_argument("--find-value-subspace", action="store_true", help="Collect V at token 0 and non-sink positions")
     p.add_argument("--find-key-subspace", action="store_true", help="Collect K at token 0 and non-sink positions")
     p.add_argument("--find-mlp-subspace", action="store_true", help="Collect MLP internals at token 0 and non-sink positions")
+    p.add_argument("--mlp", nargs="+", choices=["z", "g", "g-row", "u"], default=None, help="When --find-mlp-subspace, choose which sections to print")
     p.add_argument("--pca-topk", type=int, default=6, help="Top-k PCA for groups of vectors")
     # decomposition of input
     p.add_argument("--decompose-ln", action="store_true", help="For --layer L, decompose the norm input LN(residual + attn + mlp) at L")
@@ -1195,6 +1234,8 @@ def main():
             tok_idxs = [0, 1, 8]
 
             if args.find_mlp_subspace:
+                mlp_sections = set(args.mlp) if args.mlp is not None else {"z", "g", "g-row", "u"}
+
                 mlp_data = _collect_mlp_internals_for_layer(model, L, tok_idxs, tokenized)
                 assert 0 in mlp_data["Y"]
 
@@ -1202,7 +1243,6 @@ def main():
                 mlp = model.model.layers[L].mlp
                 Wd = mlp.down_proj.weight.detach().to(dtype=torch.float32).cpu()
                 Wg = mlp.gate_proj.weight.detach().to(dtype=torch.float32).cpu()
-                d_model, d_mlp = int(Wd.shape[0]), int(Wd.shape[1])
 
                 k = 3
                 k_fracs = (0.25, 0.75, 0.99)
@@ -1214,15 +1254,8 @@ def main():
                 U0 = mlp_data["U"][0]; U1 = mlp_data["U"][1]; U8 = mlp_data["U"][8]
                 A0 = mlp_data["A"][0]; A1 = mlp_data["A"][1]; A8 = mlp_data["A"][8]
                 X0 = mlp_data["X"][0]; X1 = mlp_data["X"][1]; X8 = mlp_data["X"][8]
-                AttnIn0 = mlp_data["Attn_in"][0]
-                AttnOut0 = mlp_data["Attn_out"][0]
-
-                z0_topk_act_idx = _topk_activated_list_abs(Z0, k)
-                w_ref = F.normalize(Wd[:, z0_topk_act_idx[0]], dim=0)
-                wdown_cos_to_top1 = []
-                for i in z0_topk_act_idx:
-                    wi = F.normalize(Wd[:, i], dim=0)
-                    wdown_cos_to_top1.append(float(torch.dot(wi, w_ref).item()))
+                AttnIn0 = mlp_data["Attn_in"][0]; AttnIn1 = mlp_data["Attn_in"][1]; AttnIn8 = mlp_data["Attn_in"][8]
+                AttnOut0 = mlp_data["Attn_out"][0]; AttnOut1 = mlp_data["Attn_out"][1]; AttnOut8 = mlp_data["Attn_out"][8]
 
                 # sanity checks
                 diff0 = Z0 - A0 * U0
@@ -1231,172 +1264,316 @@ def main():
                 ).mean().item())
                 print(f"[Sanity check] reconstruction mean_rel_l2={z0_rel_l2:.4e}")
 
-                S_act0 = _topk_activated_set(Z0, k) # should be the same as S_proj
-                S_act1 = _topk_activated_set(Z1, k)
-                S_act8 = _topk_activated_set(Z8, k)
+                def _print_mlp_z_section():
+                    S_act0 = _topk_activated_set(Z0, k) # should be the same as S_proj
+                    S_act1 = _topk_activated_set(Z1, k)
+                    S_act8 = _topk_activated_set(Z8, k)
 
-                S_u0 = _topk_activated_set(U0, k)
-                S_a0 = _topk_activated_set(A0, k)
+                    z_norm_vals = [
+                        float(Z0.norm(dim=1).mean().item()),
+                        float(Z1.norm(dim=1).mean().item()),
+                        float(Z8.norm(dim=1).mean().item()),
+                    ]
+                    z_kfrac_vals = [
+                        _k_for_energy_frac_str(Z0, k_fracs),
+                        _k_for_energy_frac_str(Z1, k_fracs),
+                        _k_for_energy_frac_str(Z8, k_fracs),
+                    ]
+                    z_topk_idx_vals = [
+                        _print_list(map(str, _topk_activated_list_abs(Z0, k))),
+                        _print_list(map(str, _topk_activated_list_abs(Z1, k))),
+                        _print_list(map(str, _topk_activated_list_abs(Z8, k))),
+                    ]
 
-                z_norm_vals = [
-                    float(Z0.norm(dim=1).mean().item()),
-                    float(Z1.norm(dim=1).mean().item()),
-                    float(Z8.norm(dim=1).mean().item()),
-                ]
-                z_kfrac_vals = [
-                    _k_for_energy_frac_str(Z0, k_fracs),
-                    _k_for_energy_frac_str(Z1, k_fracs),
-                    _k_for_energy_frac_str(Z8, k_fracs),
-                ]
-                z_topk_idx_vals = [
-                    _print_list(map(str, _topk_activated_list_abs(Z0, k))),
-                    _print_list(map(str, _topk_activated_list_abs(Z1, k))),
-                    _print_list(map(str, _topk_activated_list_abs(Z8, k))),
-                ]
-                wdown_cos_to_top1_vals = [
-                    _print_list(f"{v:.2f}" for v in wdown_cos_to_top1),
-                    None,
-                    None,
-                ]
-                colnorm_vals = [
-                    _mean_topk_column_norm(Wd, S_act0),
-                    _mean_topk_column_norm(Wd, S_act1),
-                    _mean_topk_column_norm(Wd, S_act8),
-                ]
-                g_entropy_vals = [
-                    _activation_entropy(G0),
-                    _activation_entropy(G1),
-                    _activation_entropy(G8),
-                ]
-                a_entropy_vals = [
-                    _activation_entropy(A0),
-                    _activation_entropy(A1),
-                    _activation_entropy(A8),
-                ]
-                g_pos_ratio_vals = [
-                    f"{int(round(_pos_count(G0)))}/{int(G0.size(1))}",
-                    f"{int(round(_pos_count(G1)))}/{int(G1.size(1))}",
-                    f"{int(round(_pos_count(G8)))}/{int(G8.size(1))}",
-                ]
-                u_norm_vals = [
-                    float(U0.norm(dim=1).mean().item()),
-                    float(U1.norm(dim=1).mean().item()),
-                    float(U8.norm(dim=1).mean().item()),
-                ]
-                u_topk_idx_vals = [
-                    _print_list(map(str, _topk_activated_list_abs(U0, k))),
-                    _print_list(map(str, _topk_activated_list_abs(U1, k))),
-                    _print_list(map(str, _topk_activated_list_abs(U8, k))),
-                ]
-                a_norm_vals = [
-                    float(A0.norm(dim=1).mean().item()),
-                    float(A1.norm(dim=1).mean().item()),
-                    float(A8.norm(dim=1).mean().item()),
-                ]
-                a_kfrac_vals = [
-                    _k_for_energy_frac_str(A0, k_fracs),
-                    _k_for_energy_frac_str(A1, k_fracs),
-                    _k_for_energy_frac_str(A8, k_fracs),
-                ]
-                a_topk_idx_vals = [
-                    _print_list(map(str, _topk_activated_list_abs(torch.clamp(A0, min=0.0), k))),
-                    _print_list(map(str, _topk_activated_list_abs(torch.clamp(A1, min=0.0), k))),
-                    _print_list(map(str, _topk_activated_list_abs(torch.clamp(A8, min=0.0), k))),
-                ]
+                    z0_topk_act_idx = _topk_activated_list_abs(Z0, k)
+                    w_ref = F.normalize(Wd[:, z0_topk_act_idx[0]], dim=0)
+                    wdown_cos_to_top1 = []
+                    for i in z0_topk_act_idx:
+                        wi = F.normalize(Wd[:, i], dim=0)
+                        wdown_cos_to_top1.append(float(torch.dot(wi, w_ref).item()))
+                    wdown_cos_to_top1_vals = [
+                        _print_list(f"{v:.2f}" for v in wdown_cos_to_top1),
+                        None,
+                        None,
+                    ]
 
-                metrics_z = [
-                    ("inter_z_norm", z_norm_vals, "sci"),
-                    ("inter_z_k@frac_energy [.25, .75, .99]", z_kfrac_vals, ""),
-                    (f"inter_z_topk_act_idx k={k}", z_topk_idx_vals, ""),
-                    (f"W_down_cos_to_top1_aligned_vec k={k}", wdown_cos_to_top1_vals, ""),
-                    (f"W_down_topk_act_norm k={k}", colnorm_vals, "float"),
-                ]
-                metrics_ga = [
-                    ("gate_g_entropy", g_entropy_vals, "float"),
-                    ("gate_g_pos/all", g_pos_ratio_vals, ""),
-                    ("act_a_entropy", a_entropy_vals, "float"),
-                    ("act_a_norm", a_norm_vals, "sci"),
-                    (f"act_a_topk_act_idx k={k}", a_topk_idx_vals, ""),
-                    (f"act_a_k@frac_energy [.25, .75, .99]", a_kfrac_vals, ""),
-                ]
-                metrics_u = [
-                    ("up_u_norm", u_norm_vals, "sci"),
-                    (f"up_u_tok_act_idx k={k}", u_topk_idx_vals, ""),
-                ]
+                    colnorm_vals = [
+                        _mean_topk_column_norm(Wd, S_act0),
+                        _mean_topk_column_norm(Wd, S_act1),
+                        _mean_topk_column_norm(Wd, S_act8),
+                    ]
 
-                print()
-                _print_metrics_table(metrics_z, col_names, title=f"[MLP subspace: Z/W_d] layer={L}")
-                print()
-                _print_metrics_table(metrics_ga, col_names, title=f"[MLP subspace: G/A] layer={L}")
-                print()
-                _print_metrics_table(metrics_u, col_names, title=f"[MLP subspace: U] layer={L}")  
+                    metrics_z = [
+                        ("inter_z_norm", z_norm_vals, "sci"),
+                        ("inter_z_k@frac_energy [.25, .75, .99]", z_kfrac_vals, ""),
+                        (f"inter_z_topk_act_idx k={k}", z_topk_idx_vals, ""),
+                        (f"W_down_cos_to_top1_aligned_vec k={k}", wdown_cos_to_top1_vals, ""),
+                        (f"W_down_topk_act_norm k={k}", colnorm_vals, "float"),
+                    ]
+                    print()
+                    _print_metrics_table(metrics_z, col_names, title=f"[MLP subspace: Z/W_d] layer={L}")
+                
+                def _g_top_vals(G, mode):
+                    Gm = G.mean(dim=0)
+                    _idx, _vals = _topk_1d(Gm, k=3, mode=mode)
+                    return _print_list(str(int(round(float(v)))) for v in _vals)
+                
+                def _print_mlp_g_section():
+                    g_entropy_vals = [
+                        _activation_entropy(G0),
+                        _activation_entropy(G1),
+                        _activation_entropy(G8),
+                    ]
+                    a_entropy_vals = [
+                        _activation_entropy(A0),
+                        _activation_entropy(A1),
+                        _activation_entropy(A8),
+                    ]
+                    g_pos_ratio_vals = [
+                        f"{int(round(_pos_count(G0)))}/{int(G0.size(1))}",
+                        f"{int(round(_pos_count(G1)))}/{int(G1.size(1))}",
+                        f"{int(round(_pos_count(G8)))}/{int(G8.size(1))}",
+                    ]
+                    a_norm_vals = [
+                        float(A0.norm(dim=1).mean().item()),
+                        float(A1.norm(dim=1).mean().item()),
+                        float(A8.norm(dim=1).mean().item()),
+                    ]
+                    a_kfrac_vals = [
+                        _k_for_energy_frac_str(A0, k_fracs),
+                        _k_for_energy_frac_str(A1, k_fracs),
+                        _k_for_energy_frac_str(A8, k_fracs),
+                    ]
+                    a_topk_idx_vals = [
+                        _print_list(map(str, _topk_activated_list_abs(torch.clamp(A0, min=0.0), k))),
+                        _print_list(map(str, _topk_activated_list_abs(torch.clamp(A1, min=0.0), k))),
+                        _print_list(map(str, _topk_activated_list_abs(torch.clamp(A8, min=0.0), k))),
+                    ]
+                    g_top_abs_vals = [
+                        _g_top_vals(G0, "abs"),
+                        _g_top_vals(G1, "abs"),
+                        _g_top_vals(G8, "abs"),
+                    ]
 
-                probe_idx = [5723, 8518, 422]
-                probe_cols = [f"idx_{i}" for i in probe_idx]
-                norms_all, ranks_all = _row_norm_rank_desc(Wg)
-                cos_tok0, cos_tok1, cos_tok8 = [], [], []
-                w_norms, w_ranks = [], []
-                cos_to_top1 = []
-                frac_e_tok0, frac_e_tok1, frac_e_tok8 = [], [], []
-                cos_attnin_tok0, cos_attnout_tok0 = [], []
+                    g_top_pos_vals = [
+                        _g_top_vals(G0, "pos"),
+                        _g_top_vals(G1, "pos"),
+                        _g_top_vals(G8, "pos"),
+                    ]
 
-                w_ref = F.normalize(Wg[probe_idx[0], :].to(dtype=torch.float32), dim=0)
+                    metrics_ga = [
+                        ("gate_g_entropy", g_entropy_vals, "float"),
+                        ("gate_g_pos/all", g_pos_ratio_vals, ""),
+                        ("gate_g_max_vals (abs)", g_top_abs_vals, ""),
+                        ("gate_g_max_vals (pos)", g_top_pos_vals, ""),
+                        ("act_a_entropy", a_entropy_vals, "float"),
+                        ("act_a_norm", a_norm_vals, "sci"),
+                        (f"act_a_topk_act_idx k={k}", a_topk_idx_vals, ""),
+                        (f"act_a_k@frac_energy [.25, .75, .99]", a_kfrac_vals, ""),
+                    ]
 
-                for ii in probe_idx:
-                    wi = Wg[ii, :].to(dtype=torch.float32)
-                    cos_tok0.append(_mean_cos_row_vs_X(wi, X0))
-                    cos_tok1.append(_mean_cos_row_vs_X(wi, X1))
-                    cos_tok8.append(_mean_cos_row_vs_X(wi, X8))
-                    cos_attnin_tok0.append(_mean_cos_row_vs_X(wi, AttnIn0))
-                    cos_attnout_tok0.append(_mean_cos_row_vs_X(wi, AttnOut0))
-                    frac_e_tok0.append(_mean_frac_energy_on_dir(X0, wi))
-                    frac_e_tok1.append(_mean_frac_energy_on_dir(X1, wi))
-                    frac_e_tok8.append(_mean_frac_energy_on_dir(X8, wi))
-                    w_norms.append(float(norms_all[ii].item()))
-                    w_ranks.append(str(int(ranks_all[ii].item())))
+                    print()
+                    _print_metrics_table(metrics_ga, col_names, title=f"[MLP subspace: G/A] layer={L}")
+
+                def _print_mlp_u_section():
+                    u_norm_vals = [
+                        float(U0.norm(dim=1).mean().item()),
+                        float(U1.norm(dim=1).mean().item()),
+                        float(U8.norm(dim=1).mean().item()),
+                    ]
+                    u_topk_idx_vals = [
+                        _print_list(map(str, _topk_activated_list_abs(U0, k))),
+                        _print_list(map(str, _topk_activated_list_abs(U1, k))),
+                        _print_list(map(str, _topk_activated_list_abs(U8, k))),
+                    ]
+    
+                    metrics_u = [
+                        ("up_u_norm", u_norm_vals, "sci"),
+                        (f"up_u_tok_act_idx k={k}", u_topk_idx_vals, ""),
+                    ]
+
+                    print()
+                    _print_metrics_table(metrics_u, col_names, title=f"[MLP subspace: U] layer={L}")  
+
+                def _print_mlp_g_row_section():
+                    probe_idx = [5723, 8518, 422]
+                    probe_cols = [f"idx_{i}" for i in probe_idx]
+                    norms_all, ranks_all = _row_norm_rank_desc(Wg)
+
+                    w_norms, w_ranks = [], []
+                    cos_to_top1 = []
+                    cos_to_gamma = []
+                    w_ref = F.normalize(Wg[probe_idx[0], :].to(dtype=torch.float32), dim=0)
+                    gamma = model.model.layers[L].post_attention_layernorm.weight.detach().to(dtype=torch.float32).cpu()
+                    gamma_normed = F.normalize(gamma, dim=0)
+                    _g_abs = gamma.abs()
+                    gamma_topk_idx = torch.topk(_g_abs, k=2).indices.detach().cpu().tolist()
                     
-                    wi_normed = F.normalize(wi, dim=0)
-                    cos_to_top1.append(float(torch.dot(wi_normed, w_ref).item()))
+                    for ii in probe_idx:
+                        wi = Wg[ii, :].to(dtype=torch.float32)
+                        w_norms.append(float(norms_all[ii].item()))
+                        w_ranks.append(str(int(ranks_all[ii].item())))
+                        wi_normed = F.normalize(wi, dim=0)
+                        cos_to_top1.append(float(torch.dot(wi_normed, w_ref).item()))
+                        cos_to_gamma.append(float(torch.dot(wi_normed, gamma_normed).item()))
 
-                metrics_g_vecs = [
-                    ("cos(w_i, X_tok0)", cos_tok0, "float"),
-                    ("cos(w_i, X_tok1)", cos_tok1, "float"),
-                    ("cos(w_i, X_tok8)", cos_tok8, "float"),
-                    ("cos(w_i, AttnIn_tok0)", cos_attnin_tok0, "float"),
-                    ("cos(w_i, AttnOut_tok0)", cos_attnout_tok0, "float"),
-                    ("frac_energy(X_tok0 -> w_i)", frac_e_tok0, "float"),
-                    ("frac_energy(X_tok1 -> w_i)", frac_e_tok1, "float"),
-                    ("frac_energy(X_tok8 -> w_i)", frac_e_tok8, "float"),
-                    ("||w_i||", w_norms, "sci"),
-                    ("rank(||w||) (1=largest)", w_ranks, ""),
-                    ("cos(w_i, w_top1)", cos_to_top1, "float"),
-                ]
-                print()
-                _print_metrics_table(metrics_g_vecs, probe_cols, title=f"[MLP gate row vectors] layer={L}")
+                    cos_X_tok0, cos_X_tok1, cos_X_tok8 = [], [], []
+                    cos_Xpre_tok0, cos_Xpre_tok1, cos_Xpre_tok8 = [], [], []
+                    frac_e_tok0, frac_e_tok1, frac_e_tok8 = [], [], []
+                    dot_pre_tok0, dot_pre_tok1, dot_pre_tok8 = [], [], []
+                    dot_post_tok0, dot_post_tok1, dot_post_tok8 = [], [], []
 
-                g_top_idx = _topk_activated_list_abs(G0, k)
-                gate_row_norms, frac_x0, frac_x1, frac_x8 = [], [], [], []
-                for ii in g_top_idx:
-                    w = Wg[ii, :]
-                    gate_row_norms.append(float(w.norm().item()))
-                    frac_x0.append(_frac_energy_on_direction(X0, w))
-                    frac_x1.append(_frac_energy_on_direction(X1, w))
-                    frac_x8.append(_frac_energy_on_direction(X8, w))
+                    # gamma metrics
+                    rk1, rk2 = [], []
+                    v1, v2 = [], []
+                    pos_counts = []
+                    q25, q75 = [], []
+                    all_dim = int(Wg.shape[1])
 
-                col_names_g = [f"top{j+1} row" for j in range(len(g_top_idx))]
-                idx_str = [str(i) for i in g_top_idx]
-                metrics_g = [
-                    ("idx", idx_str, ""),
-                    ("||w||", gate_row_norms, "sci"),
-                    ("frac_energy_X_tok0_on_vec", frac_x0, "float"),
-                    ("frac_energy_X_tok1_on_vec", frac_x1, "float"),
-                    ("frac_energy_X_tok8_on_vec", frac_x8, "float"),
-                ]
-                # _print_metrics_table(
-                #     metrics_g,
-                #     col_names_g,
-                #     title=f"[Gate subspace] layer={L}",
+                    S0 = (AttnIn0 + AttnOut0).float()
+                    S1 = (AttnIn1 + AttnOut1).float()
+                    S8 = (AttnIn8 + AttnOut8).float()
+
+                    for ii in probe_idx:
+                        wi = Wg[ii, :].to(dtype=torch.float32)
+                        cos_X_tok0.append(_mean_cos_row_vs_X(wi, X0))
+                        cos_X_tok1.append(_mean_cos_row_vs_X(wi, X1))
+                        cos_X_tok8.append(_mean_cos_row_vs_X(wi, X8))
+
+                        cos_Xpre_tok0.append(_mean_cos_row_vs_X(wi, S0))
+                        cos_Xpre_tok1.append(_mean_cos_row_vs_X(wi, S1))
+                        cos_Xpre_tok8.append(_mean_cos_row_vs_X(wi, S8))
+
+                        frac_e_tok0.append(_mean_frac_energy_on_dir(X0, wi))
+                        frac_e_tok1.append(_mean_frac_energy_on_dir(X1, wi))
+                        frac_e_tok8.append(_mean_frac_energy_on_dir(X8, wi))
+
+                        dot_pre_tok0.append((S0 @ wi).mean().item())
+                        dot_pre_tok1.append((S1 @ wi).mean().item())
+                        dot_pre_tok8.append((S8 @ wi).mean().item())
+
+                        dot_post_tok0.append((X0 @ wi).mean().item())
+                        dot_post_tok1.append((X1 @ wi).mean().item())
+                        dot_post_tok8.append((X8 @ wi).mean().item())
+
+                        r, vv = _rank_val_in_row_abs(wi, gamma_topk_idx[0])
+                        rk1.append(int(r)); v1.append(float(vv))
+                        r, vv = _rank_val_in_row_abs(wi, gamma_topk_idx[1])
+                        rk2.append(int(r)); v2.append(float(vv))
+                        pos_counts.append(_pos_count_in_row(wi))
+                        qv = _val_quantiles_in_row(wi, qs=(0.25, 0.75), descending=True)
+                        q25.append(float(qv[0])); q75.append(float(qv[1]))
+
+                    x_norm_vals = [
+                        float(X0.norm(dim=1).mean().item()),
+                        float(X1.norm(dim=1).mean().item()),
+                        float(X8.norm(dim=1).mean().item()),
+                    ]
+                    sum_norm_vals = [
+                        float((AttnIn0 + AttnOut0).norm(dim=1).mean().item()),
+                        float((AttnIn1 + AttnOut1).norm(dim=1).mean().item()),
+                        float((AttnIn8 + AttnOut8).norm(dim=1).mean().item()),
+                    ]
+                    x_pre_gamma_vals = [
+                        float(S0[:, gamma_topk_idx[0]].mean().item()),
+                        float(S1[:, gamma_topk_idx[0]].mean().item()),
+                        float(S8[:, gamma_topk_idx[0]].mean().item()),
+                    ]
+                    x_pre_rms_gamma_vals = [
+                        float((S0[:, gamma_topk_idx[0]] / _rms(S0, dim=1)).mean().item()),
+                        float((S1[:, gamma_topk_idx[0]] / _rms(S1, dim=1)).mean().item()),
+                        float((S8[:, gamma_topk_idx[0]] / _rms(S8, dim=1)).mean().item()),
+                    ]
+
+                    def _pack3(vals):
+                        return _print_list(f"{float(v):.2f}" for v in vals)
+                    
+                    def _pack3_int(vals):
+                        return _print_list(str(int(v)) for v in vals)
+
+                    metrics_gate_tok = [
+                        ("frac_energy(X -> row)", [_pack3(frac_e_tok0), _pack3(frac_e_tok1), _pack3(frac_e_tok8)], ""),
+                        ("||X_pre|| (pre-norm)", [f"{v:.2f}" for v in sum_norm_vals], ""),
+                        ("||X|| (post-norm)", [f"{v:.2f}" for v in x_norm_vals], ""),
+                        ("cos(row_vec @ X)", [_pack3(cos_X_tok0), _pack3(cos_X_tok1), _pack3(cos_X_tok8)], ""),
+                        ("cos(row_vec @ X_pre)", [_pack3(cos_Xpre_tok0), _pack3(cos_Xpre_tok1), _pack3(cos_Xpre_tok8)], ""),
+                        ("X_pre @ row_vec", [_pack3_int(dot_pre_tok0), _pack3_int(dot_pre_tok1), _pack3_int(dot_pre_tok8)], ""),
+                        ("X @ row_vec", [_pack3_int(dot_post_tok0), _pack3_int(dot_post_tok1), _pack3_int(dot_post_tok8)], ""),
+                        (f"X_pre(@gamma[{gamma_topk_idx[0]}])", [f"{v:.2f}" for v in x_pre_gamma_vals], ""),
+                        (f"X_pre_rms(@gamma[{gamma_topk_idx[0]}])", [f"{v:.2f}" for v in x_pre_rms_gamma_vals], ""),
+                    ]
+                    print()
+                    _print_metrics_table(metrics_gate_tok, col_names, title=f"[MLP gate row vectors @ idx={probe_idx}] layer={L}")
+
+                    metrics_gate_rows = [
+                        ("||w_i||", w_norms, "sci"),
+                        ("rank(||w||) (1=largest)", w_ranks, ""),
+                        ("cos(w_i, w_top1)", cos_to_top1, "float"),
+                        ("cos(w_i, gamma)", cos_to_gamma, "float"),
+                        (f"rank(gamma[{gamma_topk_idx[0]}])", [f"{rk1[i]}({v1[i]:+.1f})" for i in range(3)], ""),
+                        (f"rank(gamma[{gamma_topk_idx[1]}])", [f"{rk2[i]}({v2[i]:+.1f})" for i in range(3)], ""),
+                        ("wi_pos/all", [f"{pos_counts[i]}/{all_dim}" for i in range(3)], ""),
+                        ("val_percentile(w_i) [.25, .75]", [f"[{q25[i]:+.2f}, {q75[i]:+.2f}]" for i in range(3)], ""),
+                    ]
+                    print()
+                    _print_metrics_table(metrics_gate_rows, probe_cols, title=f"[MLP gate row properties] layer={L}")
+
+                if "z" in mlp_sections:
+                    _print_mlp_z_section()
+                if "g" in mlp_sections:
+                    _print_mlp_g_section()
+                if "u" in mlp_sections:
+                    _print_mlp_u_section()
+                if "g-row" in mlp_sections:
+                    _print_mlp_g_row_section()
+
+                # gamma_top_idx = [2276, 3010]
+                # print(
+                #     "gamma idx | row=5723 | row=8518 | row=422 || X_pre tok0 | tok1 | tok8"
+                #     " || Ain tok0 | Aout tok0"
                 # )
+                # for j in gamma_top_idx:
+                #     w0 = Wg[5723].float()
+                #     w1 = Wg[8518].float()
+                #     w2 = Wg[422].float()
+                #     r0 = rank_in_row(w0, j)
+                #     r1 = rank_in_row(w1, j)
+                #     r2 = rank_in_row(w2, j)
+                #     v0 = float(w0[j].item())
+                #     v1 = float(w1[j].item())
+                #     v2 = float(w2[j].item())
+                #     x0 = float(S0[:, j].mean().item())
+                #     x1 = float(S1[:, j].mean().item())
+                #     x8 = float(S8[:, j].mean().item())
+                #     ain0 = float(AttnIn0[:, j].mean())
+                #     aout0 = float(AttnOut0[:, j].mean())
+                #     print(
+                #         f"{j:8d} | "
+                #         f"rank={r0:5d} {v0:+.1f} | "
+                #         f"rank={r1:5d} {v1:+.1f} | "
+                #         f"rank={r2:5d} {v2:+.1f} ||"
+                #         f"{x0:7.3f} | {x1:7.3f} | {x8:7.3f} ||"
+                #         f"{ain0:7.3f} | {aout0:7.3f}"
+                #     )
+
+                # def _proj_stats(V, w):
+                #     V = V.to(dtype=torch.float32)
+                #     w = F.normalize(w.to(dtype=torch.float32, device=V.device), dim=0)
+                #     dot = (V @ w)
+                #     cos = dot / V.norm(dim=-1).clamp_min(EPS)
+                #     return float(dot.mean().item()), float(cos.mean().item())
+
+                # w3 = Wg[8518]
+
+                # dot_in, cos_in = _proj_stats(AttnIn0, w3)
+                # dot_out, cos_out = _proj_stats(AttnOut0, w3)
+                # dot_sum, cos_sum = _proj_stats(AttnIn0 + AttnOut0, w3)
+                # dot_x, cos_x = _proj_stats(X0, w3)
+
+                # print(f"in : dot={dot_in:.3f} cos={cos_in:.3f}")
+                # print(f"out: dot={dot_out:.3f} cos={cos_out:.3f}")
+                # print(f"sum: dot={dot_sum:.3f} cos={cos_sum:.3f}")
+                # print(f"x  : dot={dot_x:.3f} cos={cos_x:.3f}")
 
             if args.decompose_output:
                 raw_components = _collect_raw_components_for_layer(
