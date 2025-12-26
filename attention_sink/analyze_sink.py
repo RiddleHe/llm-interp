@@ -1408,6 +1408,8 @@ def main():
                     gamma_normed = F.normalize(gamma, dim=0)
                     _g_abs = gamma.abs()
                     gamma_topk_idx = torch.topk(_g_abs, k=2).indices.detach().cpu().tolist()
+                    gamma_top_idx = gamma_topk_idx[0]
+                    gamma_top_val = float(gamma[gamma_top_idx].item())
                     
                     for ii in probe_idx:
                         wi = Wg[ii, :].to(dtype=torch.float32)
@@ -1419,7 +1421,6 @@ def main():
 
                     cos_X_tok0, cos_X_tok1, cos_X_tok8 = [], [], []
                     cos_Xpre_tok0, cos_Xpre_tok1, cos_Xpre_tok8 = [], [], []
-                    frac_e_tok0, frac_e_tok1, frac_e_tok8 = [], [], []
                     dot_pre_tok0, dot_pre_tok1, dot_pre_tok8 = [], [], []
                     dot_post_tok0, dot_post_tok1, dot_post_tok8 = [], [], []
 
@@ -1434,6 +1435,10 @@ def main():
                     S1 = (AttnIn1 + AttnOut1).float()
                     S8 = (AttnIn8 + AttnOut8).float()
 
+                    S0_rms = S0 / _rms(S0, dim=1, keepdim=True)
+                    S1_rms = S1 / _rms(S1, dim=1, keepdim=True)
+                    S8_rms = S8 / _rms(S8, dim=1, keepdim=True)
+
                     for ii in probe_idx:
                         wi = Wg[ii, :].to(dtype=torch.float32)
                         cos_X_tok0.append(_mean_cos_row_vs_X(wi, X0))
@@ -1443,10 +1448,6 @@ def main():
                         cos_Xpre_tok0.append(_mean_cos_row_vs_X(wi, S0))
                         cos_Xpre_tok1.append(_mean_cos_row_vs_X(wi, S1))
                         cos_Xpre_tok8.append(_mean_cos_row_vs_X(wi, S8))
-
-                        frac_e_tok0.append(_mean_frac_energy_on_dir(X0, wi))
-                        frac_e_tok1.append(_mean_frac_energy_on_dir(X1, wi))
-                        frac_e_tok8.append(_mean_frac_energy_on_dir(X8, wi))
 
                         dot_pre_tok0.append((S0 @ wi).mean().item())
                         dot_pre_tok1.append((S1 @ wi).mean().item())
@@ -1469,7 +1470,12 @@ def main():
                         float(X1.norm(dim=1).mean().item()),
                         float(X8.norm(dim=1).mean().item()),
                     ]
-                    sum_norm_vals = [
+                    x_rms_norm_vals = [
+                        float(S0_rms.norm(dim=1).mean().item()),
+                        float(S1_rms.norm(dim=1).mean().item()),
+                        float(S8_rms.norm(dim=1).mean().item()),
+                    ]
+                    X_pre_norm_vals = [
                         float((AttnIn0 + AttnOut0).norm(dim=1).mean().item()),
                         float((AttnIn1 + AttnOut1).norm(dim=1).mean().item()),
                         float((AttnIn8 + AttnOut8).norm(dim=1).mean().item()),
@@ -1480,10 +1486,38 @@ def main():
                         float(S8[:, gamma_topk_idx[0]].mean().item()),
                     ]
                     x_pre_rms_gamma_vals = [
-                        float((S0[:, gamma_topk_idx[0]] / _rms(S0, dim=1)).mean().item()),
-                        float((S1[:, gamma_topk_idx[0]] / _rms(S1, dim=1)).mean().item()),
-                        float((S8[:, gamma_topk_idx[0]] / _rms(S8, dim=1)).mean().item()),
+                        float((S0_rms[:, gamma_top_idx]).mean().item()),
+                        float((S1_rms[:, gamma_top_idx]).mean().item()),
+                        float((S8_rms[:, gamma_top_idx]).mean().item()),
                     ]
+
+                    gamma_top_idx_2 = gamma_topk_idx[1]
+                    x_pre_rms_gamma2_vals = [
+                        float((S0_rms[:, gamma_top_idx_2]).mean().item()),
+                        float((S1_rms[:, gamma_top_idx_2]).mean().item()),
+                        float((S8_rms[:, gamma_top_idx_2]).mean().item()),
+                    ]
+
+                    def _top3_pos_idx_vals_str(X_rms, k=3):
+                        idx, vals = _topk_1d(X_rms.mean(dim=0), k=k, mode="pos")
+                        idx_str = _print_list(str(int(i)) for i in idx)
+                        vals_str = _print_list(f"{float(v):.2f}" for v in vals)
+                        return idx_str, vals_str
+                    x_pre_rms_top3_idx, x_pre_rms_top3_vals = [], []
+                    x_pre_rms_cos_gamma_vals = []
+
+                    gamma_u = F.normalize(gamma.to(dtype=torch.float32), dim=0)
+
+                    for Xr in [S0_rms, S1_rms, S8_rms]:
+                        ii, vv = _top3_pos_idx_vals_str(Xr, k=3)
+                        x_pre_rms_top3_idx.append(ii)
+                        x_pre_rms_top3_vals.append(vv)
+
+                        Xm = Xr.mean(dim=0).to(dtype=torch.float32)
+                        Xm_u = F.normalize(Xm, dim=0)
+                        x_pre_rms_cos_gamma_vals.append(
+                            f"{float(torch.dot(Xm_u, gamma_u).item()):.2f}"
+                        )
 
                     def _pack3(vals):
                         return _print_list(f"{float(v):.2f}" for v in vals)
@@ -1492,31 +1526,49 @@ def main():
                         return _print_list(str(int(v)) for v in vals)
 
                     metrics_gate_tok = [
-                        ("frac_energy(X -> row)", [_pack3(frac_e_tok0), _pack3(frac_e_tok1), _pack3(frac_e_tok8)], ""),
-                        ("||X_pre|| (pre-norm)", [f"{v:.2f}" for v in sum_norm_vals], ""),
+                        ("||X|| (pre-norm)", [f"{v:.2f}" for v in X_pre_norm_vals], ""),
+                        # ("||X|| (rms)", [f"{v:.2f}" for v in x_rms_norm_vals], ""),
                         ("||X|| (post-norm)", [f"{v:.2f}" for v in x_norm_vals], ""),
-                        ("cos(row_vec @ X)", [_pack3(cos_X_tok0), _pack3(cos_X_tok1), _pack3(cos_X_tok8)], ""),
                         ("cos(row_vec @ X_pre)", [_pack3(cos_Xpre_tok0), _pack3(cos_Xpre_tok1), _pack3(cos_Xpre_tok8)], ""),
+                        ("cos(row_vec @ X)", [_pack3(cos_X_tok0), _pack3(cos_X_tok1), _pack3(cos_X_tok8)], ""),
                         ("X_pre @ row_vec", [_pack3_int(dot_pre_tok0), _pack3_int(dot_pre_tok1), _pack3_int(dot_pre_tok8)], ""),
                         ("X @ row_vec", [_pack3_int(dot_post_tok0), _pack3_int(dot_post_tok1), _pack3_int(dot_post_tok8)], ""),
-                        (f"X_pre(@gamma[{gamma_topk_idx[0]}])", [f"{v:.2f}" for v in x_pre_gamma_vals], ""),
-                        (f"X_pre_rms(@gamma[{gamma_topk_idx[0]}])", [f"{v:.2f}" for v in x_pre_rms_gamma_vals], ""),
+                        # (f"X_pre(@gamma[{gamma_top_idx}])", [f"{v:.2f}" for v in x_pre_gamma_vals], ""),
+                        (f"X_pre_rms(@gamma[{gamma_top_idx}])", [f"{v:.2f}" for v in x_pre_rms_gamma_vals], ""),
+                        # (f"X_pre_rms(@gamma[{gamma_top_idx_2}])", [f"{v:.2f}" for v in x_pre_rms_gamma2_vals], ""),
+                        (f"X_pre_rms_top3_idx", x_pre_rms_top3_idx, ""),
+                        (f"X_pre_rms_top3_vals", x_pre_rms_top3_vals, ""),
+                        # (f"cos(X_pre_rms, gamma)", x_pre_rms_cos_gamma_vals, ""),
                     ]
                     print()
                     _print_metrics_table(metrics_gate_tok, col_names, title=f"[MLP gate row vectors @ idx={probe_idx}] layer={L}")
 
                     metrics_gate_rows = [
-                        ("||w_i||", w_norms, "sci"),
+                        # ("||w_i||", w_norms, "sci"),
                         ("rank(||w||) (1=largest)", w_ranks, ""),
                         ("cos(w_i, w_top1)", cos_to_top1, "float"),
-                        ("cos(w_i, gamma)", cos_to_gamma, "float"),
-                        (f"rank(gamma[{gamma_topk_idx[0]}])", [f"{rk1[i]}({v1[i]:+.1f})" for i in range(3)], ""),
-                        (f"rank(gamma[{gamma_topk_idx[1]}])", [f"{rk2[i]}({v2[i]:+.1f})" for i in range(3)], ""),
-                        ("wi_pos/all", [f"{pos_counts[i]}/{all_dim}" for i in range(3)], ""),
-                        ("val_percentile(w_i) [.25, .75]", [f"[{q25[i]:+.2f}, {q75[i]:+.2f}]" for i in range(3)], ""),
+                        # ("cos(w_i, gamma)", cos_to_gamma, "float"),
+                        (f"rank(gamma_top_1[{gamma_topk_idx[0]}])", [f"{rk1[i]}({v1[i]:+.1f})" for i in range(3)], ""),
+                        # (f"rank(gamma_top_2[{gamma_topk_idx[1]}])", [f"{rk2[i]}({v2[i]:+.1f})" for i in range(3)], ""),
+                        # ("wi_pos/all", [f"{pos_counts[i]}/{all_dim}" for i in range(3)], ""),
+                        # ("val_percentile(w_i) [.25, .75]", [f"[{q25[i]:+.2f}, {q75[i]:+.2f}]" for i in range(3)], ""),
                     ]
                     print()
                     _print_metrics_table(metrics_gate_rows, probe_cols, title=f"[MLP gate row properties] layer={L}")
+
+                    g_pos = torch.clamp(gamma, min=0.0)
+                    pos_vals, pos_idx = torch.topk(g_pos, k=3)
+                    abs_vals, abs_idx = torch.topk(gamma.abs(), k=3)
+                    gamma_metrics = [
+                        ("idx (pos)", [str(int(i)) for i in pos_idx.tolist()], ""),
+                        ("val (pos)", [f"{float(v):.2f}" for v in pos_vals.tolist()], ""),
+                        ("idx (abs)", [str(int(i)) for i in abs_idx.tolist()], ""),
+                        ("val (abs)", [f"{float(v):.2f}" for v in abs_vals.tolist()], ""),
+                    ]
+                    gamma_cols = ["top1", "top2", "top3"]
+
+                    print()
+                    _print_metrics_table(gamma_metrics, gamma_cols, title=f"[MLP gate gamma] layer={L}")
 
                 if "z" in mlp_sections:
                     _print_mlp_z_section()
@@ -1526,54 +1578,6 @@ def main():
                     _print_mlp_u_section()
                 if "g-row" in mlp_sections:
                     _print_mlp_g_row_section()
-
-                # gamma_top_idx = [2276, 3010]
-                # print(
-                #     "gamma idx | row=5723 | row=8518 | row=422 || X_pre tok0 | tok1 | tok8"
-                #     " || Ain tok0 | Aout tok0"
-                # )
-                # for j in gamma_top_idx:
-                #     w0 = Wg[5723].float()
-                #     w1 = Wg[8518].float()
-                #     w2 = Wg[422].float()
-                #     r0 = rank_in_row(w0, j)
-                #     r1 = rank_in_row(w1, j)
-                #     r2 = rank_in_row(w2, j)
-                #     v0 = float(w0[j].item())
-                #     v1 = float(w1[j].item())
-                #     v2 = float(w2[j].item())
-                #     x0 = float(S0[:, j].mean().item())
-                #     x1 = float(S1[:, j].mean().item())
-                #     x8 = float(S8[:, j].mean().item())
-                #     ain0 = float(AttnIn0[:, j].mean())
-                #     aout0 = float(AttnOut0[:, j].mean())
-                #     print(
-                #         f"{j:8d} | "
-                #         f"rank={r0:5d} {v0:+.1f} | "
-                #         f"rank={r1:5d} {v1:+.1f} | "
-                #         f"rank={r2:5d} {v2:+.1f} ||"
-                #         f"{x0:7.3f} | {x1:7.3f} | {x8:7.3f} ||"
-                #         f"{ain0:7.3f} | {aout0:7.3f}"
-                #     )
-
-                # def _proj_stats(V, w):
-                #     V = V.to(dtype=torch.float32)
-                #     w = F.normalize(w.to(dtype=torch.float32, device=V.device), dim=0)
-                #     dot = (V @ w)
-                #     cos = dot / V.norm(dim=-1).clamp_min(EPS)
-                #     return float(dot.mean().item()), float(cos.mean().item())
-
-                # w3 = Wg[8518]
-
-                # dot_in, cos_in = _proj_stats(AttnIn0, w3)
-                # dot_out, cos_out = _proj_stats(AttnOut0, w3)
-                # dot_sum, cos_sum = _proj_stats(AttnIn0 + AttnOut0, w3)
-                # dot_x, cos_x = _proj_stats(X0, w3)
-
-                # print(f"in : dot={dot_in:.3f} cos={cos_in:.3f}")
-                # print(f"out: dot={dot_out:.3f} cos={cos_out:.3f}")
-                # print(f"sum: dot={dot_sum:.3f} cos={cos_sum:.3f}")
-                # print(f"x  : dot={dot_x:.3f} cos={cos_x:.3f}")
 
             if args.decompose_output:
                 raw_components = _collect_raw_components_for_layer(
