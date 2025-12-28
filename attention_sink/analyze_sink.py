@@ -232,6 +232,43 @@ def _topk_list_from_scores(scores, k):
 
 def _topk_set_from_scores(scores, k):
     return set(_topk_list_from_scores(scores, k))
+
+def _freq_vote_topk_idx(Z, per_sample_k=3, mode="abs", min_freq=0.55):
+    assert Z.ndim == 2
+    Z = Z.to(dtype=torch.float32)
+    N, D = int(Z.size(0)), int(Z.size(1))
+
+    kk = int(max(0, min(int(per_sample_k), D)))
+
+    if mode == "abs":
+        score = Z.abs()
+    elif mode == "pos":
+        score = torch.clamp(Z, min=0.0)
+    else:
+        raise ValueError
+
+    idx = torch.topk(score, k=kk, dim=1, largest=True).indices
+    flat_idx = idx.reshape(-1) # [N * kk]
+
+    counts = torch.bincount(flat_idx, minlength=D).to(dtype=torch.float32)
+    freq = counts / float(N)
+
+    order = torch.argsort(freq, descending=True)
+    top1 = int(order[0].item())
+    top1_freq = float(freq[top1].item())
+
+    if top1_freq < min_freq:
+        return []
+
+    picked = []
+    for j in order.detach().cpu().tolist():
+        j = int(j)
+        if float(freq[j].item()) < float(min_freq):
+            break
+        picked.append(j)
+        if len(picked) >= kk:
+            break
+    return picked
     
 def _topk_activated_set(Z, k):
     if Z is None or Z.numel() == 0:
@@ -249,6 +286,8 @@ def _k_for_energy_frac(X, fracs=(0.25, 0.75, 0.99)):
     if X is None or X.numel() == 0:
         return [0 for _ in fracs]
     X = X.to(dtype=torch.float32)
+    if X.ndim == 1:
+        X = X.unsqueeze(0)
 
     e = (X ** 2).mean(dim=0) # per dim energy
     total = float(e.sum().clamp_min(EPS).item())
@@ -270,16 +309,99 @@ def _k_for_energy_frac(X, fracs=(0.25, 0.75, 0.99)):
     return ks
 
 def _k_for_energy_frac_str(X, fracs=(0.25, 0.75, 0.99)):
-    ks = _k_for_energy_frac(X, fracs=fracs)
-    return _print_list(str(int(k)) for k in ks)
+    if X is None or X.numel() == 0:
+        return "[]"
+    if X.ndim == 1:
+        X = X.unsqueeze(0)
+    ks = []
+    for i in range(int(X.size(0))):
+        ks.append(_k_for_energy_frac(X[i:i+1], fracs=fracs))
+    k = torch.tensor(ks, dtype=torch.float32)
+    mu = k.mean(dim=0)
+    sd = k.std(dim=0, unbiased=False)
+    parts = [_fmt_mu_sd(mu[j].item(), sd[j].item()) for j in range(int(mu.numel()))]
+    return _print_list(parts)
 
-def _mean_at_idx_list(Xmat, idx_list):
-    Xm = Xmat.to(dtype=torch.float32).mean(dim=0)
-    return [float(Xm[int(i)].item()) for i in idx_list]
+def _mean_std_scalar_str(x):
+    x = x.to(dtype=torch.float32)
+    mu = float(x.mean().item())
+    sd = float(x.std(unbiased=False).item())
+    return _fmt_mu_sd(mu, sd)
 
-def _mean_dim(Xmat, idx):
-    Xm = Xmat.to(dtype=torch.float32).mean(dim=0)
-    return float(Xm[int(idx)].item())
+def _mean_std_scalar_float_str(x, mu_digits=2, sd_digits=2):
+    x = x.to(dtype=torch.float32)
+    mu = float(x.mean().item())
+    sd = float(x.std(unbiased=False).item())
+    return _fmt_mu_sd_float(mu, sd, mu_digits=mu_digits, sd_digits=sd_digits)
+
+def _flip_negcol_stats_str(Gpre, Gpost, Wg, top_idx):
+    Gpre = Gpre.to(dtype=torch.float32)
+    Gpost = Gpost.to(dtype=torch.float32)
+    col = Wg[:, int(top_idx)].to(dtype=torch.float32, device=Gpre.device)
+    negcol = (col < 0).unsqueeze(0)
+
+    flip = (Gpre > 0) & (Gpost < 0)
+    flipped_cnt = flip.sum(dim=1).to(dtype=torch.float32)
+    neg_cnt = (flip & negcol).sum(dim=1).to(dtype=torch.float32)
+    
+    flipped_cnt_str = _mean_std_scalar_str(flipped_cnt)
+    neg_cnt_str = _mean_std_scalar_str(neg_cnt)
+    neg_over_flip_cnt_str = f"{neg_cnt_str}/{flipped_cnt_str}"
+
+    return neg_over_flip_cnt_str
+
+def _cos_to_rows_mu_sd_str(W_rows, X):
+    X = X.to(dtype=torch.float32)
+    Xu = F.normalize(X, dim=1)
+    out = []
+    for w in W_rows:
+        wu = F.normalize(w.to(dtype=torch.float32), dim=0)
+        c = (Xu @ wu)
+        out.append(_mean_std_scalar_float_str(c, mu_digits=2, sd_digits=2)) # [N]
+    return out
+
+def _dot_to_rows_mu_sd_str(W_rows, X):
+    X = X.to(dtype=torch.float32)
+    out = []
+    for w in W_rows:
+        w = w.to(dtype=torch.float32)
+        d = (X @ w)
+        out.append(_mean_std_scalar_str(d))
+    return out
+
+def _fmt_mu_sd_float(mu, sd, mu_digits=2, sd_digits=2):
+    mu_f = float(mu)
+    sd_f = float(sd)
+    return f"{mu_f:.{int(mu_digits)}f}±{sd_f:.{int(sd_digits)}f}"
+
+def _fmt_mu_sd(mu, sd):
+    mu_i = int(round(float(mu)))
+    sd_f = float(sd)
+    if sd_f < 0.05:
+        sd_s = "0"
+    elif sd_f < 100:
+        sd_s = str(int(round(sd_f)))
+    else:
+        exp = int(math.floor(math.log10(sd_f)))
+        mant = int(round(sd_f / 10 ** exp))
+        if mant == 10:
+            mant, exp = 1, exp + 1
+        sd_s = f"{mant}e{exp}"
+    return f"{mu_i}±{sd_s}"
+
+def _pack3_str(vals):
+    return _print_list(str(v) for v in vals)
+
+def _top3_pos_idx_vals_str(X, k=3):
+    idx, vals = _topk_1d(X.mean(dim=0), k=k, mode="pos")
+    return [int(i) for i in idx], [float(v) for v in vals]
+
+def _vals_at_fixed_idx_mu_sd_str(X, idx_list):
+    X = X.to(dtype=torch.float32)
+    out = []
+    for j in idx_list:
+        out.append(_mean_std_scalar_str(X[:, int(j)]))
+    return _print_list(out)
 
 def _topk_1d(x, k=3, mode="pos"):
     x = x.to(dtype=torch.float32)
@@ -322,13 +444,30 @@ def _val_quantiles_in_row(w, qs=(0.25, 0.75), descending=False):
     out = [float(v) for v in vals]
     return out[::-1] if descending else out
 
-def _pos_count(Z): # [N, D]
-    return float((Z > 0).sum(dim=1).float().mean().item())
+def _pos_count_stats(Z):
+    assert Z.ndim == 2
+    cnt = (Z > 0).sum(dim=1).to(dtype=torch.float32)
+    mu = float(cnt.mean().item())
+    sd = float(cnt.std(unbiased=False).item())
+    D = int(Z.size(1))
+    return mu, sd, D
+
+def _pos_all_mu_sd_str(Z):
+    mu, sd, D = _pos_count_stats(Z)
+    mu_sd = _fmt_mu_sd(mu, sd)
+    return f"{mu_sd}/{D}"
 
 def _mean_vec_norm(X):
     if X is None or X.numel() == 0:
         return 0.0
     return float(X.norm(dim=-1).mean().item())
+
+def _vec_norm_mu_sd_str(X):
+    X = X.to(dtype=torch.float32)
+    norms = X.norm(dim=1)
+    mu = float(norms.mean().item())
+    sd = float(norms.std(unbiased=False).item())
+    return _fmt_mu_sd(mu, sd)
 
 def _mean_or_zero(xs): return float(np.mean(xs)) if xs else 0.0
 
@@ -351,10 +490,34 @@ def _component_direction_stats(R, A, M):
     }
     return stats
 
-def _activation_entropy(Z):
-    Z2 = (Z ** 2).mean(dim=0)
-    p = Z2 / Z2.sum().clamp_min(EPS)
-    return float(-(p * (p + EPS).log()).sum().item())
+def _mean_activation_entropy(Z):
+    Z = Z.to(dtype=torch.float32)
+    assert Z.ndim == 2
+    Z2 = (Z ** 2).clamp_min(0.0)
+    denom = Z2.sum(dim=1, keepdim=True).clamp_min(EPS)
+    p = Z2 / denom
+    H = -(p * (p + EPS).log()).sum(dim=1)
+    return float(H.mean().item())
+
+def _topk_vals_mu_sd_str(Z, k=3, mode="abs"):
+    Z = Z.to(dtype=torch.float32)
+    assert Z.ndim == 2
+    k = int(max(0, min(int(k), int(Z.size(1)))))
+
+    if mode == "pos":
+        score = torch.clamp(Z, min=0.0)
+        vals, _ = torch.topk(score, k=k, dim=1, largest=True)
+    elif mode == "abs":
+        score = Z.abs()
+        _, idx = torch.topk(score, k=k, dim=1, largest=True)
+        vals = Z.gather(1, idx)
+    else:
+        raise ValueError
+
+    mu = vals.mean(dim=0)
+    sd = vals.std(dim=0, unbiased=False)
+    parts = [_fmt_mu_sd(mu[j].item(), sd[j].item()) for j in range(int(mu.numel()))]
+    return _print_list(parts)
 
 def _mean_topk_column_norm(Wd, idx_set):
     if not idx_set:
@@ -369,11 +532,6 @@ def _row_norm_rank_desc(W):
     rank = torch.empty_like(order)
     rank[order] = torch.arange(1, order.numel() + 1, device=order.device)
     return norms, rank
-
-def _mean_cos_row_vs_X(w_row, X):
-    w = F.normalize(w_row.to(dtype=torch.float32), dim=0)
-    Xu = F.normalize(X.to(dtype=torch.float32), dim=1)
-    return float((Xu @ w).mean().item())
 
 def _vec_neg_topk(vec, k=3):
     v = vec.detach().to(dtype=torch.float32)
@@ -672,6 +830,67 @@ def _pick_head_with_caches(model, attns, layer_idx, head_idx):
     return pick_head(attns, layer_idx, head_idx)
 
 # Plotting functions
+
+def _plot_per_gate_mean_contrib(Srms, gamma_base, gamma_alt, Wg, out_path, title):
+    Srms = Srms.to(dtype=torch.float32)
+    gb = gamma_base.to(dtype=torch.float32).view(1, -1)
+    ga = gamma_alt.to(dtype=torch.float32).view(1, -1)
+
+    Xb = Srms * gb
+    Xa = Srms * ga
+
+    Gb = Xb @ Wg.t()
+    Ga = Xa @ Wg.t()
+
+    mu_b = Gb.mean(dim=0).detach().cpu().numpy() # [D]
+    sd_b = Gb.std(dim=0, unbiased=False).detach().cpu().numpy()
+    mu_a = Ga.mean(dim=0).detach().cpu().numpy()
+    sd_a = Ga.std(dim=0, unbiased=False).detach().cpu().numpy()
+
+    idx = np.arange(mu_b.shape[0])
+    # idx = np.argsort(mu_b)
+
+    x = np.arange(len(idx))
+    plt.figure(figsize=(12, 3.8))
+    plt.errorbar(
+        x, mu_b[idx], yerr=sd_b[idx],
+        fmt=".", elinewidth=0.5, capsize=1, label="baseline (gamma)"
+    )
+    plt.errorbar(
+        x, mu_a[idx], yerr=sd_a[idx],
+        fmt=".", elinewidth=0.5, capsize=1, label="no_gamma_top1+2"
+    )
+    plt.axhline(0.0, color="black", linewidth=0.8)
+    plt.xlabel("gate neurons")
+    plt.ylabel("mean contribution ± std")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+def _plot_wg_col_distrib(Wg, top_idx, out_path, title, highlight_rows=None):
+    col = Wg[:, int(top_idx)].to(dtype=torch.float32).detach().cpu().numpy()
+    plt.figure(figsize=(7, 3.5))
+    counts, bins, _ = plt.hist(col, bins=200, alpha=0.6, label="all rows")
+    plt.axvline(0.0, color="black", linewidth=0.8)
+
+    if highlight_rows:
+        ymax = float(np.max(counts))
+        for r in highlight_rows:
+            r = int(r)
+            if 0 <= r < col.shape[0]:
+                x = float(col[r])
+                plt.axvline(x, linestyle="--", linewidth=1.0)
+                plt.text(x, 0.95 * ymax, f"j={r}", rotation=90, va="top", ha="right", fontsize=8)
+
+    plt.xlabel(f"Wg[:, {int(top_idx)}] value")
+    plt.ylabel("count")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
 
 def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", stats_b=None, mode=None):
     layers = sorted({s["layer"] for s in stats_a})
@@ -1300,9 +1519,9 @@ def main():
                     S_act8 = _topk_activated_set(Z8, k)
 
                     z_norm_vals = [
-                        float(Z0.norm(dim=1).mean().item()),
-                        float(Z1.norm(dim=1).mean().item()),
-                        float(Z8.norm(dim=1).mean().item()),
+                        _vec_norm_mu_sd_str(Z0),
+                        _vec_norm_mu_sd_str(Z1),
+                        _vec_norm_mu_sd_str(Z8),
                     ]
                     z_kfrac_vals = [
                         _k_for_energy_frac_str(Z0, k_fracs),
@@ -1310,12 +1529,12 @@ def main():
                         _k_for_energy_frac_str(Z8, k_fracs),
                     ]
                     z_topk_idx_vals = [
-                        _print_list(map(str, _topk_activated_list_abs(Z0, k))),
-                        _print_list(map(str, _topk_activated_list_abs(Z1, k))),
-                        _print_list(map(str, _topk_activated_list_abs(Z8, k))),
+                        _print_list(map(str, _freq_vote_topk_idx(Z0, per_sample_k=k, mode="abs"))),
+                        _print_list(map(str, _freq_vote_topk_idx(Z1, per_sample_k=k, mode="abs"))),
+                        _print_list(map(str, _freq_vote_topk_idx(Z8, per_sample_k=k, mode="abs"))),
                     ]
 
-                    z0_topk_act_idx = _topk_activated_list_abs(Z0, k)
+                    z0_topk_act_idx = _freq_vote_topk_idx(Z0, per_sample_k=k, mode="abs")
                     w_ref = F.normalize(Wd[:, z0_topk_act_idx[0]], dim=0)
                     wdown_cos_to_top1 = []
                     for i in z0_topk_act_idx:
@@ -1334,72 +1553,67 @@ def main():
                     ]
 
                     metrics_z = [
-                        ("inter_z_norm", z_norm_vals, "sci"),
-                        ("inter_z_k@frac_energy [.25, .75, .99]", z_kfrac_vals, ""),
-                        (f"inter_z_topk_act_idx k={k}", z_topk_idx_vals, ""),
+                        ("z_norm", z_norm_vals, "sci"),
+                        ("z_frac_energy [.25/.75/.99]", z_kfrac_vals, ""),
+                        (f"z_topk_act_idx k={k}", z_topk_idx_vals, ""),
                         (f"W_down_cos_to_top1_aligned_vec k={k}", wdown_cos_to_top1_vals, ""),
                         (f"W_down_topk_act_norm k={k}", colnorm_vals, "float"),
                     ]
                     print()
                     _print_metrics_table(metrics_z, col_names, title=f"[MLP subspace: Z/W_d] layer={L}")
                 
-                def _g_top_vals(G, mode):
-                    Gm = G.mean(dim=0)
-                    _idx, _vals = _topk_1d(Gm, k=3, mode=mode)
-                    return _print_list(str(int(round(float(v)))) for v in _vals)
-                
                 def _print_mlp_g_section():
                     g_entropy_vals = [
-                        _activation_entropy(G0),
-                        _activation_entropy(G1),
-                        _activation_entropy(G8),
+                        _mean_activation_entropy(G0),
+                        _mean_activation_entropy(G1),
+                        _mean_activation_entropy(G8),
                     ]
                     a_entropy_vals = [
-                        _activation_entropy(A0),
-                        _activation_entropy(A1),
-                        _activation_entropy(A8),
+                        _mean_activation_entropy(A0),
+                        _mean_activation_entropy(A1),
+                        _mean_activation_entropy(A8),
                     ]
                     g_pos_ratio_vals = [
-                        f"{int(round(_pos_count(G0)))}/{int(G0.size(1))}",
-                        f"{int(round(_pos_count(G1)))}/{int(G1.size(1))}",
-                        f"{int(round(_pos_count(G8)))}/{int(G8.size(1))}",
+                        _pos_all_mu_sd_str(G0),
+                        _pos_all_mu_sd_str(G1),
+                        _pos_all_mu_sd_str(G8),
                     ]
                     a_norm_vals = [
-                        float(A0.norm(dim=1).mean().item()),
-                        float(A1.norm(dim=1).mean().item()),
-                        float(A8.norm(dim=1).mean().item()),
+                        _vec_norm_mu_sd_str(A0),
+                        _vec_norm_mu_sd_str(A1),
+                        _vec_norm_mu_sd_str(A8)
                     ]
                     a_kfrac_vals = [
-                        _k_for_energy_frac_str(A0, k_fracs),
-                        _k_for_energy_frac_str(A1, k_fracs),
-                        _k_for_energy_frac_str(A8, k_fracs),
+                        _k_for_energy_frac_str(A0, (0.25, 0.50, 0.99)),
+                        _k_for_energy_frac_str(A1, (0.25, 0.50, 0.99)),
+                        _k_for_energy_frac_str(A8, (0.25, 0.50, 0.99)),
                     ]
                     a_topk_idx_vals = [
-                        _print_list(map(str, _topk_activated_list_abs(torch.clamp(A0, min=0.0), k))),
-                        _print_list(map(str, _topk_activated_list_abs(torch.clamp(A1, min=0.0), k))),
-                        _print_list(map(str, _topk_activated_list_abs(torch.clamp(A8, min=0.0), k))),
+                        _print_list(map(str, _freq_vote_topk_idx(A0, per_sample_k=k, mode="pos"))),
+                        _print_list(map(str, _freq_vote_topk_idx(A1, per_sample_k=k, mode="pos"))),
+                        _print_list(map(str, _freq_vote_topk_idx(A8, per_sample_k=k, mode="pos"))),
                     ]
                     g_top_abs_vals = [
-                        _g_top_vals(G0, "abs"),
-                        _g_top_vals(G1, "abs"),
-                        _g_top_vals(G8, "abs"),
+                        _topk_vals_mu_sd_str(G0, k=3, mode="abs"),
+                        _topk_vals_mu_sd_str(G1, k=3, mode="abs"),
+                        _topk_vals_mu_sd_str(G8, k=3, mode="abs"),
                     ]
 
                     g_top_pos_vals = [
-                        _g_top_vals(G0, "pos"),
-                        _g_top_vals(G1, "pos"),
-                        _g_top_vals(G8, "pos"),
+                        _topk_vals_mu_sd_str(G0, k=3, mode="pos"),
+                        _topk_vals_mu_sd_str(G1, k=3, mode="pos"),
+                        _topk_vals_mu_sd_str(G8, k=3, mode="pos"),
                     ]
 
                     metrics_ga = [
-                        ("gate_g_entropy", g_entropy_vals, "float"),
-                        ("gate_g_pos/all", g_pos_ratio_vals, ""),
-                        ("gate_g_max_vals (abs)", g_top_abs_vals, ""),
-                        ("gate_g_max_vals (pos)", g_top_pos_vals, ""),
-                        ("act_a_entropy", a_entropy_vals, "float"),
-                        ("act_a_norm", a_norm_vals, "sci"),
-                        (f"act_a_topk_act_idx k={k}", a_topk_idx_vals, ""),
-                        (f"act_a_k@frac_energy [.25, .75, .99]", a_kfrac_vals, ""),
+                        ("g_entropy", g_entropy_vals, "float"),
+                        ("g_pos/all", g_pos_ratio_vals, ""),
+                        ("g_max_vals (abs)", g_top_abs_vals, ""),
+                        ("g_max_vals (pos)", g_top_pos_vals, ""),
+                        ("a_entropy", a_entropy_vals, "float"),
+                        ("a_norm", a_norm_vals, "sci"),
+                        (f"a_topk_act_idx k={k}", a_topk_idx_vals, ""),
+                        (f"a_frac_energy [.25/.5/.99]", a_kfrac_vals, ""),
                     ]
 
                     print()
@@ -1412,9 +1626,9 @@ def main():
                         float(U8.norm(dim=1).mean().item()),
                     ]
                     u_topk_idx_vals = [
-                        _print_list(map(str, _topk_activated_list_abs(U0, k))),
-                        _print_list(map(str, _topk_activated_list_abs(U1, k))),
-                        _print_list(map(str, _topk_activated_list_abs(U8, k))),
+                        _print_list(map(str, _freq_vote_topk_idx(U0, per_sample_k=k, mode="abs"))),
+                        _print_list(map(str, _freq_vote_topk_idx(U1, per_sample_k=k, mode="abs"))),
+                        _print_list(map(str, _freq_vote_topk_idx(U8, per_sample_k=k, mode="abs"))),
                     ]
     
                     metrics_u = [
@@ -1445,34 +1659,31 @@ def main():
                         cos_to_top1.append(float(torch.dot(wi_normed, w_ref).item()))
                         cos_to_gamma.append(float(torch.dot(wi_normed, gamma_normed).item()))
 
-                    cos_X_tok0, cos_X_tok1, cos_X_tok8 = [], [], []
-                    cos_Xpre_tok0, cos_Xpre_tok1, cos_Xpre_tok8 = [], [], []
-                    dot_pre_tok0, dot_pre_tok1, dot_pre_tok8 = [], [], []
-                    dot_post_tok0, dot_post_tok1, dot_post_tok8 = [], [], []
+                    W_rows = [Wg[ii, :].to(dtype=torch.float32) for ii in probe_idx]
+
+                    cos_X_tok0 = _cos_to_rows_mu_sd_str(W_rows, X0)
+                    cos_X_tok1 = _cos_to_rows_mu_sd_str(W_rows, X1)
+                    cos_X_tok8 = _cos_to_rows_mu_sd_str(W_rows, X8)
+
+                    cos_Xpre_tok0 = _cos_to_rows_mu_sd_str(W_rows, S0)
+                    cos_Xpre_tok1 = _cos_to_rows_mu_sd_str(W_rows, S1)
+                    cos_Xpre_tok8 = _cos_to_rows_mu_sd_str(W_rows, S8)
+
+                    dot_pre_tok0 = _dot_to_rows_mu_sd_str(W_rows, S0)
+                    dot_pre_tok1 = _dot_to_rows_mu_sd_str(W_rows, S1)
+                    dot_pre_tok8 = _dot_to_rows_mu_sd_str(W_rows, S8)
+
+                    dot_post_tok0 = _dot_to_rows_mu_sd_str(W_rows, X0)
+                    dot_post_tok1 = _dot_to_rows_mu_sd_str(W_rows, X1)
+                    dot_post_tok8 = _dot_to_rows_mu_sd_str(W_rows, X8)
 
                     rk1, rk2 = [], []
                     v1, v2 = [], []
                     pos_counts = []
                     q25, q75 = [], []
-                    all_dim = int(Wg.shape[1])
 
                     for ii in probe_idx:
                         wi = Wg[ii, :].to(dtype=torch.float32)
-                        cos_X_tok0.append(_mean_cos_row_vs_X(wi, X0))
-                        cos_X_tok1.append(_mean_cos_row_vs_X(wi, X1))
-                        cos_X_tok8.append(_mean_cos_row_vs_X(wi, X8))
-
-                        cos_Xpre_tok0.append(_mean_cos_row_vs_X(wi, S0))
-                        cos_Xpre_tok1.append(_mean_cos_row_vs_X(wi, S1))
-                        cos_Xpre_tok8.append(_mean_cos_row_vs_X(wi, S8))
-
-                        dot_pre_tok0.append((S0 @ wi).mean().item())
-                        dot_pre_tok1.append((S1 @ wi).mean().item())
-                        dot_pre_tok8.append((S8 @ wi).mean().item())
-
-                        dot_post_tok0.append((X0 @ wi).mean().item())
-                        dot_post_tok1.append((X1 @ wi).mean().item())
-                        dot_post_tok8.append((X8 @ wi).mean().item())
 
                         r, vv = _rank_val_in_row_abs(wi, gamma_topk_idx[0])
                         rk1.append(int(r)); v1.append(float(vv))
@@ -1482,78 +1693,47 @@ def main():
                         qv = _val_quantiles_in_row(wi, qs=(0.25, 0.75), descending=True)
                         q25.append(float(qv[0])); q75.append(float(qv[1]))
 
-                    x_norm_vals = [
-                        float(X0.norm(dim=1).mean().item()),
-                        float(X1.norm(dim=1).mean().item()),
-                        float(X8.norm(dim=1).mean().item()),
-                    ]
-                    x_rms_norm_vals = [
-                        float(S0_rms.norm(dim=1).mean().item()),
-                        float(S1_rms.norm(dim=1).mean().item()),
-                        float(S8_rms.norm(dim=1).mean().item()),
-                    ]
-                    X_pre_norm_vals = [
-                        float((AttnIn0 + AttnOut0).norm(dim=1).mean().item()),
-                        float((AttnIn1 + AttnOut1).norm(dim=1).mean().item()),
-                        float((AttnIn8 + AttnOut8).norm(dim=1).mean().item()),
-                    ]
-                    x_pre_gamma_vals = [
-                        float(S0[:, gamma_topk_idx[0]].mean().item()),
-                        float(S1[:, gamma_topk_idx[0]].mean().item()),
-                        float(S8[:, gamma_topk_idx[0]].mean().item()),
-                    ]
-                    x_pre_rms_gamma_vals = [
-                        float((S0_rms[:, gamma_top_idx]).mean().item()),
-                        float((S1_rms[:, gamma_top_idx]).mean().item()),
-                        float((S8_rms[:, gamma_top_idx]).mean().item()),
-                    ]
-                    x_pre_rms_gamma2_vals = [
-                        float((S0_rms[:, gamma_top_idx_2]).mean().item()),
-                        float((S1_rms[:, gamma_top_idx_2]).mean().item()),
-                        float((S8_rms[:, gamma_top_idx_2]).mean().item()),
-                    ]
-
-                    def _top3_pos_idx_vals_str(X_rms, k=3):
-                        idx, vals = _topk_1d(X_rms.mean(dim=0), k=k, mode="pos")
-                        idx_str = _print_list(str(int(i)) for i in idx)
-                        vals_str = _print_list(f"{float(v):.2f}" for v in vals)
-                        return idx_str, vals_str
-                    x_pre_rms_top3_idx, x_pre_rms_top3_vals = [], []
-                    x_pre_rms_cos_gamma_vals = []
+                    x_pre_rms_top3_idx = []
 
                     gamma_u = F.normalize(gamma.to(dtype=torch.float32), dim=0)
 
                     for Xr in [S0_rms, S1_rms, S8_rms]:
-                        ii, vv = _top3_pos_idx_vals_str(Xr, k=3)
-                        x_pre_rms_top3_idx.append(ii)
-                        x_pre_rms_top3_vals.append(vv)
-
-                        Xm = Xr.mean(dim=0).to(dtype=torch.float32)
-                        Xm_u = F.normalize(Xm, dim=0)
-                        x_pre_rms_cos_gamma_vals.append(
-                            f"{float(torch.dot(Xm_u, gamma_u).item()):.2f}"
+                        x_pre_rms_top3_idx.append(
+                            _freq_vote_topk_idx(Xr, per_sample_k=3, mode="abs")
                         )
 
-                    def _pack3(vals):
-                        return _print_list(f"{float(v):.2f}" for v in vals)
-                    
-                    def _pack3_int(vals):
-                        return _print_list(str(int(v)) for v in vals)
-
                     metrics_gate_tok = [
-                        ("||X|| (pre-norm)", [f"{v:.2f}" for v in X_pre_norm_vals], ""),
-                        # ("||X|| (rms)", [f"{v:.2f}" for v in x_rms_norm_vals], ""),
-                        ("||X|| (post-norm)", [f"{v:.2f}" for v in x_norm_vals], ""),
-                        ("cos(row_vec @ X_pre)", [_pack3(cos_Xpre_tok0), _pack3(cos_Xpre_tok1), _pack3(cos_Xpre_tok8)], ""),
-                        ("cos(row_vec @ X)", [_pack3(cos_X_tok0), _pack3(cos_X_tok1), _pack3(cos_X_tok8)], ""),
-                        ("X_pre @ row_vec", [_pack3_int(dot_pre_tok0), _pack3_int(dot_pre_tok1), _pack3_int(dot_pre_tok8)], ""),
-                        ("X @ row_vec", [_pack3_int(dot_post_tok0), _pack3_int(dot_post_tok1), _pack3_int(dot_post_tok8)], ""),
+                        ("||X|| (pre-norm)", [
+                            _vec_norm_mu_sd_str(S0), _vec_norm_mu_sd_str(S1), _vec_norm_mu_sd_str(S8)
+                        ], ""),
+                        ("||X|| (post-norm)", [
+                            _vec_norm_mu_sd_str(X0), _vec_norm_mu_sd_str(X1), _vec_norm_mu_sd_str(X8)
+                        ], ""),
+                        ("cos(row_vec @ X_pre)", [_pack3_str(cos_Xpre_tok0), _pack3_str(cos_Xpre_tok1), _pack3_str(cos_Xpre_tok8)], ""),
+                        ("cos(row_vec @ X)", [_pack3_str(cos_X_tok0), _pack3_str(cos_X_tok1), _pack3_str(cos_X_tok8)], ""),
+                        ("X_pre @ row_vec", [_pack3_str(dot_pre_tok0), _pack3_str(dot_pre_tok1), _pack3_str(dot_pre_tok8)], ""),
+                        ("X @ row_vec", [_pack3_str(dot_post_tok0), _pack3_str(dot_post_tok1), _pack3_str(dot_post_tok8)], ""),
                         # (f"X_pre(@gamma[{gamma_top_idx}])", [f"{v:.2f}" for v in x_pre_gamma_vals], ""),
-                        (f"X_pre_rms(@gamma[{gamma_top_idx}])", [f"{v:.2f}" for v in x_pre_rms_gamma_vals], ""),
-                        (f"X_pre_rms(@gamma[{gamma_top_idx_2}])", [f"{v:.2f}" for v in x_pre_rms_gamma2_vals], ""),
-                        (f"X_pre_rms_top3_idx", x_pre_rms_top3_idx, ""),
-                        (f"X_pre_rms_top3_vals", x_pre_rms_top3_vals, ""),
-                        # (f"cos(X_pre_rms, gamma)", x_pre_rms_cos_gamma_vals, ""),
+                        (f"X_pre_rms(@gamma[{gamma_top_idx}])", [
+                            _mean_std_scalar_str(S0_rms[:, gamma_top_idx]),
+                            _mean_std_scalar_str(S1_rms[:, gamma_top_idx]),
+                            _mean_std_scalar_str(S8_rms[:, gamma_top_idx]),
+                        ], ""),
+                        (f"X_pre_rms(@gamma[{gamma_top_idx_2}])", [
+                            _mean_std_scalar_str(S0_rms[:, gamma_top_idx_2]),
+                            _mean_std_scalar_str(S1_rms[:, gamma_top_idx_2]),
+                            _mean_std_scalar_str(S8_rms[:, gamma_top_idx_2]),
+                        ], ""),
+                        (f"X_pre_rms_top3_idx (abs)", [
+                            _print_list(str(i) for i in x_pre_rms_top3_idx[0]),
+                            _print_list(str(i) for i in x_pre_rms_top3_idx[1]),
+                            _print_list(str(i) for i in x_pre_rms_top3_idx[2]),
+                        ], ""),
+                        (f"X_pre_rms_top3_vals", [
+                            _vals_at_fixed_idx_mu_sd_str(S0_rms, x_pre_rms_top3_idx[0]),
+                            _vals_at_fixed_idx_mu_sd_str(S1_rms, x_pre_rms_top3_idx[1]),
+                            _vals_at_fixed_idx_mu_sd_str(S8_rms, x_pre_rms_top3_idx[2]),
+                        ], ""),
                     ]
                     print()
                     _print_metrics_table(metrics_gate_tok, col_names, title=f"[MLP gate row vectors @ idx={probe_idx}] layer={L}")
@@ -1579,100 +1759,132 @@ def main():
                     Gpre1 = S1.to(dtype=torch.float32) @ Wg_t
                     Gpre8 = S8.to(dtype=torch.float32) @ Wg_t
 
+                    Grms0 = S0_rms.to(dtype=torch.float32) @ Wg_t
+                    Grms1 = S1_rms.to(dtype=torch.float32) @ Wg_t
+                    Grms8 = S8_rms.to(dtype=torch.float32) @ Wg_t
+
                     Gpost0 = X0.to(dtype=torch.float32) @ Wg_t
                     Gpost1 = X1.to(dtype=torch.float32) @ Wg_t
                     Gpost8 = X8.to(dtype=torch.float32) @ Wg_t
 
-                    def _g_from_zeroed(Xrms, zero_idx):
-                        Xz = Xrms.clone()
-                        Xz[:, zero_idx] = 0.0
-                        Xz_post = Xz * gamma.view(1, -1)
-                        return Xz_post @ Wg_t
+                    def _g_from_gamma_set_to_one(Xrms, idx_list):
+                        gmod = gamma.to(dtype=torch.float32).clone()
+                        if idx_list:
+                            gmod[idx_list] = 1.0
+                        X_post = Xrms.to(dtype=torch.float32) * gmod.view(1, -1)
+                        return X_post @ Wg_t
 
-                    zero1 = [int(gamma_neg_top_idx[0])] if len(gamma_neg_top_idx) >=1 else []
-                    zero2 = (
+                    def _g_from_gamma_only_keep(Xrms, idx_list):
+                        gmod = torch.ones_like(gamma.to(dtype=torch.float32))
+                        if idx_list:
+                            idx = torch.tensor([int(i) for i in idx_list], dtype=torch.long, device=gmod.device)
+                            gmod[idx] = gamma.to(dtype=torch.float32)[idx]
+                        X_post = Xrms.to(dtype=torch.float32) * gmod.view(1, -1)
+                        return X_post @ Wg_t
+
+
+                    set_neg1 = [int(gamma_neg_top_idx[0])] if len(gamma_neg_top_idx) >=1 else []
+                    set_neg2 = (
                         [int(gamma_neg_top_idx[0]), int(gamma_neg_top_idx[1])]
-                        if len(gamma_neg_top_idx) >= 2 else zero1
+                        if len(gamma_neg_top_idx) >= 2 else set_neg1
                     )
 
-                    Gz1_0 = _g_from_zeroed(S0_rms, zero1)
-                    Gz1_1 = _g_from_zeroed(S1_rms, zero1)
-                    Gz1_8 = _g_from_zeroed(S8_rms, zero1)
+                    Gz1_0 = _g_from_gamma_set_to_one(S0_rms, set_neg1)
+                    Gz1_1 = _g_from_gamma_set_to_one(S1_rms, set_neg1)
+                    Gz1_8 = _g_from_gamma_set_to_one(S8_rms, set_neg1)
 
-                    Gz2_0 = _g_from_zeroed(S0_rms, zero2)
-                    Gz2_1 = _g_from_zeroed(S1_rms, zero2)
-                    Gz2_8 = _g_from_zeroed(S8_rms, zero2)
+                    Gz2_0 = _g_from_gamma_set_to_one(S0_rms, set_neg2)
+                    Gz2_1 = _g_from_gamma_set_to_one(S1_rms, set_neg2)
+                    Gz2_8 = _g_from_gamma_set_to_one(S8_rms, set_neg2)
 
-                    zero_abs1 = [int(gamma_top_idx)]
-                    Gaz1_0 = _g_from_zeroed(S0_rms, zero_abs1)
-                    Gaz1_1 = _g_from_zeroed(S1_rms, zero_abs1)
-                    Gaz1_8 = _g_from_zeroed(S8_rms, zero_abs1)
+                    set_abs1 = [int(gamma_top_idx)]
+                    Gaz1_0 = _g_from_gamma_set_to_one(S0_rms, set_abs1)
+                    Gaz1_1 = _g_from_gamma_set_to_one(S1_rms, set_abs1)
+                    Gaz1_8 = _g_from_gamma_set_to_one(S8_rms, set_abs1)
 
-                    zero_abs2 = [int(gamma_top_idx), int(gamma_top_idx_2)]
-                    Gaz2_0 = _g_from_zeroed(S0_rms, zero_abs2)
-                    Gaz2_1 = _g_from_zeroed(S1_rms, zero_abs2)
-                    Gaz2_8 = _g_from_zeroed(S8_rms, zero_abs2)
+                    Gonly1_0 = _g_from_gamma_only_keep(S0_rms, set_abs1)
+                    Gonly1_1 = _g_from_gamma_only_keep(S1_rms, set_abs1)
+                    Gonly1_8 = _g_from_gamma_only_keep(S8_rms, set_abs1)
 
-                    zero_abs_only2 = [int(gamma_top_idx_2)]
-                    Gaz_only2_0 = _g_from_zeroed(S0_rms, zero_abs_only2)
-                    Gaz_only2_1 = _g_from_zeroed(S1_rms, zero_abs_only2)
-                    Gaz_only2_8 = _g_from_zeroed(S8_rms, zero_abs_only2)
+                    set_abs2 = [int(gamma_top_idx), int(gamma_top_idx_2)]
+                    Gaz2_0 = _g_from_gamma_set_to_one(S0_rms, set_abs2)
+                    Gaz2_1 = _g_from_gamma_set_to_one(S1_rms, set_abs2)
+                    Gaz2_8 = _g_from_gamma_set_to_one(S8_rms, set_abs2)
+
+                    Gonly2_0 = _g_from_gamma_only_keep(S0_rms, set_abs2)
+                    Gonly2_1 = _g_from_gamma_only_keep(S1_rms, set_abs2)
+                    Gonly2_8 = _g_from_gamma_only_keep(S8_rms, set_abs2)
+
+                    set_abs_only2 = [int(gamma_top_idx_2)]
+                    Gaz_only2_0 = _g_from_gamma_set_to_one(S0_rms, set_abs_only2)
+                    Gaz_only2_1 = _g_from_gamma_set_to_one(S1_rms, set_abs_only2)
+                    Gaz_only2_8 = _g_from_gamma_set_to_one(S8_rms, set_abs_only2)
 
                     pos_pre = [
-                        f"{int(round(_pos_count(Gpre0)))}/{int(Gpre0.size(1))}",
-                        f"{int(round(_pos_count(Gpre1)))}/{int(Gpre1.size(1))}",
-                        f"{int(round(_pos_count(Gpre8)))}/{int(Gpre8.size(1))}",
+                        _pos_all_mu_sd_str(Gpre0),
+                        _pos_all_mu_sd_str(Gpre1),
+                        _pos_all_mu_sd_str(Gpre8),
+                    ]
+                    pos_rms = [
+                        _pos_all_mu_sd_str(Grms0),
+                        _pos_all_mu_sd_str(Grms1),
+                        _pos_all_mu_sd_str(Grms8),
                     ]
                     pos_post = [
-                        f"{int(round(_pos_count(Gpost0)))}/{int(Gpost0.size(1))}",
-                        f"{int(round(_pos_count(Gpost1)))}/{int(Gpost1.size(1))}",
-                        f"{int(round(_pos_count(Gpost8)))}/{int(Gpost8.size(1))}",
+                        _pos_all_mu_sd_str(Gpost0),
+                        _pos_all_mu_sd_str(Gpost1),
+                        _pos_all_mu_sd_str(Gpost8),
                     ]
                     pos_zero2 = [
-                        f"{int(round(_pos_count(Gz2_0)))}/{int(Gz2_0.size(1))}",
-                        f"{int(round(_pos_count(Gz2_1)))}/{int(Gz2_1.size(1))}",
-                        f"{int(round(_pos_count(Gz2_8)))}/{int(Gz2_8.size(1))}",
+                        _pos_all_mu_sd_str(Gz2_0),
+                        _pos_all_mu_sd_str(Gz2_1),
+                        _pos_all_mu_sd_str(Gz2_8),
                     ]
                     pos_zero_abs1 = [
-                        f"{int(round(_pos_count(Gaz1_0)))}/{int(Gaz1_0.size(1))}",
-                        f"{int(round(_pos_count(Gaz1_1)))}/{int(Gaz1_1.size(1))}",
-                        f"{int(round(_pos_count(Gaz1_8)))}/{int(Gaz1_8.size(1))}",
+                        _pos_all_mu_sd_str(Gaz1_0),
+                        _pos_all_mu_sd_str(Gaz1_1),
+                        _pos_all_mu_sd_str(Gaz1_8),
+                    ]
+                    pos_only_abs1 = [
+                        _pos_all_mu_sd_str(Gonly1_0),
+                        _pos_all_mu_sd_str(Gonly1_1),
+                        _pos_all_mu_sd_str(Gonly1_8),
                     ]
                     pos_zero_abs2 = [
-                        f"{int(round(_pos_count(Gaz2_0)))}/{int(Gaz2_0.size(1))}",
-                        f"{int(round(_pos_count(Gaz2_1)))}/{int(Gaz2_1.size(1))}",
-                        f"{int(round(_pos_count(Gaz2_8)))}/{int(Gaz2_8.size(1))}",
+                        _pos_all_mu_sd_str(Gaz2_0),
+                        _pos_all_mu_sd_str(Gaz2_1),
+                        _pos_all_mu_sd_str(Gaz2_8),
+                    ]
+                    pos_only_abs2 = [
+                        _pos_all_mu_sd_str(Gonly2_0),
+                        _pos_all_mu_sd_str(Gonly2_1),
+                        _pos_all_mu_sd_str(Gonly2_8),
                     ]
                     pos_zero_abs_only2 = [
-                        f"{int(round(_pos_count(Gaz_only2_0)))}/{int(Gaz_only2_0.size(1))}",
-                        f"{int(round(_pos_count(Gaz_only2_1)))}/{int(Gaz_only2_1.size(1))}",
-                        f"{int(round(_pos_count(Gaz_only2_8)))}/{int(Gaz_only2_8.size(1))}",
+                        _pos_all_mu_sd_str(Gaz_only2_0),
+                        _pos_all_mu_sd_str(Gaz_only2_1),
+                        _pos_all_mu_sd_str(Gaz_only2_8),
                     ]
-
-                    def _flip_and_topneg_ratio(Gpre, Gpost, top_idx):
-                        gpre_m = Gpre.to(dtype=torch.float32).mean(dim=0)
-                        gpost_m = Gpost.to(dtype=torch.float32).mean(dim=0)
-                        flip = (gpre_m > 0) & (gpost_m < 0)
-                        denom = int(flip.sum().item())
-                        if denom == 0: return "0/0"
-                        top_col = Wg[:, int(top_idx)].to(dtype=torch.float32)
-                        num = int(((top_col < 0) & flip).sum().item())
-                        return f"{num}/{denom}"
-
-                    flip_ratio_vals = [
-                        _flip_and_topneg_ratio(Gpre0, Gpost0, gamma_top_idx),
-                        _flip_and_topneg_ratio(Gpre1, Gpost1, gamma_top_idx),
-                        _flip_and_topneg_ratio(Gpre8, Gpost8, gamma_top_idx),
-                    ]
+                     
+                    flip_stats_tok0 = _flip_negcol_stats_str(Gpre0, Gpost0, Wg, gamma_top_idx)
+                    flip_stats_tok1 = _flip_negcol_stats_str(Gpre1, Gpost1, Wg, gamma_top_idx)
+                    flip_stats_tok8 = _flip_negcol_stats_str(Gpre8, Gpost8, Wg, gamma_top_idx)
 
                     metrics_g_sign = [
                         ("pos(X_pre @ Wg)/all", pos_pre, ""),
                         ("pos(X @ Wg)/all", pos_post, ""),
-                        (f"pos(X_[0_gamma_neg_top_2] @ Wg)/all", pos_zero2, ""),
-                        (f"pos(X_[0_gamma_top1] @ Wg)/all", pos_zero_abs1, ""),
-                        (f"pos(X_[0_gamma_top2] @ Wg)/all", pos_zero_abs_only2, ""),
-                        (f"pos(X_[0_gamma_top1+2] @ Wg)/all", pos_zero_abs2, ""),
-                        (f"Wg[{gamma_top_idx}<0]/flipped", flip_ratio_vals, ""),
+                        # (f"pos(X_[no_γ_neg_top1+2] @ Wg)/all", pos_zero2, ""),
+                        # (f"pos(X_[no_gamma_top2] @ Wg)/all", pos_zero_abs_only2, ""),
+                        (f"pos(X_[no_γ_top1+2] @ Wg)/all", pos_zero_abs2, ""),
+                        # (f"pos(X_[no_γ_top1] @ Wg)/all", pos_zero_abs1, ""),
+                        (f"pos(X_[only_γ_top1] @ Wg)/all", pos_only_abs1, ""),
+                        (f"pos(X_[only_γ_top1+2] @ Wg)/all", pos_only_abs2, ""),
+                        # ("pos(X_[no_γ] @ Wg)/all", pos_rms, ""),
+                        (f"neg[@{gamma_top_idx}]/flipped", [
+                            flip_stats_tok0, 
+                            flip_stats_tok1, 
+                            flip_stats_tok8
+                        ], ""),
                     ]
                     print()
                     _print_metrics_table(
@@ -1682,22 +1894,48 @@ def main():
                     )
                     _print_mlp_g_gamma_section()
 
+                    gamma_base = gamma.to(dtype=torch.float32)
+                    gamma_no_top1 = gamma_base.clone()
+                    gamma_no_top1[[int(gamma_top_idx), int(gamma_top_idx_2)]] = 1.0
+
+                    _plot_per_gate_mean_contrib(
+                        S0_rms,
+                        gamma_base,
+                        gamma_no_top1,
+                        Wg,
+                        out_path=os.path.join(args.outdir, f"MLP_g_per_gate_mean_contrib_tok0_L{L}.png"),
+                        title=f"Per-gate mean contribution to g | L={L} tok0"
+                    )
+
+                    score0 = Gpost0.to(dtype=torch.float32).abs().mean(dim=0)
+                    top3_gate_idx_tok0 = torch.topk(score0, k=3, largest=True).indices.detach().cpu().tolist()
+
+                    _plot_wg_col_distrib(
+                        Wg,
+                        gamma_top_idx,
+                        out_path=os.path.join(args.outdir, f"MLP_Wg_col_distrib_gamma_top1_idx{int(gamma_top_idx)}_L{L}.png"),
+                        title=f"Wg column distribution for gamma idx={int(gamma_top_idx)} | L={L}",
+                        highlight_rows=top3_gate_idx_tok0,
+                    )
+
+                    _plot_wg_col_distrib(
+                        Wg,
+                        gamma_top_idx_2,
+                        out_path=os.path.join(args.outdir, f"MLP_Wg_col_distrib_gamma_top2_idx{int(gamma_top_idx_2)}_L{L}.png"),
+                        title=f"Wg column distribution for gamma idx={int(gamma_top_idx_2)} | L={L}",
+                        highlight_rows=top3_gate_idx_tok0,
+                    )
+
                 def _print_mlp_g_gamma_section():
                     g_pos = torch.clamp(gamma, min=0.0)
                     pos_vals, pos_idx = torch.topk(g_pos, k=3)
                     abs_vals, abs_idx = torch.topk(gamma.abs(), k=3)
 
-                    n_rows = int(Wg.size(0))
-                    cneg1 = int((Wg[:, int(gamma_top_idx)].to(dtype=torch.float32) < 0).sum().item())
-                    cneg2 = int((Wg[:, int(gamma_top_idx_2)].to(dtype=torch.float32) < 0).sum().item())
-                    wg_neg_counts = [f"{cneg1}/{n_rows}", f"{cneg2}/{n_rows}", "N/A"]
-
                     gamma_metrics = [
-                        ("top3 idx (pos)", [str(int(i)) for i in pos_idx.tolist()], ""),
-                        ("top3 val (pos)", [f"{float(v):.2f}" for v in pos_vals.tolist()], ""),
+                        # ("top3 idx (pos)", [str(int(i)) for i in pos_idx.tolist()], ""),
+                        # ("top3 val (pos)", [f"{float(v):.2f}" for v in pos_vals.tolist()], ""),
                         ("top3 idx (abs)", [str(int(i)) for i in abs_idx.tolist()], ""),
                         ("top3 val (abs)", [f"{float(v):.2f}" for v in abs_vals.tolist()], ""),
-                        ("Wg_neg/all @ gamma_top_idx", wg_neg_counts, ""),
                     ]
                     gamma_cols = ["top1", "top2", "top3"]
 
