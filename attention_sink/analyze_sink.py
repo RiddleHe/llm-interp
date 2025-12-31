@@ -1,3 +1,4 @@
+from curses import KEY_F50
 import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math, copy
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
@@ -452,10 +453,9 @@ def _pos_count_stats(Z):
     D = int(Z.size(1))
     return mu, sd, D
 
-def _pos_all_mu_sd_str(Z):
+def _pos_mu_sd_str(Z):
     mu, sd, D = _pos_count_stats(Z)
-    mu_sd = _fmt_mu_sd(mu, sd)
-    return f"{mu_sd}/{D}"
+    return _fmt_mu_sd(mu, sd)
 
 def _mean_vec_norm(X):
     if X is None or X.numel() == 0:
@@ -869,6 +869,153 @@ def _plot_per_gate_mean_contrib(Srms, gamma_base, gamma_alt, Wg, out_path, title
     plt.savefig(out_path, dpi=300)
     plt.close()
 
+def _dot_contrib_energy_per_dim(X, w_row, eps=EPS):
+    X = X.to(dtype=torch.float32)
+    w = w_row.to(dtype=torch.float32, device=X.device)
+
+    Xhat = F.normalize(X, dim=1)
+    what = F.normalize(w, dim=0)
+
+    C = Xhat * what.view(1, -1) # [N, D]
+    energy = C.pow(2).mean(dim=0) # [D]
+    energy = energy.detach().cpu().numpy()
+    what = what.detach().cpu().numpy()
+
+    return energy, what
+    
+def _k_at_cdf_threshold(mass_sorted, thr):
+    cdf = np.cumsum(mass_sorted)
+    thr = float(thr)
+    thr = max(0.0, min(1.0, thr))
+    k = int(np.searchsorted(cdf, thr, side="left")) + 1
+    return int(min(k, int(mass_sorted.size)))
+
+def _majority_sign_over_threshold(X, dim_idx, thr=0.75):
+    col = X[:, int(dim_idx)]
+    frac_pos = float((col > 0).to(dtype=torch.float32).mean().item())
+    frac_neg = float((col < 0).to(dtype=torch.float32).mean().item())
+    thr = float(thr)
+    if frac_pos >= thr:
+        return "+"
+    if frac_neg >= thr:
+        return "-"
+    return "∅"
+
+def _squash_rank_axis(ranks, D, thr, tail_frac=0.10):
+    D = int(max(1, D))
+    r = ranks.astype(np.float32)
+    thr = int(max(1, min(int(thr), D - 1)))
+    tail_frac = float(max(1e-6, min(float(tail_frac), 0.99)))
+
+    head_w = (1.0 - tail_frac) * float(D)
+    tail_w = tail_frac * float(D)
+
+    x = np.empty_like(r, dtype=np.float32)
+    head = (r <= thr)
+    x[head] = (r[head] / float(thr)) * head_w
+
+    tail = ~head
+    denom = float(max(1, (D - 1 - thr)))
+    x[tail] = head_w + ((r[tail] - float(thr)) / denom) * tail_w
+    return x
+
+def _plot_wg_row_energy_stack(X, Wg, row_idxs, out_path, title, topk=3):
+    squash_boundary = 16
+
+    fig, axes = plt.subplots(len(row_idxs), 1, figsize=(12, 7.5), sharex=False, squeeze=False)
+    axes = axes[:, 0]
+
+    for ax, ridx in zip(axes, row_idxs):
+        w = Wg[int(ridx), :].to(dtype=torch.float32)
+        energy, what = _dot_contrib_energy_per_dim(X, w, eps=EPS)
+
+        order = np.argsort(-energy)
+        e_sorted = energy[order]
+        what_sorted = what[order]
+
+        D = int(e_sorted.shape[0])
+        ranks = np.arange(D)
+
+        denom = float(np.sum(e_sorted))
+        mass = (e_sorted / denom).astype(np.float32)
+
+        k25 = _k_at_cdf_threshold(mass, 0.25)
+        k50 = _k_at_cdf_threshold(mass, 0.50)
+        k75 = _k_at_cdf_threshold(mass, 0.75)
+        
+        thr = int(max(1, min(int(squash_boundary), D-1)))
+        x = _squash_rank_axis(ranks, D=D, thr=thr, tail_frac=0.10)
+
+        b25 = int(min(max(0, k25), D-1))
+        b50 = int(min(max(0, k50), D-1))
+        b75 = int(min(max(0, k75), D-1))
+
+        cur = 0
+        if b25 > 0:
+            ax.axvspan(x[0], x[b25], alpha=0.10, color="tab:green", label="top .25 mass")
+            cur = b25
+
+        if b50 > 0:
+            if b50 == cur and cur > 0:
+                ax.axvspan(x[0], x[cur], alpha=0.10, color="tab:orange", label="top .50 mass")
+            elif b50 > cur:
+                ax.axvspan(x[cur], x[b50], alpha=0.10, color="tab:orange", label="top .50 mass")
+                cur = b50
+
+        if b75 > 0:
+            if b75 == cur and cur > 0:
+                ax.axvspan(x[0], x[cur], alpha=0.10, color="tab:red", label="top .75 mass")
+            elif b75 > cur:
+                ax.axvspan(x[cur], x[b75], alpha=0.10, color="tab:red", label="top .75 mass")
+                cur = b75
+
+        kk = int(min(int(topk), int(e_sorted.shape[0])))
+        top_idx = order[:kk]
+
+        parts = []
+        for i in top_idx.tolist():
+            wsgn = "+" if what[i] >= 0 else "-"
+            xsgn = _majority_sign_over_threshold(X, int(i), thr=0.75)
+            parts.append(f"{int(i)}({wsgn}/{xsgn})")
+
+        top_str = " | top{} idx: {}".format(
+            kk,
+            " > ".join(parts)
+        )
+
+        ax.plot(x, e_sorted, linewidth=1.0, label=f"row={int(ridx)}{top_str}")
+
+        ax.set_ylabel("E[c^2]")
+        # ax.set_yscale("log")
+        top_energy = float(e_sorted[0])
+        ax.set_yscale("symlog", linthresh=top_energy * 1e-2, linscale=1.0)
+        ax.set_xlim(0.0, float(D))
+
+        tick_ranks = [0, 1, 2, 4, 8, thr, b75, D-1]
+        tick_ranks = sorted(set(int(r) for r in tick_ranks if 0 <= int(r) < D))
+        tick_pos = _squash_rank_axis(np.array(tick_ranks), D=D, thr=thr, tail_frac=0.10)
+        ax.set_xticks(tick_pos.tolist())
+        ax.set_xticklabels([str(int(r)) for r in tick_ranks], fontsize=9)
+
+        handles, labels = ax.get_legend_handles_labels()
+        seen = set()
+        h2, l2 = [], []
+        for h, l in zip(handles, labels):
+            if l in seen:
+                continue
+            seen.add(l)
+            h2.append(h)
+            l2.append(l)
+        ax.legend(h2, l2, loc="upper right", fontsize=8, frameon=False)
+        ax.grid(True, linewidth=0.3, alpha=0.4)
+
+    axes[-1].set_xlabel(f"dim rank by contrib energy (desc)")
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0,0.0,1,0.985])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
 def _plot_wg_col_distrib(Wg, top_idx, out_path, title, highlight_rows=None):
     col = Wg[:, int(top_idx)].to(dtype=torch.float32).detach().cpu().numpy()
     plt.figure(figsize=(7, 3.5))
@@ -1044,6 +1191,10 @@ def _pert_suffix(args, include_lower_attn=True):
 
 def _print_list(lst):
     return "[" + ", ".join(lst) + "]"
+
+def _pad_list(xs, k):
+    xs = list(xs)
+    return xs + [""] * (k - len(xs))
 
 def _print_metrics_table(metrics, col_names, title=None, col_w=20):
     if title:
@@ -1478,7 +1629,8 @@ def main():
                 Wg = mlp.gate_proj.weight.detach().to(dtype=torch.float32).cpu()
 
                 gamma = model.model.layers[L].post_attention_layernorm.weight.detach().to(dtype=torch.float32).cpu()
-                gamma_neg_top_idx, gamma_neg_top_vals = _vec_neg_topk(gamma, k=3)
+                gamma_neg_count = int((gamma < 0).sum().item())
+                gamma_neg_top_idx, gamma_neg_top_vals = _vec_neg_topk(gamma, k=gamma_neg_count)
                 
                 _g_abs = gamma.abs()
                 gamma_topk_idx = torch.topk(_g_abs, k=2).indices.detach().cpu().tolist()
@@ -1574,9 +1726,9 @@ def main():
                         _mean_activation_entropy(A8),
                     ]
                     g_pos_ratio_vals = [
-                        _pos_all_mu_sd_str(G0),
-                        _pos_all_mu_sd_str(G1),
-                        _pos_all_mu_sd_str(G8),
+                        _pos_mu_sd_str(G0),
+                        _pos_mu_sd_str(G1),
+                        _pos_mu_sd_str(G8),
                     ]
                     a_norm_vals = [
                         _vec_norm_mu_sd_str(A0),
@@ -1584,25 +1736,28 @@ def main():
                         _vec_norm_mu_sd_str(A8)
                     ]
                     a_kfrac_vals = [
-                        _k_for_energy_frac_str(A0, (0.25, 0.50, 0.99)),
-                        _k_for_energy_frac_str(A1, (0.25, 0.50, 0.99)),
-                        _k_for_energy_frac_str(A8, (0.25, 0.50, 0.99)),
-                    ]
-                    a_topk_idx_vals = [
-                        _print_list(map(str, _freq_vote_topk_idx(A0, per_sample_k=k, mode="pos"))),
-                        _print_list(map(str, _freq_vote_topk_idx(A1, per_sample_k=k, mode="pos"))),
-                        _print_list(map(str, _freq_vote_topk_idx(A8, per_sample_k=k, mode="pos"))),
+                        _k_for_energy_frac_str(A0, (0.25, 0.50, 0.7)),
+                        _k_for_energy_frac_str(A1, (0.25, 0.50, 0.7)),
+                        _k_for_energy_frac_str(A8, (0.25, 0.50, 0.7)),
                     ]
                     g_top_abs_vals = [
                         _topk_vals_mu_sd_str(G0, k=3, mode="abs"),
                         _topk_vals_mu_sd_str(G1, k=3, mode="abs"),
                         _topk_vals_mu_sd_str(G8, k=3, mode="abs"),
                     ]
+                    a_topk_idx0 = _freq_vote_topk_idx(A0, per_sample_k=k, mode="pos")
+                    a_topk_idx1 = _freq_vote_topk_idx(A1, per_sample_k=k, mode="pos")
+                    a_topk_idx8 = _freq_vote_topk_idx(A8, per_sample_k=k, mode="pos")
 
                     g_top_pos_vals = [
                         _topk_vals_mu_sd_str(G0, k=3, mode="pos"),
                         _topk_vals_mu_sd_str(G1, k=3, mode="pos"),
                         _topk_vals_mu_sd_str(G8, k=3, mode="pos"),
+                    ]
+                    a_top_pos_vals = [
+                        _topk_vals_mu_sd_str(A0, k=3, mode="pos"),
+                        _topk_vals_mu_sd_str(A1, k=3, mode="pos"),
+                        _topk_vals_mu_sd_str(A8, k=3, mode="pos"),
                     ]
 
                     metrics_ga = [
@@ -1610,10 +1765,20 @@ def main():
                         ("g_pos/all", g_pos_ratio_vals, ""),
                         ("g_max_vals (abs)", g_top_abs_vals, ""),
                         ("g_max_vals (pos)", g_top_pos_vals, ""),
+                        ("a_max_vals (pos)", a_top_pos_vals, ""),
                         ("a_entropy", a_entropy_vals, "float"),
                         ("a_norm", a_norm_vals, "sci"),
-                        (f"a_topk_act_idx k={k}", a_topk_idx_vals, ""),
-                        (f"a_frac_energy [.25/.5/.99]", a_kfrac_vals, ""),
+                        (f"a_topk_act_idx k={k}", [
+                            _print_list(map(str, a_topk_idx0)),
+                            _print_list(map(str, a_topk_idx1)),
+                            _print_list(map(str, a_topk_idx8)),
+                        ], ""),
+                        # (f"a_frac_energy [.25/.5/.99]", a_kfrac_vals, ""),
+                        (f"a_explained_energy@top{k}_idx", [
+                            _fracmass_on_set(A0, set(a_topk_idx0)),
+                            _fracmass_on_set(A1, set(a_topk_idx1)),
+                            _fracmass_on_set(A8, set(a_topk_idx8)),
+                        ], "float")
                     ]
 
                     print()
@@ -1714,12 +1879,12 @@ def main():
                         ("X_pre @ row_vec", [_pack3_str(dot_pre_tok0), _pack3_str(dot_pre_tok1), _pack3_str(dot_pre_tok8)], ""),
                         ("X @ row_vec", [_pack3_str(dot_post_tok0), _pack3_str(dot_post_tok1), _pack3_str(dot_post_tok8)], ""),
                         # (f"X_pre(@gamma[{gamma_top_idx}])", [f"{v:.2f}" for v in x_pre_gamma_vals], ""),
-                        (f"X_pre_rms(@gamma[{gamma_top_idx}])", [
+                        (f"X_pre_rms(@γ_top1[{gamma_top_idx}])", [
                             _mean_std_scalar_str(S0_rms[:, gamma_top_idx]),
                             _mean_std_scalar_str(S1_rms[:, gamma_top_idx]),
                             _mean_std_scalar_str(S8_rms[:, gamma_top_idx]),
                         ], ""),
-                        (f"X_pre_rms(@gamma[{gamma_top_idx_2}])", [
+                        (f"X_pre_rms(@γ_top2[{gamma_top_idx_2}])", [
                             _mean_std_scalar_str(S0_rms[:, gamma_top_idx_2]),
                             _mean_std_scalar_str(S1_rms[:, gamma_top_idx_2]),
                             _mean_std_scalar_str(S8_rms[:, gamma_top_idx_2]),
@@ -1750,6 +1915,16 @@ def main():
                     ]
                     print()
                     _print_metrics_table(metrics_gate_rows, probe_cols, title=f"[MLP gate row properties] layer={L}")
+
+                    _plot_wg_row_energy_stack(
+                        S0_rms,
+                        Wg,
+                        row_idxs=probe_idx,
+                        out_path=os.path.join(args.outdir, f"MLP_Wg_row_contrib_to_dot_tok0_L{L}.png"),
+                        title=f"Per-dim contrib to dot product (Xpre_rms_tok0, @ Wg_row) | L={L}",
+                        topk=3,
+                    )
+                    
                     _print_mlp_g_gamma_section()
 
                 def _print_mlp_g_sign_section():
@@ -1767,6 +1942,8 @@ def main():
                     Gpost1 = X1.to(dtype=torch.float32) @ Wg_t
                     Gpost8 = X8.to(dtype=torch.float32) @ Wg_t
 
+                    neg_gamma_idx = (gamma < 0).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+
                     def _g_from_gamma_set_to_one(Xrms, idx_list):
                         gmod = gamma.to(dtype=torch.float32).clone()
                         if idx_list:
@@ -1782,20 +1959,11 @@ def main():
                         X_post = Xrms.to(dtype=torch.float32) * gmod.view(1, -1)
                         return X_post @ Wg_t
 
+                    set_neg_all = [int(i) for i in gamma_neg_top_idx] if gamma_neg_top_idx else []
 
-                    set_neg1 = [int(gamma_neg_top_idx[0])] if len(gamma_neg_top_idx) >=1 else []
-                    set_neg2 = (
-                        [int(gamma_neg_top_idx[0]), int(gamma_neg_top_idx[1])]
-                        if len(gamma_neg_top_idx) >= 2 else set_neg1
-                    )
-
-                    Gz1_0 = _g_from_gamma_set_to_one(S0_rms, set_neg1)
-                    Gz1_1 = _g_from_gamma_set_to_one(S1_rms, set_neg1)
-                    Gz1_8 = _g_from_gamma_set_to_one(S8_rms, set_neg1)
-
-                    Gz2_0 = _g_from_gamma_set_to_one(S0_rms, set_neg2)
-                    Gz2_1 = _g_from_gamma_set_to_one(S1_rms, set_neg2)
-                    Gz2_8 = _g_from_gamma_set_to_one(S8_rms, set_neg2)
+                    Gzneg_0 = _g_from_gamma_set_to_one(S0_rms, set_neg_all)
+                    Gzneg_1 = _g_from_gamma_set_to_one(S1_rms, set_neg_all)
+                    Gzneg_8 = _g_from_gamma_set_to_one(S8_rms, set_neg_all)
 
                     set_abs1 = [int(gamma_top_idx)]
                     Gaz1_0 = _g_from_gamma_set_to_one(S0_rms, set_abs1)
@@ -1821,49 +1989,44 @@ def main():
                     Gaz_only2_8 = _g_from_gamma_set_to_one(S8_rms, set_abs_only2)
 
                     pos_pre = [
-                        _pos_all_mu_sd_str(Gpre0),
-                        _pos_all_mu_sd_str(Gpre1),
-                        _pos_all_mu_sd_str(Gpre8),
+                        _pos_mu_sd_str(Gpre0),
+                        _pos_mu_sd_str(Gpre1),
+                        _pos_mu_sd_str(Gpre8),
                     ]
                     pos_rms = [
-                        _pos_all_mu_sd_str(Grms0),
-                        _pos_all_mu_sd_str(Grms1),
-                        _pos_all_mu_sd_str(Grms8),
+                        _pos_mu_sd_str(Grms0),
+                        _pos_mu_sd_str(Grms1),
+                        _pos_mu_sd_str(Grms8),
                     ]
                     pos_post = [
-                        _pos_all_mu_sd_str(Gpost0),
-                        _pos_all_mu_sd_str(Gpost1),
-                        _pos_all_mu_sd_str(Gpost8),
-                    ]
-                    pos_zero2 = [
-                        _pos_all_mu_sd_str(Gz2_0),
-                        _pos_all_mu_sd_str(Gz2_1),
-                        _pos_all_mu_sd_str(Gz2_8),
+                        _pos_mu_sd_str(Gpost0),
+                        _pos_mu_sd_str(Gpost1),
+                        _pos_mu_sd_str(Gpost8),
                     ]
                     pos_zero_abs1 = [
-                        _pos_all_mu_sd_str(Gaz1_0),
-                        _pos_all_mu_sd_str(Gaz1_1),
-                        _pos_all_mu_sd_str(Gaz1_8),
+                        _pos_mu_sd_str(Gaz1_0),
+                        _pos_mu_sd_str(Gaz1_1),
+                        _pos_mu_sd_str(Gaz1_8),
                     ]
                     pos_only_abs1 = [
-                        _pos_all_mu_sd_str(Gonly1_0),
-                        _pos_all_mu_sd_str(Gonly1_1),
-                        _pos_all_mu_sd_str(Gonly1_8),
+                        _pos_mu_sd_str(Gonly1_0),
+                        _pos_mu_sd_str(Gonly1_1),
+                        _pos_mu_sd_str(Gonly1_8),
                     ]
                     pos_zero_abs2 = [
-                        _pos_all_mu_sd_str(Gaz2_0),
-                        _pos_all_mu_sd_str(Gaz2_1),
-                        _pos_all_mu_sd_str(Gaz2_8),
+                        _pos_mu_sd_str(Gaz2_0),
+                        _pos_mu_sd_str(Gaz2_1),
+                        _pos_mu_sd_str(Gaz2_8),
                     ]
                     pos_only_abs2 = [
-                        _pos_all_mu_sd_str(Gonly2_0),
-                        _pos_all_mu_sd_str(Gonly2_1),
-                        _pos_all_mu_sd_str(Gonly2_8),
+                        _pos_mu_sd_str(Gonly2_0),
+                        _pos_mu_sd_str(Gonly2_1),
+                        _pos_mu_sd_str(Gonly2_8),
                     ]
-                    pos_zero_abs_only2 = [
-                        _pos_all_mu_sd_str(Gaz_only2_0),
-                        _pos_all_mu_sd_str(Gaz_only2_1),
-                        _pos_all_mu_sd_str(Gaz_only2_8),
+                    pos_zero_neg_all = [
+                        _pos_mu_sd_str(Gzneg_0),
+                        _pos_mu_sd_str(Gzneg_1),
+                        _pos_mu_sd_str(Gzneg_8),
                     ]
                      
                     flip_stats_tok0 = _flip_negcol_stats_str(Gpre0, Gpost0, Wg, gamma_top_idx)
@@ -1871,14 +2034,14 @@ def main():
                     flip_stats_tok8 = _flip_negcol_stats_str(Gpre8, Gpost8, Wg, gamma_top_idx)
 
                     metrics_g_sign = [
-                        ("pos(X_pre @ Wg)/all", pos_pre, ""),
-                        ("pos(X @ Wg)/all", pos_post, ""),
-                        # (f"pos(X_[no_γ_neg_top1+2] @ Wg)/all", pos_zero2, ""),
+                        ("pos(X_pre @ Wg)", pos_pre, ""),
+                        ("pos(X @ Wg)", pos_post, ""),
                         # (f"pos(X_[no_gamma_top2] @ Wg)/all", pos_zero_abs_only2, ""),
-                        (f"pos(X_[no_γ_top1+2] @ Wg)/all", pos_zero_abs2, ""),
+                        (f"pos(X_[no_γ_neg_all({gamma_neg_count})] @ Wg)", pos_zero_neg_all, ""),
+                        (f"pos(X_[no_γ_top1+2] @ Wg)", pos_zero_abs2, ""),
                         # (f"pos(X_[no_γ_top1] @ Wg)/all", pos_zero_abs1, ""),
-                        (f"pos(X_[only_γ_top1] @ Wg)/all", pos_only_abs1, ""),
-                        (f"pos(X_[only_γ_top1+2] @ Wg)/all", pos_only_abs2, ""),
+                        (f"pos(X_[only_γ_top1] @ Wg)", pos_only_abs1, ""),
+                        (f"pos(X_[only_γ_top1+2] @ Wg)", pos_only_abs2, ""),
                         # ("pos(X_[no_γ] @ Wg)/all", pos_rms, ""),
                         (f"neg[@{gamma_top_idx}]/flipped", [
                             flip_stats_tok0, 
@@ -1890,7 +2053,7 @@ def main():
                     _print_metrics_table(
                         metrics_g_sign, 
                         col_names, 
-                        title=f"[MLP gate g sign] layer={L}"
+                        title=f"[MLP gate g sign] layer={L} | total_dim={int(Wg.size(0))}"
                     )
                     _print_mlp_g_gamma_section()
 
@@ -1928,19 +2091,30 @@ def main():
 
                 def _print_mlp_g_gamma_section():
                     g_pos = torch.clamp(gamma, min=0.0)
-                    pos_vals, pos_idx = torch.topk(g_pos, k=3)
-                    abs_vals, abs_idx = torch.topk(gamma.abs(), k=3)
+                    pos_vals, pos_idx = torch.topk(g_pos, k=5)
+                    abs_vals, abs_idx = torch.topk(gamma.abs(), k=5)
+
+                    neg_mask = gamma < 0
+                    neg_vals_all = gamma[neg_mask]
+                    neg_idx_all = neg_mask.nonzero(as_tuple=False).view(-1)
+                    kk = min(5, neg_idx_all.shape[0])
+                    neg_abs = neg_vals_all.abs()
+                    neg_abs_vals, neg_order = torch.topk(neg_abs, k=kk)
+                    neg_idx = neg_idx_all[neg_order]
+                    neg_vals = gamma[neg_idx]
 
                     gamma_metrics = [
                         # ("top3 idx (pos)", [str(int(i)) for i in pos_idx.tolist()], ""),
                         # ("top3 val (pos)", [f"{float(v):.2f}" for v in pos_vals.tolist()], ""),
-                        ("top3 idx (abs)", [str(int(i)) for i in abs_idx.tolist()], ""),
-                        ("top3 val (abs)", [f"{float(v):.2f}" for v in abs_vals.tolist()], ""),
+                        ("top5 idx (abs)", [str(int(i)) for i in abs_idx.tolist()], ""),
+                        ("top5 val (abs)", [f"{float(v):.2f}" for v in abs_vals.tolist()], ""),
+                        ("top5 idx (neg)", _pad_list([str(int(i)) for i in neg_idx.tolist()], 5), ""),
+                        ("top5 val (neg)", _pad_list([f"{float(v):.2f}" for v in neg_vals.tolist()], 5), ""),
                     ]
-                    gamma_cols = ["top1", "top2", "top3"]
+                    gamma_cols = ["top1", "top2", "top3", "top4", "top5"]
 
                     print()
-                    _print_metrics_table(gamma_metrics, gamma_cols, title=f"[MLP gate gamma] layer={L}")
+                    _print_metrics_table(gamma_metrics, gamma_cols, title=f"[MLP gate gamma] layer={L}", col_w=8)
 
                 if "z" in mlp_sections:
                     _print_mlp_z_section()
