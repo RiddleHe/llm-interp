@@ -919,9 +919,7 @@ def _squash_rank_axis(ranks, D, thr, tail_frac=0.10):
     x[tail] = head_w + ((r[tail] - float(thr)) / denom) * tail_w
     return x
 
-def _plot_wg_row_energy_stack(X, Wg, row_idxs, out_path, title, topk=3):
-    squash_boundary = 16
-
+def _plot_wg_row_energy_stack(X, Wg, row_idxs, out_path, title, squash_boundary=16, topk=3):
     fig, axes = plt.subplots(len(row_idxs), 1, figsize=(12, 7.5), sharex=False, squeeze=False)
     axes = axes[:, 0]
 
@@ -991,7 +989,7 @@ def _plot_wg_row_energy_stack(X, Wg, row_idxs, out_path, title, topk=3):
         ax.set_yscale("symlog", linthresh=top_energy * 1e-2, linscale=1.0)
         ax.set_xlim(0.0, float(D))
 
-        tick_ranks = [0, 1, 2, 4, 8, thr, b75, D-1]
+        tick_ranks = [0, 1, 2, 4, 8, thr, b25, b50, b75, D-1]
         tick_ranks = sorted(set(int(r) for r in tick_ranks if 0 <= int(r) < D))
         tick_pos = _squash_rank_axis(np.array(tick_ranks), D=D, thr=thr, tail_frac=0.10)
         ax.set_xticks(tick_pos.tolist())
@@ -1627,6 +1625,7 @@ def main():
                 mlp = model.model.layers[L].mlp
                 Wd = mlp.down_proj.weight.detach().to(dtype=torch.float32).cpu()
                 Wg = mlp.gate_proj.weight.detach().to(dtype=torch.float32).cpu()
+                Wu = mlp.up_proj.weight.detach().to(dtype=torch.float32).cpu()
 
                 gamma = model.model.layers[L].post_attention_layernorm.weight.detach().to(dtype=torch.float32).cpu()
                 gamma_neg_count = int((gamma < 0).sum().item())
@@ -1790,22 +1789,44 @@ def main():
                         float(U1.norm(dim=1).mean().item()),
                         float(U8.norm(dim=1).mean().item()),
                     ]
+                    u_topk_idx0 = _freq_vote_topk_idx(U0, per_sample_k=k, mode="abs")
+                    u_topk_idx1 = _freq_vote_topk_idx(U1, per_sample_k=k, mode="abs")
+                    u_topk_idx8 = _freq_vote_topk_idx(U8, per_sample_k=k, mode="abs")
+
                     u_topk_idx_vals = [
-                        _print_list(map(str, _freq_vote_topk_idx(U0, per_sample_k=k, mode="abs"))),
-                        _print_list(map(str, _freq_vote_topk_idx(U1, per_sample_k=k, mode="abs"))),
-                        _print_list(map(str, _freq_vote_topk_idx(U8, per_sample_k=k, mode="abs"))),
+                        _print_list(map(str, u_topk_idx0)),
+                        _print_list(map(str, u_topk_idx1)),
+                        _print_list(map(str, u_topk_idx8)),
+                    ]
+
+                    u_topk_explained_energy_vals = [
+                        _fracmass_on_set(U0, set(u_topk_idx0)),
+                        _fracmass_on_set(U1, set(u_topk_idx1)),
+                        _fracmass_on_set(U8, set(u_topk_idx8)),
                     ]
     
                     metrics_u = [
                         ("up_u_norm", u_norm_vals, "sci"),
                         (f"up_u_tok_act_idx k={k}", u_topk_idx_vals, ""),
+                        (f"u_explained_energy@top{k}_idx", u_topk_explained_energy_vals, "float"),
                     ]
 
                     print()
                     _print_metrics_table(metrics_u, col_names, title=f"[MLP subspace: U] layer={L}")  
 
+                    probe_idx = [8518, 422, 5723]
+                    _plot_wg_row_energy_stack(
+                        S0_rms,
+                        Wu,
+                        row_idxs=probe_idx,
+                        out_path=os.path.join(args.outdir, f"MLP_Wu_row_contrib_to_dot_tok0_L{L}.png"),
+                        title=f"Per-dim contrib to dot product (Xpre_rms_tok0 @ Wu_row) | L={L}",
+                        squash_boundary=24,
+                        topk=3,
+                    )
+
                 def _print_mlp_g_row_section():
-                    probe_idx = [5723, 8518, 422]
+                    probe_idx = [8518, 422, 5723]
                     probe_cols = [f"idx_{i}" for i in probe_idx]
                     norms_all, ranks_all = _row_norm_rank_desc(Wg)
 
