@@ -222,6 +222,10 @@ def _fracmass_on_set(Z, idx_set):
     num = (Z[:, idx] ** 2).sum(dim=1)
     return float((num / denom).mean().item())
 
+def _topk_idx_from_np(arr, k=3):
+    order = np.argsort(-arr)
+    return [int(i) for i in order[:int(k)].tolist()]
+
 def _topk_list_from_scores(scores, k):
     if scores is None or scores.numel() == 0:
         return []
@@ -546,7 +550,111 @@ def _vec_neg_topk(vec, k=3):
     neg_vals = neg_vals_all[order]
     return [int(i) for i in neg_idx.tolist()], [float(v) for v in neg_vals.tolist()]
 
-# decomposition of input functions
+def _select_topk_dims_from_rows(X, W_list, probe_idx, topk=2, topk_per_row=3):
+    probe_idx = [int(i) for i in probe_idx]
+    topk_per_row = int(topk_per_row)
+    D = int(X.size(1))
+
+    counts = np.zeros((D,), dtype=np.int64)
+    energy_sum = np.zeros((D,), dtype=np.float64)
+
+    for W in W_list:
+        for ridx in probe_idx:
+            w = W[int(ridx), :].to(dtype=torch.float32)
+            e, _what = _dot_contrib_energy_per_dim(X, w, eps=EPS)
+            top_idx = _topk_idx_from_np(e, k=topk_per_row)
+            for j in top_idx:
+                counts[int(j)] += 1
+                energy_sum[int(j)] += float(e[int(j)])
+
+    order = np.lexsort((-energy_sum, -counts))
+    topk_idx = [int(order[i]) for i in range(int(topk))]
+    return topk_idx, counts, energy_sum
+
+# hooks
+
+def _collect_residual_decomp_to_layer(model, layer_idx, tok_idxs, tokenized):
+    L = int(layer_idx)
+    tok_idxs = [int(t) for t in tok_idxs]
+    run_cache = {}
+
+    comps = []
+    comps.append(("embed", "embed"))
+    for i in range(0, L+1):
+        comps.append((f"attn_{i}", f"L{i}.attn"))
+        if i <= L - 1:
+            comps.append((f"mlp_{i}", f"L{i}.mlp"))
+    
+    buckets = {key: {t: [] for t in tok_idxs} for key, _lbl in comps}
+    comp_labels = {key: lbl for key, lbl in comps}
+
+    handles = []
+
+    # get embed states
+    h_emb = model.model.layers[0].register_forward_pre_hook(
+        lambda m, a, k, _c=run_cache: _c.__setitem__("embed", _get_hidden_from_hook_args(a, k).detach().float().cpu()),
+        with_kwargs=True,
+    )
+    handles.append(h_emb)
+
+    # get attn out and mlp out
+    for i in range(0, L+1):
+        attn = model.model.layers[i].self_attn
+        mlp = model.model.layers[i].mlp
+
+        def _mk_attn_hook(ii):
+            def _hook(_module, args, output, _c=run_cache):
+                _c[f"attn_{ii}"] = output[0].detach().float().cpu()
+            return _hook
+
+        def _mk_mlp_hook(ii):
+            def _hook(_module, args, output, _c=run_cache):
+                _c[f"mlp_{ii}"] = output.detach().float().cpu()
+            return _hook
+
+        handles.append(attn.register_forward_hook(_mk_attn_hook(i)))
+        if i <= L - 1:
+            handles.append(mlp.register_forward_hook(_mk_mlp_hook(i)))
+
+    try:
+        for input_ids, base_pos in tqdm(
+            tokenized,
+            desc=f"Collecting residual decomp to Xpre at L={L}",
+            leave=False,
+        ):
+            run_cache.clear()
+            _ = prefill(model, input_ids, base_pos)
+
+            for key, _lbl in comps:
+                if key not in run_cache:
+                    raise RuntimeError(f"[residual] Missing cache key: {key}")
+
+            for key, _lbl in comps:
+                X = run_cache[key][0]
+                S = int(X.size(0))
+                for t in tok_idxs:
+                    if t >= S:
+                        continue
+                    buckets[key][t].append(X[t].clone())
+
+    finally:
+        for h in handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+
+    out = {
+        "labels": comp_labels,
+        "data": {},
+    }
+    for key, _lbl in comps:
+        out["data"][key] = {}
+        for t in tok_idxs:
+            vecs = buckets[key][t]
+            if vecs:
+                out["data"][key][t] = torch.stack(vecs, dim=0) # [N, D]
+    return out
 
 def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
     cache_raw = {}
@@ -829,7 +937,81 @@ def _pick_head_with_caches(model, attns, layer_idx, head_idx):
         return pick_head(model._lower_attn_cache, layer_idx, head_idx)
     return pick_head(attns, layer_idx, head_idx)
 
-# Plotting functions
+# plots
+
+def _plot_residual_dim_heatmaps(dim_list, comp_names, tok0_mat, diff_mat, out_path, title):
+    assert len(dim_list) == tok0_mat.shape[0] == diff_mat.shape[0]
+    C = int(len(comp_names))
+    R = int(len(dim_list))
+
+    fig, axes = plt.subplots(R, 1, figsize=(max(10, 0.55 * C), 1.6 * R), sharex=True)
+    if R == 1:
+        axes = [axes]
+
+    def _row_norm(v):
+        v = v.astype(np.float32)
+        vmax = float(np.max(v))
+        vmin = float(np.min(v))
+        return vmin, vmax
+
+    for di, d in enumerate(dim_list):
+        ax = axes[di]
+
+        row_tok0 = tok0_mat[di:di+1, :]
+
+        vmin1, vmax1 = _row_norm(row_tok0)
+        _ = ax.imshow(
+            row_tok0,
+            aspect="auto",
+            interpolation="nearest",
+            vmin=vmin1,
+            vmax=vmax1,
+            extent=(-0.5, C - 0.5, -0.5, 0.5),
+        )
+
+        diff_vec = diff_mat[di, :].astype(np.float32)
+        max_abs = float(np.max(np.abs(diff_vec)))
+        if max_abs < EPS:
+            max_abs = 1e-6
+
+        y_base = 0.70
+        y_span = 0.45
+        xs = np.arange(C, dtype=np.float32)
+        heights = (diff_vec / max_abs) * y_span
+        
+        ax.bar(
+            xs,
+            heights,
+            width=0.35,
+            bottom=y_base,
+            alpha=0.9,
+            edgecolor="none",
+            clip_on=False,
+        )
+
+        ax.set_yticks([0])
+        ax.set_yticklabels(["tok0"], fontsize=9)
+
+        ax.set_title(
+            f"dim={int(d)} | heat=tok0 mean | bars=(tok0-tok8) mean",
+            fontsize=10,
+            loc="left",
+        )
+        ax.grid(False)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.tick_params(left=False)
+
+        ax.set_xlim(-0.5, C - 0.5)
+        ax.set_ylim(-0.5, 1.05)
+
+    axes[-1].set_xticks(list(range(C)))
+    axes[-1].set_xticklabels(comp_names, rotation=65, ha="right", fontsize=8)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0.0, 1, 0.985])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
 
 def _plot_per_gate_mean_contrib(Srms, gamma_base, gamma_alt, Wg, out_path, title):
     Srms = Srms.to(dtype=torch.float32)
@@ -1251,7 +1433,7 @@ def main():
     p.add_argument("--find-value-subspace", action="store_true", help="Collect V at token 0 and non-sink positions")
     p.add_argument("--find-key-subspace", action="store_true", help="Collect K at token 0 and non-sink positions")
     p.add_argument("--find-mlp-subspace", action="store_true", help="Collect MLP internals at token 0 and non-sink positions")
-    p.add_argument("--mlp", nargs="+", choices=["z", "g", "g-row", "g-sign", "u"], default=None, help="When --find-mlp-subspace, choose which sections to print")
+    p.add_argument("--mlp", nargs="+", choices=["z", "g", "g-row", "g-sign", "u", "residual"], default=None, help="When --find-mlp-subspace, choose which sections to print")
     p.add_argument("--pca-topk", type=int, default=6, help="Top-k PCA for groups of vectors")
     # decomposition of input
     p.add_argument("--decompose-ln", action="store_true", help="For --layer L, decompose the norm input LN(residual + attn + mlp) at L")
@@ -1616,7 +1798,7 @@ def main():
             tok_idxs = [0, 1, 8]
 
             if args.find_mlp_subspace:
-                mlp_sections = set(args.mlp) if args.mlp is not None else {"z", "g", "g-row", "g-sign", "u"}
+                mlp_sections = set(args.mlp) if args.mlp is not None else {"z", "g", "g-row", "g-sign", "u", "residual"}
 
                 mlp_data = _collect_mlp_internals_for_layer(model, L, tok_idxs, tokenized)
                 assert 0 in mlp_data["Y"]
@@ -2137,6 +2319,58 @@ def main():
                     print()
                     _print_metrics_table(gamma_metrics, gamma_cols, title=f"[MLP gate gamma] layer={L}", col_w=8)
 
+                def _print_mlp_residual_section():
+                    probe_idx = [8518, 422, 5723]
+
+                    top2_dim, _cnts, _esum = _select_topk_dims_from_rows(
+                        S0_rms,
+                        [Wg, Wu],
+                        probe_idx=probe_idx,
+                        topk=2,
+                        topk_per_row=3,
+                    )
+
+                    decomp = _collect_residual_decomp_to_layer(model, L, tok_idxs=[0, 8], tokenized=tokenized)
+                    labels = decomp["labels"]
+                    data = decomp["data"]
+
+                    comp_keys = []
+                    comp_names = []
+                    comp_keys.append("embed"); comp_names.append(labels["embed"])
+                    for i in range(0, L):
+                        comp_keys.append(f"attn_{i}"); comp_names.append(labels[f"attn_{i}"])
+                        comp_keys.append(f"mlp_{i}"); comp_names.append(labels[f"mlp_{i}"])
+                    comp_keys.append(f"attn_{L}"); comp_names.append(labels[f"attn_{L}"])
+
+                    dims = [int(d) for d in top2_dim]
+                    C = int(len(comp_keys))
+                    tok0_mat = np.zeros((len(dims), C), dtype=np.float32)
+                    diff_mat = np.zeros((len(dims), C), dtype=np.float32)
+
+                    for ci, key in enumerate(comp_keys):
+                        X0 = data[key].get(0, None)
+                        X8 = data[key].get(8, None)
+                        assert X0 is not None and X8 is not None
+
+                        for di, d in enumerate(dims):
+                            v0 = X0[:, d].to(dtype=torch.float32).mean().item()
+                            vd = (X0[:, d].to(dtype=torch.float32) - X8[:, d].to(dtype=torch.float32)).mean().item()
+                            tok0_mat[di, ci] = float(v0)
+                            diff_mat[di, ci] = float(vd)
+
+                    out_path = os.path.join(args.outdir, f"MLP_residual_decomp_dims_tok0_vs_tok8_L{L}.png")
+                    title = f"[Residual decomposition to MLP input] layer={L} | dims={dims} | row_vecs={probe_idx}"
+                    _plot_residual_dim_heatmaps(
+                        dim_list=dims,
+                        comp_names=comp_names,
+                        tok0_mat=tok0_mat,
+                        diff_mat=diff_mat,
+                        out_path=out_path,
+                        title=title,
+                    )
+                    print()
+                    print(f"[MLP residual decomp] auto-picked top dims: {dims} | saved: {out_path}")
+
                 if "z" in mlp_sections:
                     _print_mlp_z_section()
                 if "g" in mlp_sections:
@@ -2147,6 +2381,8 @@ def main():
                     _print_mlp_g_row_section()
                 if "g-sign" in mlp_sections:
                     _print_mlp_g_sign_section()
+                if "residual" in mlp_sections:
+                    _print_mlp_residual_section()
 
             if args.decompose_output:
                 raw_components = _collect_raw_components_for_layer(
