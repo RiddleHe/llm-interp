@@ -4,7 +4,7 @@
 
 ```bash
 pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-pip install numpy matplotlib tqdm transformers
+pip install numpy matplotlib tqdm transformers accelerate
 ```
 
 ## Topics
