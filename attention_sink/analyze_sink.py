@@ -122,7 +122,7 @@ def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_retu
         handles.append([h1, h2])
     return handles
 
-def _install_mlp_z_ablation_hook(
+def _install_mlp_out_ablation_hook(
     model,
     layer_idx,
     mode,
@@ -132,7 +132,7 @@ def _install_mlp_z_ablation_hook(
     clamp_alpha_max=1.0,
 ):
     handles = []
-    mlp = model.model.layers[L].mlp
+    mlp = model.model.layers[layer_idx].mlp
 
     Q = None
     if mode == "direction":
@@ -152,8 +152,8 @@ def _install_mlp_z_ablation_hook(
             v8 = y2[:, tok_ref, :]
             n0 = v0.norm(dim=-1).clamp_min(EPS)
             n8 = v8.norm(dim=-1)
-            alpha = (n8 / n0).to(dtype=torch.float32)
-            alpha = alpha.clamp_max(max=clamp_alpha_max)
+            alpha = (n8 / n0).to(dtype=v0.dtype)
+            alpha = alpha.clamp(max=clamp_alpha_max)
             y2[:, tok_ablate, :] = v0 * alpha.unsqueeze(-1)
             return y2
 
@@ -1039,6 +1039,35 @@ def _capture_qkv_multi(model, layer_idxs, cache, capture_attn_out=False, capture
 
     return handles
 
+def _scan_sink_attention_only(model, tokenized, scan_layers):
+    per_layer_acc = {
+        L: {"sink_attn_h": []}
+        for L in scan_layers
+    }
+
+    min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
+    last_q = min_len - 1
+
+    for input_ids, base_pos in tqdm(tokenized, desc="Scanning (attn only)", position=0, leave=False):
+        attns = prefill(model, input_ids, base_pos)
+
+        for L in scan_layers:
+            hm_all = _pick_all_heads_with_caches(model, attns, L)
+            sink_qmean_per_head = hm_all[:, 4:, 0].mean(dim=1)
+            per_layer_acc[L]["sink_attn_h"].append(sink_qmean_per_head.detach().cpu())
+            
+    stats = []
+    for L in sorted(per_layer_acc.keys()):
+        acc = per_layer_acc[L]
+        sink_mu, sink_var = _reduce_headwise(acc["sink_attn_h"])
+        stats.append({
+            "sink_attn": sink_mu,
+            "sink_attn_var": sink_var,
+            "layer": L,
+        })
+
+    return stats
+
 def compute_cosine_series(q, k, head_idx, k_sink_idx, q_positions):
     kv = k[0, head_idx, k_sink_idx]
     kn = F.normalize(kv, dim=0)
@@ -1479,8 +1508,7 @@ def main():
     p.add_argument("--model", default="Qwen/Qwen3-8B")
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32"])
-    p.add_argument("--prompt", default=None)
-    p.add_argument("--prompt-file", default=None)
+    p.add_argument("--prompt-file", default="prompts.txt")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--head", type=int, default=0)
     # scanning mode
@@ -1510,7 +1538,7 @@ def main():
     p.add_argument("--decompose-ln", action="store_true", help="For --layer L, decompose the norm input LN(residual + attn + mlp) at L")
     p.add_argument("--decompose-output", action="store_true", help="For --layer L, decompose the output (residual + attn + mlp) at L")
     # ablation
-    p.add_argument("--ablate-mlp-out", choices=["mag", "dir"], default=None, help="Ablate MLP output at token 0.")
+    p.add_argument("--ablate-mlp-out", choices=["magnitude", "direction"], default=None, help="Ablate MLP output at token 0.")
     p.add_argument("--vec-idx", type=int, nargs="+", default=None, help="Indices of the vectors to ablate.")
     # output
     p.add_argument("--outdir", default="results")
@@ -1519,13 +1547,7 @@ def main():
     _disable_packed_sequence_splitting()
     tok, model = load_model(args.model, args.device, args.dtype, random_init=args.random_init)
 
-    if args.prompt_file:
-        prompts = _load_prompts_from_file(args.prompt_file)
-    else:
-        if args.prompt:
-            prompts = [args.prompt]
-        else:
-            prompts = ["To understand the failure of window attention, we find an interesting phenomenon of autoregressive LLMs: a surprisingly large amount of attention score is allocated to the initial tokens, irrespective of their relevance to the language modeling task"]
+    prompts = _load_prompts_from_file(args.prompt_file)
 
     tokenized = []
     for text in prompts:
@@ -1702,7 +1724,41 @@ def main():
     if args.ablate_mlp_out:
         L = int(args.layer)
         scan_layers = list(range(L + 1, num_layers))
-        pass
+        vec_idx = [int(i) for i in args.vec_idx] if args.ablate_mlp_out == "direction" else None
+        
+        stats_before = _scan_sink_attention_only(model, tokenized, scan_layers)
+        ablate_handles = _install_mlp_out_ablation_hook(
+            model, 
+            L, 
+            args.ablate_mlp_out, 
+            vec_idx, 
+            tok_ablate=0, 
+            tok_ref=8
+        )
+        try:
+            stats_after = _scan_sink_attention_only(model, tokenized, scan_layers)
+        finally:
+            for h in ablate_handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+
+        before = sorted(stats_before, key=lambda x: x["layer"])
+        after = sorted(stats_after, key=lambda x: x["layer"])
+        series = [("before", before), ("after", after)]
+
+        tag = f"ablate_{args.ablate_mlp_out}_L{L}_token_0"
+        if args.ablate_mlp_out == "direction" and args.vec_idx:
+            tag += "_vec" + "_".join(map(str, args.vec_idx))
+
+        _plot_progression_multi(
+            series, args.outdir, key="sink_attn", ylabel=f"Attn(Q[q>=4] -> K[0]) (var across heads)",
+            title=f"Attention score before/after ablation={args.ablate_mlp_out} | L={L} | token=0",
+            fname=f"ablate_mlp_out_{tag}_L{L}.png", 
+            mode="prob",
+        )
+        return
 
     if args.scan:
         # perturbed pass
