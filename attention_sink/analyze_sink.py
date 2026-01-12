@@ -172,6 +172,26 @@ def _install_mlp_out_ablation_hook(
     handles.append(h)
     return handles
 
+def _install_mlp_in_ablation_hook(
+    model,
+    layer_idx,
+    dim_idx,
+    tok_ablate
+):
+    ln = model.model.layers[layer_idx].post_attention_layernorm
+
+    def _prehook(_module, args):
+        x = args[0] # [B, S, D]
+        B, S, D = int(x.size(0)), int(x.size(1)), int(x.size(2))
+
+        x2 = x.clone()
+        other = torch.cat([x2[:, :tok_ablate, :], x2[:, tok_ablate+1:, :]], dim=1) # [B, S-1, D]
+        mu = other.mean(dim=1) # [B, D]
+        x2[:, tok_ablate, dim_idx] = mu[:, dim_idx]
+        return (x2,)
+
+    h = ln.register_forward_pre_hook(_prehook)
+    return [h] 
 
 def apply_perturbations(base_pos, rope_overrides=None, mask=None):
     pos_ids = base_pos
@@ -447,6 +467,14 @@ def _fmt_mu_sd(mu, sd):
 
 def _pack3_str(vals):
     return _print_list(str(v) for v in vals)
+
+def _fetch_rows(W, row_idx_list):
+    return [W[i, :].to(dtype=torch.float32) for i in row_idx_list]
+
+def _dot_rows_pack_mu_sd(W, row_idx_list, X):
+    rows = _fetch_rows(W, row_idx_list)
+    vals = _dot_to_rows_mu_sd_str(rows, X)
+    return _print_list(vals)
 
 def _top3_pos_idx_vals_str(X, k=3):
     idx, vals = _topk_1d(X.mean(dim=0), k=k, mode="pos")
@@ -1540,6 +1568,8 @@ def main():
     # ablation
     p.add_argument("--ablate-mlp-out", choices=["magnitude", "direction"], default=None, help="Ablate MLP output at token 0.")
     p.add_argument("--vec-idx", type=int, nargs="+", default=None, help="Indices of the vectors to ablate.")
+    p.add_argument("--ablate-mlp-in", action="store_true", help="Ablate MLP input at token 0.")
+    p.add_argument("--dim-idx", type=int, nargs="+", default=None, help="Indices of the dimensions to ablate.")
     # output
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
@@ -1756,6 +1786,81 @@ def main():
             series, args.outdir, key="sink_attn", ylabel=f"Attn(Q[q>=4] -> K[0]) (var across heads)",
             title=f"Attention score before/after ablation={args.ablate_mlp_out} | L={L} | token=0",
             fname=f"ablate_mlp_out_{tag}_L{L}.png", 
+            mode="prob",
+        )
+        return
+
+    if args.ablate_mlp_in:
+        L = int(args.layer)
+        scan_layers = list(range(L + 1, num_layers))
+        dim_idx = [int(i) for i in (args.dim_idx or [])]
+        dim_str = _print_list(map(str, dim_idx))
+
+        mlp_before = _collect_mlp_internals_for_layer(model, L, [0], tokenized)
+        stats_before = _scan_sink_attention_only(model, tokenized, scan_layers)
+ 
+        G0_b = mlp_before["G"][0]
+        U0_b = mlp_before["U"][0]
+
+        wg_rows = _freq_vote_topk_idx(G0_b, per_sample_k=3, mode="abs", min_freq=0.55)
+        wu_rows = _freq_vote_topk_idx(U0_b, per_sample_k=3, mode="abs", min_freq=0.55)
+
+        mlp_mod = model.model.layers[L].mlp
+        Wg = mlp_mod.gate_proj.weight.detach().to(dtype=torch.float32).cpu()
+        Wu = mlp_mod.up_proj.weight.detach().to(dtype=torch.float32).cpu()
+
+        ablate_handles = _install_mlp_in_ablation_hook(
+            model,
+            layer_idx=L,
+            dim_idx=dim_idx,
+            tok_ablate=0,
+        )
+        try:
+            mlp_after = _collect_mlp_internals_for_layer(model, L, [0], tokenized)
+            stats_after = _scan_sink_attention_only(model, tokenized, scan_layers)
+        finally:
+            for h in ablate_handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+
+        # Dot product ablation
+
+        def _S_and_X(mlp_data):
+            X = mlp_data["X"][0]
+            S = (mlp_data["Attn_in"][0] + mlp_data["Attn_out"][0]).to(dtype=torch.float32)
+            return S, X
+
+        S0_b, X0_b = _S_and_X(mlp_before)
+        S0_a, X0_a = _S_and_X(mlp_after)
+
+        col_names = ["before", "after"]
+        metrics = [
+            ("Wg_rows", [str(wg_rows), "N/A"], ""),
+            ("Wu_rows", [str(wu_rows), "N/A"], ""),
+            ("X_preLN @ Wg_row", [_dot_rows_pack_mu_sd(Wg, wg_rows, S0_b), _dot_rows_pack_mu_sd(Wg, wg_rows, S0_a)], ""),
+            ("X_postLN @ Wg_row", [_dot_rows_pack_mu_sd(Wg, wg_rows, X0_b), _dot_rows_pack_mu_sd(Wg, wg_rows, X0_a)], ""),
+            ("X_preLN @ Wu_row", [_dot_rows_pack_mu_sd(Wu, wu_rows, S0_b), _dot_rows_pack_mu_sd(Wu, wu_rows, S0_a)], ""),
+            ("X_postLN @ Wu_row", [_dot_rows_pack_mu_sd(Wu, wu_rows, X0_b), _dot_rows_pack_mu_sd(Wu, wu_rows, X0_a)], ""),
+        ]
+        print()
+        _print_metrics_table(
+            metrics,
+            col_names,
+            title=f"[ablate_mlp_in] layers={L} | token=0 | dims={dim_str}",
+            col_w=36
+        )
+
+        before = sorted(stats_before, key=lambda x: x["layer"])
+        after = sorted(stats_after, key=lambda x: x["layer"])
+        series = [("before", before), ("after", after)]
+
+        tag = f"ablate_mlp_in_L{L}_tok0_dims_" + "_".join(map(str, dim_idx))
+        _plot_progression_multi(
+            series, args.outdir, key="sink_attn", ylabel=f"Attn(Q[q>=4] -> K) (var across heads)",
+            title=f"Attention score before/after MLP input ablation | L={L} | token=0 | dims={dim_str}",
+            fname=f"{tag}.png",
             mode="prob",
         )
         return
@@ -2063,9 +2168,10 @@ def main():
                     _topk_vals_mu_sd_str(G1, k=3, mode="abs"),
                     _topk_vals_mu_sd_str(G8, k=3, mode="abs"),
                 ]
-                a_topk_idx0 = _freq_vote_topk_idx(A0, per_sample_k=k, mode="pos")
-                a_topk_idx1 = _freq_vote_topk_idx(A1, per_sample_k=k, mode="pos")
-                a_topk_idx8 = _freq_vote_topk_idx(A8, per_sample_k=k, mode="pos")
+                k_a = 5
+                a_topk_idx0 = _freq_vote_topk_idx(A0, per_sample_k=k_a, mode="pos")
+                a_topk_idx1 = _freq_vote_topk_idx(A1, per_sample_k=k_a, mode="pos")
+                a_topk_idx8 = _freq_vote_topk_idx(A8, per_sample_k=k_a, mode="pos")
 
                 g_top_pos_vals = [
                     _topk_vals_mu_sd_str(G0, k=3, mode="pos"),
@@ -2086,7 +2192,7 @@ def main():
                     ("a_max_vals (pos)", a_top_pos_vals, ""),
                     ("a_entropy", a_entropy_vals, "float"),
                     ("a_norm", a_norm_vals, "sci"),
-                    (f"a_topk_act_idx k={k}", [
+                    (f"a_topk_act_idx k={k_a}", [
                         _print_list(map(str, a_topk_idx0)),
                         _print_list(map(str, a_topk_idx1)),
                         _print_list(map(str, a_topk_idx8)),
