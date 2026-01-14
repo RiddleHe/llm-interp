@@ -71,6 +71,15 @@ def _get_hidden_from_hook_args(args, kwargs):
         return kwargs["hidden_states"]
     return args[0]
 
+def _write_hidden_to_hook_args(x_new, args, kwargs):
+    if kwargs is not None and "hidden_states" in kwargs:
+        kwargs["hidden_states"] = x_new
+        return args, kwargs
+
+    args = list(args)
+    args[0] = x_new
+    return tuple(args), kwargs
+
 def _install_lower_attn_hooks(model, layers, factor=0.5, sink_k_idx=0, only_return_sink_value=False):
     handles = []
     num_heads = model.config.num_attention_heads
@@ -169,6 +178,33 @@ def _install_mlp_out_ablation_hook(
         return output
 
     h = mlp.register_forward_hook(_hook)
+    handles.append(h)
+    return handles
+
+def _install_local_input_subspace_ablation_hook(
+    model,
+    layer_idx,
+    Q,
+    tok_ablate=0,
+):
+    handles = []
+    blk = model.model.layers[layer_idx]
+
+    def _prehook(_module, args, kwargs):
+        x = _get_hidden_from_hook_args(args, kwargs)
+        x2 = x.clone()
+
+        v = x2[:, tok_ablate, :].to(dtype=torch.float32) # [B, D]
+        Qd = Q.to(device=v.device, dtype=torch.float32) # [D, n_vec]
+
+        coeff = v @ Qd # [B, n_vec]
+        proj = coeff @ Qd.T # [B, D]
+        v_new = v - proj
+        x2[:, tok_ablate, :] = v_new.to(dtype=x.dtype)
+        
+        return _write_hidden_to_hook_args(x2, args, kwargs)
+
+    h = blk.register_forward_pre_hook(_prehook, with_kwargs=True)
     handles.append(h)
     return handles
 
@@ -357,6 +393,13 @@ def _topk_activated_list_abs(Z, k):
         return []
     scores = Z.to(dtype=torch.float32).abs().mean(dim=0)
     return _topk_list_from_scores(scores, k)
+
+def _compute_Wd_subspace(model, layer_idx, vec_idx):
+    mlp = model.model.layers[layer_idx].mlp
+    Wd = mlp.down_proj.weight.detach().to(dtype=torch.float32)
+    B = Wd[:, vec_idx]
+    Q, _R = torch.linalg.qr(B, mode="reduced")
+    return Q.contiguous()
 
 def _k_for_energy_frac(X, fracs=(0.25, 0.75, 0.99)):
     if X is None or X.numel() == 0:
@@ -1755,6 +1798,10 @@ def main():
         L = int(args.layer)
         scan_layers = list(range(L + 1, num_layers))
         vec_idx = [int(i) for i in args.vec_idx] if args.ablate_mlp_out == "direction" else None
+
+        Q = None
+        if args.ablate_mlp_out == "direction":
+            Q = _compute_Wd_subspace(model, L, vec_idx)
         
         stats_before = _scan_sink_attention_only(model, tokenized, scan_layers)
         ablate_handles = _install_mlp_out_ablation_hook(
@@ -1769,14 +1816,29 @@ def main():
             stats_after = _scan_sink_attention_only(model, tokenized, scan_layers)
         finally:
             for h in ablate_handles:
+                h.remove()
+
+        stats_local = []
+        
+        if Q is not None:
+            for L2 in scan_layers:
+                local_handles = _install_local_input_subspace_ablation_hook(
+                    model,
+                    layer_idx=L2,
+                    Q=Q,
+                    tok_ablate=0,
+                )
                 try:
-                    h.remove()
-                except Exception:
-                    pass
+                    stats = _scan_sink_attention_only(model, tokenized, [L2])
+                    stats_local.extend(stats)
+                finally:
+                    for h in local_handles:
+                        h.remove()
 
         before = sorted(stats_before, key=lambda x: x["layer"])
         after = sorted(stats_after, key=lambda x: x["layer"])
-        series = [("before", before), ("after", after)]
+        local = sorted(stats_local, key=lambda x: x["layer"])
+        series = [("baseline", before), ("mlp_out_ablated", after), ("layer_input_ablated", local)]
 
         tag = f"ablate_{args.ablate_mlp_out}_L{L}_token_0"
         if args.ablate_mlp_out == "direction" and args.vec_idx:
