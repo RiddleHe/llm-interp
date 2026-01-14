@@ -14,13 +14,13 @@ The script uses CLI arguments to simulate a variety of attention sink related ph
 ### Progression of vector norms and spreads across layers
 
 ```bash
-python analyze_sink.py --scan --print qkv --prompt-file prompts.txt --outdir [outdir] --sink-idx [idx] --scan-interval [itvl]
+python analyze_sink.py --scan --print qkv --sink-idx [list_of_idx] --scan-interval [itvl]
 ```
 
 ### Key vectors in a specific layer
 
 ```bash
-python analyze_sink.py --prompt-file prompts.txt --find-key-subspace --layer [layer_idx] --head [head_idx] --outdir [outdir]
+python analyze_sink.py --find-key-subspace --layer [layer_idx] --head [head_idx] 
 ```
 
 The output will have the following features:
@@ -36,7 +36,7 @@ The output will have the following features:
 ### Output activation in a specific layer
 
 ```bash
-python analyze_sink.py --prompt-file prompts.txt --decompose-output --layer [layer_idx]
+python analyze_sink.py --decompose-output --layer [layer_idx]
 ```
 
 The output will have the following features:
@@ -55,5 +55,11 @@ The output will have the following features:
 ### MLP module outputs in a specific layer
 
 ```bash
-python analyze_sink.py --prompt-file prompts.txt --find-mlp-subspace --layer [layer_idx]
+python analyze_sink.py --find-mlp-subspace --layer [layer_idx]
+```
+
+### Ablating MLP outputs and see subsequent layer's attention scores
+
+```bash
+python analyze_sink.py --layer [layer_idx] --ablate-mlp-out direction --vec-idx [list_of_idx]
 ```
