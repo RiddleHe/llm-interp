@@ -1,4 +1,3 @@
-from curses import KEY_F50
 import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math, copy
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
@@ -208,27 +207,6 @@ def _install_local_input_subspace_ablation_hook(
     handles.append(h)
     return handles
 
-def _install_mlp_in_ablation_hook(
-    model,
-    layer_idx,
-    dim_idx,
-    tok_ablate
-):
-    ln = model.model.layers[layer_idx].post_attention_layernorm
-
-    def _prehook(_module, args):
-        x = args[0] # [B, S, D]
-        B, S, D = int(x.size(0)), int(x.size(1)), int(x.size(2))
-
-        x2 = x.clone()
-        other = torch.cat([x2[:, :tok_ablate, :], x2[:, tok_ablate+1:, :]], dim=1) # [B, S-1, D]
-        mu = other.mean(dim=1) # [B, D]
-        x2[:, tok_ablate, dim_idx] = mu[:, dim_idx]
-        return (x2,)
-
-    h = ln.register_forward_pre_hook(_prehook)
-    return [h] 
-
 def apply_perturbations(base_pos, rope_overrides=None, mask=None):
     pos_ids = base_pos
     applied = {}
@@ -251,7 +229,25 @@ def _register_block_raw_captures(model, L, cache):
 
     return handles
 
-# PCA
+# Geometric analysis
+
+def _mean_dot_to_rows(X, W, row_idx_list):
+    X = X.to(dtype=torch.float32)
+    W = W.to(dtype=torch.float32, device=X.device)
+    rows = torch.tensor([int(i) for i in row_idx_list], dtype=torch.long, device=X.device)
+    Wsel = W.index_select(0, rows)
+    dots = X @ Wsel.t()
+    return dots.mean(dim=1)
+
+def _pos_frac(G):
+    return (G > 0).to(dtype=torch.float32).mean(dim=1) 
+
+def _frac_energy_on_set_per_sample(Z, idx_list):
+    Z = Z.to(dtype=torch.float32) # [B, D]
+    idx = torch.tensor([int(i) for i in idx_list], dtype=torch.long, device=Z.device) 
+    denom = (Z ** 2).sum(dim=1).clamp_min(EPS) # [B]
+    num = (Z.index_select(1, idx) ** 2).sum(dim=1) # [B]
+    return num / denom # [B]
 
 def _svd_centered(X, full_matrices=False):
     Xc = X - X.mean(dim=0, keepdim=True)
@@ -311,14 +307,6 @@ def _mean_dir_decomposition(XQ, XK, VhQ, label, k):
     if mu_norm_sq <= EPS:
         return 0.0
     return _frac_energy_on_direction(XQ, mu)
-
-def _set_overlap_ratio(A, B, k):
-    k = int(k)
-    if k <= 0:
-        return 0.0
-    if not A or not B:
-        return 0.0
-    return float(len(A & B) / float(k))
 
 def _fracmass_on_set(Z, idx_set):
     if Z is None or Z.numel() == 0 or (not idx_set):
@@ -928,17 +916,12 @@ def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
 def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
     mlp = model.model.layers[layer_idx].mlp
     attn = model.model.layers[layer_idx].self_attn
+    ln = model.model.layers[layer_idx].post_attention_layernorm
     cache = {}
 
-    h_blk = model.model.layers[layer_idx].register_forward_pre_hook(
-        lambda m, a, k, _c=cache: _c.__setitem__("attn_in", _get_hidden_from_hook_args(a, k).detach().float().cpu()),
-        with_kwargs=True,
-    ) # capture attn input
-    def _attn_hook(_module, args, output, _cache=cache):
-        attn_out = output[0]
-        _cache["attn_out"] = attn_out.detach().float().cpu()
-    h_attn = attn.register_forward_hook(_attn_hook) # capture attn output
-    # attn output + attn input -> MLP input
+    def _ln_prehook(_module, args, _cache=cache):
+        _cache["ln_in"] = args[0].detach().float().cpu()
+    h_ln = ln.register_forward_pre_hook(_ln_prehook)
 
     def _mlp_hook(_module, inputs, output, _cache=cache):
         x = inputs[0]
@@ -962,8 +945,7 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
     A_tok = copy.deepcopy(X_tok)
     Z_tok = copy.deepcopy(X_tok)
     Y_tok = copy.deepcopy(X_tok)
-    Attn_in_tok = copy.deepcopy(X_tok)
-    Attn_out_tok = copy.deepcopy(X_tok)
+    LN_in_tok = copy.deepcopy(X_tok)
 
     try:
         for input_ids, base_pos in tqdm(
@@ -973,7 +955,7 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
         ):
             cache.clear()
             _ = prefill(model, input_ids, base_pos)
-            assert all(k in cache for k in ["x", "g", "u", "a", "z", "y", "attn_in", "attn_out"])
+            assert all(k in cache for k in ["x", "g", "u", "a", "z", "y", "ln_in"])
 
             x = cache["x"][0]
             g = cache["g"][0]
@@ -981,8 +963,7 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
             a = cache["a"][0]
             z = cache["z"][0]
             y = cache["y"][0]
-            attn_in = cache["attn_in"][0]
-            attn_out = cache["attn_out"][0]
+            ln_in = cache["ln_in"][0]
             S = int(x.shape[0])
             for t in tok_idxs:
                 assert t < S
@@ -992,17 +973,16 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
                 A_tok[t].append(a[t].clone())
                 Z_tok[t].append(z[t].clone())
                 Y_tok[t].append(y[t].clone())
-                Attn_in_tok[t].append(attn_in[t].clone())
-                Attn_out_tok[t].append(attn_out[t].clone())
+                LN_in_tok[t].append(ln_in[t].clone())
 
     finally:
-        for _h in [h, h_attn, h_blk]:
+        for _h in [h, h_ln]:
             try:
                 _h.remove()
             except Exception:
                 pass
 
-    out = {"X": {}, "G": {}, "U": {}, "A": {}, "Z": {}, "Y": {}, "Attn_in": {}, "Attn_out": {}}
+    out = {"X": {}, "G": {}, "U": {}, "A": {}, "Z": {}, "Y": {}, "LN_in": {}}
     for name, bucket in [
         ("X", X_tok),
         ("G", G_tok),
@@ -1010,14 +990,77 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
         ("A", A_tok),
         ("Z", Z_tok),
         ("Y", Y_tok),
-        ("Attn_in", Attn_in_tok),
-        ("Attn_out", Attn_out_tok),
+        ("LN_in", LN_in_tok),
     ]:
         for t, vecs in bucket.items():
             if vecs:
                 out[name][t] = torch.stack(vecs, dim=0)
 
     return out
+
+def _collect_mlp_scalar_metrics_for_layer(
+    model,
+    layer_idx,
+    tok_idx,
+    tokenized,
+    Wg,
+    Wu,
+    wg_rows,
+    wu_rows,
+    z_idx,
+):
+    mlp = model.model.layers[layer_idx].mlp
+    out = {
+        "wg_dot": [],
+        "wu_dot": [],
+        "pos_frac": [],
+        "z_frac": [],
+        "out_log_norm": [],
+    }
+
+    def _hook(_module, inputs, output):
+        x = inputs[0]
+        y = output
+        x0 = x[:, tok_idx, :].detach()
+        y0 = y[:, tok_idx, :].detach()
+
+        with torch.no_grad():
+            g = _module.gate_proj(x).detach()
+            u = _module.up_proj(x).detach()
+            a = _module.act_fn(g).detach()
+            z = (a * u).detach()
+
+            g0 = g[:, tok_idx, :]
+            z0 = z[:, tok_idx, :]
+
+            wg_dot = _mean_dot_to_rows(x0.to(dtype=torch.float32), Wg, wg_rows)
+            wu_dot = _mean_dot_to_rows(x0.to(dtype=torch.float32), Wu, wu_rows)
+            posfrac = _pos_frac(g0)
+            zfrac = _frac_energy_on_set_per_sample(z0, z_idx)
+            outln = torch.log(y0.norm(dim=1).clamp_min(EPS))
+
+            out["wg_dot"].append(wg_dot.detach().float().cpu())
+            out["wu_dot"].append(wu_dot.detach().float().cpu())
+            out["pos_frac"].append(posfrac.detach().float().cpu())
+            out["z_frac"].append(zfrac.detach().float().cpu())
+            out["out_log_norm"].append(outln.detach().float().cpu())
+
+    h = mlp.register_forward_hook(_hook)
+    try:
+        for input_ids, base_pos in tqdm(
+            tokenized,
+            desc=f"Collecting MLP metrics at L={layer_idx} | token={tok_idx}",
+            leave=False,
+        ):
+            _ = prefill(model, input_ids, base_pos)
+    finally:
+        h.remove()
+
+    out_np = {}
+    for k, chunks in out.items():
+        v = torch.cat(chunks, dim=0).numpy().astype(np.float32)
+        out_np[k] = v
+    return out_np
 
 # Parsing functions
 
@@ -1378,6 +1421,64 @@ def _plot_wg_row_energy_stack(X, Wg, row_idxs, out_path, title, squash_boundary=
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
 
+def _plot_ablation_delta_bars(
+    comp_names,
+    deltas_mu_sd,
+    out_path,
+    title,
+):
+    metrics = [
+        ("wg_dot", "Δ X_postLN @ Wg_rows"),
+        ("wu_dot", "Δ X_postLN @ Wu_rows"),
+        ("pos_frac", "Δ (G > 0)"),
+        ("z_frac", "Δ Z frac energy @ top 3 dims"),
+        ("out_log_norm", "Δ log ||MLP_out||")
+    ]
+    K = len(comp_names)
+
+    fig, axes = plt.subplots(
+        len(metrics),
+        1,
+        figsize=(13.5, max(10, 1.10 * K)),
+        sharey=True,
+    )
+    if len(metrics) == 1:
+        axes = [axes]
+
+    y = np.arange(K, dtype=np.int32)
+    for i, (mkey, ylab) in enumerate(metrics):
+        ax = axes[i]
+        mu, sd = deltas_mu_sd[mkey]
+        mu = np.asarray(mu, dtype=np.float32)
+        sd = np.asarray(sd, dtype=np.float32)
+
+        ax.barh(y, mu, height=0.68, alpha=0.90, edgecolor="none")
+        ax.errorbar(
+            mu,
+            y,
+            xerr=sd,
+            fmt="none",
+            ecolor="black",
+            elinewidth=0.8,
+            capsize=2,
+            alpha=0.55,
+        )
+
+        ax.axvline(0.0, color="black", linewidth=0.8)
+        ax.set_xlabel(ylab)
+        ax.grid(True, axis="x", linewidth=0.4, alpha=0.35)
+        ax.grid(False, axis="y")
+
+        ax.set_yticks(y)
+        ax.set_yticklabels(comp_names, fontsize=8)
+        ax.set_ylabel("Residual term", fontsize=9)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.subplots_adjust(left=0.38, hspace=0.28)
+    fig.tight_layout(rect=[0, 0.0, 1, 0.985])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
 def _plot_wg_col_distrib(Wg, top_idx, out_path, title, highlight_rows=None):
     col = Wg[:, int(top_idx)].to(dtype=torch.float32).detach().cpu().numpy()
     plt.figure(figsize=(7, 3.5))
@@ -1612,7 +1713,6 @@ def main():
     p.add_argument("--ablate-mlp-out", choices=["magnitude", "direction"], default=None, help="Ablate MLP output at token 0.")
     p.add_argument("--vec-idx", type=int, nargs="+", default=None, help="Indices of the vectors to ablate.")
     p.add_argument("--ablate-mlp-in", action="store_true", help="Ablate MLP input at token 0.")
-    p.add_argument("--dim-idx", type=int, nargs="+", default=None, help="Indices of the dimensions to ablate.")
     # output
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
@@ -1855,75 +1955,125 @@ def main():
     if args.ablate_mlp_in:
         L = int(args.layer)
         scan_layers = list(range(L + 1, num_layers))
-        dim_idx = [int(i) for i in (args.dim_idx or [])]
-        dim_str = _print_list(map(str, dim_idx))
+        tok_ablate = 0
 
-        mlp_before = _collect_mlp_internals_for_layer(model, L, [0], tokenized)
-        stats_before = _scan_sink_attention_only(model, tokenized, scan_layers)
- 
-        G0_b = mlp_before["G"][0]
-        U0_b = mlp_before["U"][0]
+        mlp_before = _collect_mlp_internals_for_layer(model, L, [tok_ablate], tokenized)
+        G0_b = mlp_before["G"][tok_ablate]
+        U0_b = mlp_before["U"][tok_ablate]
+        Z0_b = mlp_before["Z"][tok_ablate]
 
         wg_rows = _freq_vote_topk_idx(G0_b, per_sample_k=3, mode="abs", min_freq=0.55)
         wu_rows = _freq_vote_topk_idx(U0_b, per_sample_k=3, mode="abs", min_freq=0.55)
+        z_idx = _freq_vote_topk_idx(Z0_b, per_sample_k=3, mode="abs", min_freq=0.55)
 
         mlp_mod = model.model.layers[L].mlp
+        ln = model.model.layers[L].post_attention_layernorm
         Wg = mlp_mod.gate_proj.weight.detach().to(dtype=torch.float32).cpu()
         Wu = mlp_mod.up_proj.weight.detach().to(dtype=torch.float32).cpu()
 
-        ablate_handles = _install_mlp_in_ablation_hook(
+        decomp = _collect_residual_decomp_to_layer(model, L, [tok_ablate], tokenized)
+        labels = decomp["labels"]
+        data = decomp["data"]
+
+        comp_keys = []
+        comp_names = []
+        comp_keys.append("embed"); comp_names.append(labels["embed"])
+        for i in range(0, L):
+            comp_keys.append(f"attn_{i}"); comp_names.append(labels[f"attn_{i}"])
+            comp_keys.append(f"mlp_{i}"); comp_names.append(labels[f"mlp_{i}"])
+        comp_keys.append(f"attn_{L}"); comp_names.append(labels[f"attn_{L}"])
+
+        stats_base = _scan_sink_attention_only(model, tokenized, scan_layers)
+        base_scalars = _collect_mlp_scalar_metrics_for_layer(
             model,
-            layer_idx=L,
-            dim_idx=dim_idx,
-            tok_ablate=0,
-        )
-        try:
-            mlp_after = _collect_mlp_internals_for_layer(model, L, [0], tokenized)
-            stats_after = _scan_sink_attention_only(model, tokenized, scan_layers)
-        finally:
-            for h in ablate_handles:
-                try:
-                    h.remove()
-                except Exception:
-                    pass
-
-        # Dot product ablation
-
-        def _S_and_X(mlp_data):
-            X = mlp_data["X"][0]
-            S = (mlp_data["Attn_in"][0] + mlp_data["Attn_out"][0]).to(dtype=torch.float32)
-            return S, X
-
-        S0_b, X0_b = _S_and_X(mlp_before)
-        S0_a, X0_a = _S_and_X(mlp_after)
-
-        col_names = ["before", "after"]
-        metrics = [
-            ("Wg_rows", [str(wg_rows), "N/A"], ""),
-            ("Wu_rows", [str(wu_rows), "N/A"], ""),
-            ("X_preLN @ Wg_row", [_dot_rows_pack_mu_sd(Wg, wg_rows, S0_b), _dot_rows_pack_mu_sd(Wg, wg_rows, S0_a)], ""),
-            ("X_postLN @ Wg_row", [_dot_rows_pack_mu_sd(Wg, wg_rows, X0_b), _dot_rows_pack_mu_sd(Wg, wg_rows, X0_a)], ""),
-            ("X_preLN @ Wu_row", [_dot_rows_pack_mu_sd(Wu, wu_rows, S0_b), _dot_rows_pack_mu_sd(Wu, wu_rows, S0_a)], ""),
-            ("X_postLN @ Wu_row", [_dot_rows_pack_mu_sd(Wu, wu_rows, X0_b), _dot_rows_pack_mu_sd(Wu, wu_rows, X0_a)], ""),
-        ]
-        print()
-        _print_metrics_table(
-            metrics,
-            col_names,
-            title=f"[ablate_mlp_in] layers={L} | token=0 | dims={dim_str}",
-            col_w=36
+            L,
+            tok_ablate,
+            tokenized,
+            Wg,
+            Wu,
+            wg_rows,
+            wu_rows,
+            z_idx,
         )
 
-        before = sorted(stats_before, key=lambda x: x["layer"])
-        after = sorted(stats_after, key=lambda x: x["layer"])
-        series = [("before", before), ("after", after)]
+        series = [("baseline", sorted(stats_base, key=lambda x: x["layer"]))]
+        deltas_mu_sd = {
+            "wg_dot": ([], []),
+            "wu_dot": ([], []),
+            "pos_frac": ([], []),
+            "z_frac": ([], []),
+            "out_log_norm": ([], []),
+        }
 
-        tag = f"ablate_mlp_in_L{L}_tok0_dims_" + "_".join(map(str, dim_idx))
+        for key, name in tqdm(
+            list(zip(comp_keys, comp_names)),
+            desc=f"[ablate_mlp_in] leave-one-component-out @ pre-LN | L={L}",
+            leave=False,
+        ):
+            Xc = data[key][tok_ablate] # [N, D]
+            ctr = {"i": 0}
+
+            def _prehook(_module, args, _ctr=ctr, _Xc=Xc):
+                x = args[0] #[1, S, D]
+                i = int(_ctr["i"]) # keep track of the index of the current prompt
+                _ctr["i"] = i + 1
+                if i < 0 or i >= int(_Xc.size(0)):
+                    return (x,)
+                x2 = x.clone()
+                v = _Xc[i].to(device=x2.device, dtype=x2.dtype) # [D], retrieve component of the current prompt
+                x2[:, tok_ablate, :] = x2[:, tok_ablate, :] - v.view(1, -1) # [1, D]
+                return (x2,)
+
+            h = ln.register_forward_pre_hook(_prehook)
+
+            try:
+                ctr["i"] = 0 # reset for prompt scanning
+                stats_c = _scan_sink_attention_only(model, tokenized, scan_layers)
+                series.append((name, sorted(stats_c, key=lambda x: x["layer"])))
+
+                ctr["i"] = 0 # reset again for another round of prompt scanning
+                scal_c = _collect_mlp_scalar_metrics_for_layer(
+                    model,
+                    L,
+                    tok_ablate,
+                    tokenized,
+                    Wg,
+                    Wu,
+                    wg_rows,
+                    wu_rows,
+                    z_idx
+                )
+
+                for mk in deltas_mu_sd.keys():
+                    d = (scal_c[mk] - base_scalars[mk]).astype(np.float32)
+                    mu = float(np.mean(d))
+                    sd = float(np.std(d))
+                    deltas_mu_sd[mk][0].append(mu)
+                    deltas_mu_sd[mk][1].append(sd)
+            finally:
+                h.remove()
+
+        
+        tag = f"ablate_mlp_in_preLN_components_targetL{L}_tok{tok_ablate}"
         _plot_progression_multi(
-            series, args.outdir, key="sink_attn", ylabel=f"Attn(Q[q>=4] -> K) (var across heads)",
-            title=f"Attention score before/after MLP input ablation | L={L} | token=0 | dims={dim_str}",
-            fname=f"{tag}.png",
+            series, args.outdir, key="sink_attn", ylabel=f"Attn(Q[q>=4] -> K[0]) (var across heads)",
+            title=(
+                f"Sink attention after pre-LN leave-one-component-out | "
+                f"target MLP layer={L} token={tok_ablate}"
+            ),
+            fname=f"{tag}_sink_attn.png",
             mode="prob",
+        )
+
+        out_path = os.path.join(args.outdir, f"{tag}_mlp_scalar_deltas.png")
+        _plot_ablation_delta_bars(
+            comp_names=comp_names,
+            deltas_mu_sd={k: (deltas_mu_sd[k][0], deltas_mu_sd[k][1]) for k in deltas_mu_sd.keys()},
+            out_path=out_path,
+            title=(
+                f"Pre-LN component ablations (Δ vs baseline) | L={L} tok={tok_ablate} | "
+                f"Wg_rows={wg_rows} Wu_rows={wu_rows} Z_top3={z_idx}"
+            ),
         )
         return
 
@@ -2132,12 +2282,10 @@ def main():
             U0 = mlp_data["U"][0]; U1 = mlp_data["U"][1]; U8 = mlp_data["U"][8]
             A0 = mlp_data["A"][0]; A1 = mlp_data["A"][1]; A8 = mlp_data["A"][8]
             X0 = mlp_data["X"][0]; X1 = mlp_data["X"][1]; X8 = mlp_data["X"][8]
-            AttnIn0 = mlp_data["Attn_in"][0]; AttnIn1 = mlp_data["Attn_in"][1]; AttnIn8 = mlp_data["Attn_in"][8]
-            AttnOut0 = mlp_data["Attn_out"][0]; AttnOut1 = mlp_data["Attn_out"][1]; AttnOut8 = mlp_data["Attn_out"][8]
 
-            S0 = (AttnIn0 + AttnOut0).float()
-            S1 = (AttnIn1 + AttnOut1).float()
-            S8 = (AttnIn8 + AttnOut8).float()
+            S0 = mlp_data["LN_in"][0].float()
+            S1 = mlp_data["LN_in"][1].float()
+            S8 = mlp_data["LN_in"][8].float()
 
             S0_rms = S0 / _rms(S0, dim=1, keepdim=True)
             S1_rms = S1 / _rms(S1, dim=1, keepdim=True)
