@@ -998,27 +998,36 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
 
     return out
 
-def _collect_mlp_scalar_metrics_for_layer(
+def _scan_sink_and_collect_mlp_scalars(
     model,
+    tokenized,
+    scan_layers,
     layer_idx,
     tok_idx,
-    tokenized,
     Wg,
     Wu,
     wg_rows,
     wu_rows,
     z_idx,
 ):
+    # attention metrics
+    per_layer_acc = {L: {"sink_attn_h": []} for L in scan_layers}
+    
     mlp = model.model.layers[layer_idx].mlp
-    out = {
+    scal = {
         "wg_dot": [],
         "wu_dot": [],
         "pos_frac": [],
         "z_frac": [],
         "out_log_norm": [],
+        "out_frac_z": [],
     }
 
-    def _hook(_module, inputs, output):
+    attn_out_norm = []
+
+    z_idx_t = torch.tensor(z_idx, dtype=torch.long)
+
+    def _mlp_hook(_module, inputs, output):
         x = inputs[0]
         y = output
         x0 = x[:, tok_idx, :].detach()
@@ -1039,28 +1048,59 @@ def _collect_mlp_scalar_metrics_for_layer(
             zfrac = _frac_energy_on_set_per_sample(z0, z_idx)
             outln = torch.log(y0.norm(dim=1).clamp_min(EPS))
 
-            out["wg_dot"].append(wg_dot.detach().float().cpu())
-            out["wu_dot"].append(wu_dot.detach().float().cpu())
-            out["pos_frac"].append(posfrac.detach().float().cpu())
-            out["z_frac"].append(zfrac.detach().float().cpu())
-            out["out_log_norm"].append(outln.detach().float().cpu())
+            scal["wg_dot"].append(wg_dot.detach().float().cpu())
+            scal["wu_dot"].append(wu_dot.detach().float().cpu())
+            scal["pos_frac"].append(posfrac.detach().float().cpu())
+            scal["z_frac"].append(zfrac.detach().float().cpu())
+            scal["out_log_norm"].append(outln.detach().float().cpu())
 
-    h = mlp.register_forward_hook(_hook)
+            y0f = y0.to(dtype=torch.float32)
+            denom = (y0f.pow(2).sum(dim=1)).clamp_min(EPS)
+            idx = z_idx_t.to(device=y0f.device)
+            sel = y0f.index_select(1, idx)
+            frac = (sel.pow(2) / denom.unsqueeze(1))
+            scal["out_frac_z"].append(frac.detach().cpu())
+
+    attn = model.model.layers[layer_idx].self_attn
+    def _attn_hook(_module, args, output):
+        aout = output[0]
+        v = aout[:, tok_idx, :].detach().to(dtype=torch.float32)
+        attn_out_norm.append(v.norm(dim=1).detach().cpu())
+
+    h_attn = attn.register_forward_hook(_attn_hook)
+    h = mlp.register_forward_hook(_mlp_hook)
+
     try:
         for input_ids, base_pos in tqdm(
             tokenized,
-            desc=f"Collecting MLP metrics at L={layer_idx} | token={tok_idx}",
+            desc=f"Collecting MLP metrics and sink attention at L={layer_idx} | token={tok_idx}",
             leave=False,
         ):
-            _ = prefill(model, input_ids, base_pos)
+            attns = prefill(model, input_ids, base_pos)
+
+            for L in scan_layers:
+                hm_all = _pick_all_heads_with_caches(model, attns, L)
+                sink_qmean_per_head = hm_all[:, 4:, 0].mean(dim=1)
+                per_layer_acc[L]["sink_attn_h"].append(sink_qmean_per_head.detach().cpu())
+
     finally:
         h.remove()
+        h_attn.remove()
 
-    out_np = {}
-    for k, chunks in out.items():
+    attn_stats = []
+    for L in sorted(per_layer_acc.keys()):
+        acc = per_layer_acc[L]
+        sink_mu, sink_var = _reduce_headwise(acc["sink_attn_h"])
+        attn_stats.append({"sink_attn": sink_mu, "sink_attn_var": sink_var, "layer": L})
+
+    mlp_scal_np = {}
+    for k, chunks in scal.items():
         v = torch.cat(chunks, dim=0).numpy().astype(np.float32)
-        out_np[k] = v
-    return out_np
+        mlp_scal_np[k] = v
+
+    attn_out_norm_mu = float(torch.cat(attn_out_norm, dim=0).mean().item())
+
+    return attn_stats, mlp_scal_np, attn_out_norm_mu
 
 # Parsing functions
 
@@ -1326,6 +1366,89 @@ def _plot_per_gate_mean_contrib(Srms, gamma_base, gamma_alt, Wg, out_path, title
     plt.savefig(out_path, dpi=300)
     plt.close()
 
+def _plot_z_topk_energy_stacks(
+    Z_list,
+    tok_labels,
+    topk,
+    out_path,
+    title,
+):
+    norms_mu = []
+    parts = []
+    parts_idx = []
+
+    for Z in Z_list:
+        Z = Z.to(dtype=torch.float32)
+        nm = float(Z.norm(dim=1).mean().item())
+        norms_mu.append(nm)
+
+        e = (Z.pow(2)).mean(dim=0)
+        total = float(e.sum().clamp_min(EPS).item())
+        mass = (e / total).detach().cpu().numpy().astype(np.float32)
+
+        order = np.argsort(-mass)
+        k_eff = int(min(topk, order.shape[0]))
+        idx = [int(i) for i in order[:k_eff].tolist()]
+        top_mass = [float(mass[i]) for i in idx]
+        rest = float(max(0.0, 1.0 - sum(top_mass)))
+
+        parts_idx.append(idx)
+        parts.append(top_mass + [rest])
+
+    y = np.arange(len(tok_labels), dtype=np.int32)
+
+    fig, axes = plt.subplots(
+        2, 1, figsize=(13.0, 6.4), sharey=True,
+        gridspec_kw={"height_ratios": [2.0, 1.6]}
+    )
+    ax_full, ax_zoom = axes
+
+    cmap = plt.get_cmap("viridis")
+    top_colors = [cmap(t) for t in np.linspace(0.15, 0.85, topk)]
+    rest_face = (0.92, 0.92, 0.92, 1.0)
+    rest_edge = (0.45, 0.45, 0.45, 1.0)
+
+    def _draw(ax, xlim=None, show_labels=True):
+        for i, (nm, fracs, idxs) in enumerate(zip(norms_mu, parts, parts_idx)):
+            left = 0.0
+
+            for j, f in enumerate(fracs[:-1]):
+                w = float(nm) * float(f)
+                ax.barh(i, w, left=left, height=0.62, color=top_colors[j], alpha=0.92, edgecolor="white", linewidth=0.6)
+
+                if show_labels and (j < 6) and (w > 0.06 * max(1.0, nm)):
+                    ax.text(left + 0.5 * w, i, str(int(idxs[j])), ha="center", va="center", fontsize=8, color="black")
+
+                left += w
+        
+            w_rest = float(nm) * float(fracs[-1])
+            ax.barh(i, w_rest, left=left, height=0.62, color=rest_face, alpha=1.0, edgecolor=rest_edge, linewidth=0.9, hatch="///")
+            left += w_rest
+
+            ax.text(left + 0.01 * max(1.0, left), i, f"||Z||≈{nm:.1f}", va="center", ha="left", fontsize=9, color="black")
+
+        ax.set_yticks(y)
+        ax.set_yticklabels(tok_labels, fontsize=10)
+        ax.set_ylabel("token", fontsize=10)
+        ax.grid(True, axis="x", linewidth=0.4, alpha=0.18)
+        ax.grid(False, axis="y")
+        ax.tick_params(axis="y", pad=6)
+
+        if xlim is not None:
+            ax.set_xlim(0.0, float(xlim))
+
+    ax_full.set_title(title, fontsize=11, loc="center", pad=10)
+    ax_full.set_xlabel("mean ||Z|| (stacked by top-k energy dims + rest)", labelpad=10)
+    _draw(ax_full, xlim=None, show_labels=True)
+
+    zoom_ref = max(norms_mu[1:])
+    ax_zoom.set_xlabel("mean ||Z|| (zoom to tok1/tok8 scale)", labelpad=10)
+    _draw(ax_zoom, xlim=zoom_ref * 1.15, show_labels=True)
+
+    fig.subplots_adjust(left=0.12, right=0.98, top=0.90, bottom=0.10, hspace=0.30)
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
 def _plot_wg_row_energy_stack(X, Wg, row_idxs, out_path, title, squash_boundary=16, topk=3):
     fig, axes = plt.subplots(len(row_idxs), 1, figsize=(12, 7.5), sharex=False, squeeze=False)
     axes = axes[:, 0]
@@ -1426,13 +1549,16 @@ def _plot_ablation_delta_bars(
     deltas_mu_sd,
     out_path,
     title,
+    out_log_norm_parts=None,
+    out_log_norm_dim_labels=None,
+    out_log_norm_ref=None,
 ):
     metrics = [
-        ("wg_dot", "Δ X_postLN @ Wg_rows"),
-        ("wu_dot", "Δ X_postLN @ Wu_rows"),
-        ("pos_frac", "Δ (G > 0)"),
-        ("z_frac", "Δ Z frac energy @ top 3 dims"),
-        ("out_log_norm", "Δ log ||MLP_out||")
+        ("wg_dot", "Δz (X_postLN · Wg_rows)"),
+        ("wu_dot", "Δz (X_postLN · Wu_rows)"),
+        ("pos_frac", "Δ pp (G > 0)"),
+        ("z_frac", "Relative Δ (Z frac @ top3)"),
+        ("out_log_norm", "×  (baseline=1)")
     ]
     K = len(comp_names)
 
@@ -1445,6 +1571,9 @@ def _plot_ablation_delta_bars(
     if len(metrics) == 1:
         axes = [axes]
 
+    rest_face = (0.92, 0.92, 0.92, 1.0)
+    rest_edge = (0.45, 0.45, 0.45, 1.0)
+
     y = np.arange(K, dtype=np.int32)
     for i, (mkey, ylab) in enumerate(metrics):
         ax = axes[i]
@@ -1452,7 +1581,45 @@ def _plot_ablation_delta_bars(
         mu = np.asarray(mu, dtype=np.float32)
         sd = np.asarray(sd, dtype=np.float32)
 
-        ax.barh(y, mu, height=0.68, alpha=0.90, edgecolor="none")
+        if (mkey == "out_log_norm") and (out_log_norm_parts is not None) and (out_log_norm_dim_labels is not None):
+            Kp = len(out_log_norm_dim_labels)
+            cmap = plt.get_cmap("viridis")
+            dim_colors = [cmap(t) for t in np.linspace(0.15, 0.85, max(1, Kp))]
+            
+            for row_i in range(len(y)):
+                total = float(mu[row_i])
+                parts = out_log_norm_parts[row_i]
+                left = 0.0
+
+                for j in range(Kp):
+                    frac = float(parts[j])
+                    w = total * frac
+                    ax.barh(
+                        y[row_i], w, left=left, height=0.68,
+                        color=dim_colors[j],
+                        alpha=0.92,
+                        edgecolor="white",
+                        linewidth=0.6,
+                    )
+
+                    if w > 0.12 * max(1e-6, total):
+                        ax.text(
+                            left + 0.5 * w, y[row_i], out_log_norm_dim_labels[j],
+                            ha="center", va="center", fontsize=8, color="black",
+                        )
+                    left += w
+
+                frac_rest = float(parts[-1])
+                w_rest = total * frac_rest
+                ax.barh(
+                    y[row_i], w_rest, left=left, height=0.68,
+                    color=rest_face, alpha=1.0,
+                    edgecolor=rest_edge, linewidth=0.9,
+                    hatch="///",
+                )
+        else:
+            ax.barh(y, mu, height=0.68, alpha=0.90, edgecolor="none")
+
         ax.errorbar(
             mu,
             y,
@@ -1464,7 +1631,25 @@ def _plot_ablation_delta_bars(
             alpha=0.55,
         )
 
-        ax.axvline(0.0, color="black", linewidth=0.8)
+        if mkey == "out_log_norm":
+            ax.axvline(1.0, color="black", linewidth=0.9, linestyle="--")
+            if out_log_norm_ref is not None:
+                ref = float(out_log_norm_ref)
+                ax.axvline(ref, color=(0.35, 0.35, 0.35), linewidth=1.2, linestyle=":")
+                xmax = float(np.nanmax(mu + sd))
+                if ref < 0.05 * max(1e-6, xmax):
+                    ax.text(0.01 * max(1.0, xmax), y[-1] + 0.2, f"attn_ref={ref:.3g}",
+                            fontsize=8, ha="left", va="bottom", color=(0.25, 0.25, 0.25))
+                else:
+                    ax.text(ref, y[-1] + 0.2, f"attn_ref={ref:.3g}", fontsize=8, ha="center",
+                            va="bottom", color=(0.25, 0.25, 0.25))
+        else:
+            ax.axvline(0.0, color="black", linewidth=0.8)
+
+        if mkey in ("wg_dot", "wu_dot"):
+            ax.xaxis.set_major_locator(ticker.MultipleLocator(1.0))
+            ax.xaxis.set_minor_locator(ticker.MultipleLocator(0.5))
+
         ax.set_xlabel(ylab)
         ax.grid(True, axis="x", linewidth=0.4, alpha=0.35)
         ax.grid(False, axis="y")
@@ -1472,6 +1657,17 @@ def _plot_ablation_delta_bars(
         ax.set_yticks(y)
         ax.set_yticklabels(comp_names, fontsize=8)
         ax.set_ylabel("Residual term", fontsize=9)
+
+        if (mkey == "out_log_norm") and (out_log_norm_parts is not None) and (out_log_norm_dim_labels is not None):
+            import matplotlib.patches as mpatches
+            Kp = len(out_log_norm_dim_labels)
+            cmap = plt.get_cmap("viridis")
+            dim_colors = [cmap(t) for t in np.linspace(0.15, 0.85, max(1, Kp))]
+            handles = []
+            for j in range(Kp):
+                handles.append(mpatches.Patch(facecolor=dim_colors[j], edgecolor="white", label=f"dim {out_log_norm_dim_labels[j]}"))
+            handles.append(mpatches.Patch(facecolor=rest_face, edgecolor=rest_edge, hatch="///", label="rest"))
+            ax.legend(handles=handles, loc="lower right", fontsize=8, frameon=False, ncol=2)
 
     fig.suptitle(title, fontsize=12, y=0.995)
     fig.subplots_adjust(left=0.38, hspace=0.28)
@@ -1983,18 +2179,21 @@ def main():
             comp_keys.append(f"mlp_{i}"); comp_names.append(labels[f"mlp_{i}"])
         comp_keys.append(f"attn_{L}"); comp_names.append(labels[f"attn_{L}"])
 
-        stats_base = _scan_sink_attention_only(model, tokenized, scan_layers)
-        base_scalars = _collect_mlp_scalar_metrics_for_layer(
+        stats_base, base_scalars, attn_out_norm_mu = _scan_sink_and_collect_mlp_scalars(
             model,
+            tokenized,
+            scan_layers,
             L,
             tok_ablate,
-            tokenized,
             Wg,
             Wu,
             wg_rows,
             wu_rows,
             z_idx,
         )
+
+        base_mlp_out_norm_mu = float(np.exp(base_scalars["out_log_norm"]).mean())
+        attn_ref_mult = float(attn_out_norm_mu / (base_mlp_out_norm_mu + EPS))
 
         series = [("baseline", sorted(stats_base, key=lambda x: x["layer"]))]
         deltas_mu_sd = {
@@ -2004,6 +2203,9 @@ def main():
             "z_frac": ([], []),
             "out_log_norm": ([], []),
         }
+
+        out_log_norm_parts = []
+        out_log_norm_dim_labels = [str(int(i)) for i in (z_idx or [])]
 
         for key, name in tqdm(
             list(zip(comp_keys, comp_names)),
@@ -2027,29 +2229,59 @@ def main():
             h = ln.register_forward_pre_hook(_prehook)
 
             try:
-                ctr["i"] = 0 # reset for prompt scanning
-                stats_c = _scan_sink_attention_only(model, tokenized, scan_layers)
-                series.append((name, sorted(stats_c, key=lambda x: x["layer"])))
-
                 ctr["i"] = 0 # reset again for another round of prompt scanning
-                scal_c = _collect_mlp_scalar_metrics_for_layer(
+                stats_c, scal_c, _ = _scan_sink_and_collect_mlp_scalars(
                     model,
+                    tokenized,
+                    scan_layers,
                     L,
                     tok_ablate,
-                    tokenized,
                     Wg,
                     Wu,
                     wg_rows,
                     wu_rows,
                     z_idx
                 )
+                series.append((name, sorted(stats_c, key=lambda x: x["layer"])))
+
+                fr = scal_c["out_frac_z"]
+                fr_mu = fr.mean(axis=0).astype(np.float64).tolist()
+                rest = float(max(0.0, 1.0 - float(np.sum(fr_mu))))
+                out_log_norm_parts.append([float(x) for x in fr_mu] + [rest])
 
                 for mk in deltas_mu_sd.keys():
-                    d = (scal_c[mk] - base_scalars[mk]).astype(np.float32)
-                    mu = float(np.mean(d))
-                    sd = float(np.std(d))
-                    deltas_mu_sd[mk][0].append(mu)
-                    deltas_mu_sd[mk][1].append(sd)
+                    base = base_scalars[mk].astype(np.float32)
+                    cur = scal_c[mk].astype(np.float32)
+
+                    mu_base = float(base.mean())
+                    sd_base = float(base.std())
+
+                    mu_cur = float(cur.mean())
+                    sd_cur = float(cur.std())
+
+                    if mk in ("wg_dot", "wu_dot"):
+                        # z score
+                        mu = (mu_cur - mu_base) / (sd_base + EPS)
+                        sd = sd_cur / (sd_base + EPS)
+
+                    elif mk == "pos_frac":
+                        v = 100.0 * (cur - base)
+                        mu = float(v.mean())
+                        sd = float(v.std())
+
+                    elif mk == "z_frac":
+                        v = (cur - base) / (base + EPS)
+                        mu = float(v.mean())
+                        sd = float(v.std())
+
+                    elif mk == "out_log_norm":
+                        v = np.exp(cur - base)
+                        mu = float(v.mean())
+                        sd = float(v.std())
+                        
+                    deltas_mu_sd[mk][0].append(float(mu))
+                    deltas_mu_sd[mk][1].append(float(sd))
+
             finally:
                 h.remove()
 
@@ -2074,6 +2306,9 @@ def main():
                 f"Pre-LN component ablations (Δ vs baseline) | L={L} tok={tok_ablate} | "
                 f"Wg_rows={wg_rows} Wu_rows={wu_rows} Z_top3={z_idx}"
             ),
+            out_log_norm_parts=out_log_norm_parts,
+            out_log_norm_dim_labels=out_log_norm_dim_labels,
+            out_log_norm_ref=attn_ref_mult,
         )
         return
 
@@ -2346,6 +2581,15 @@ def main():
                 ]
                 print()
                 _print_metrics_table(metrics_z, col_names, title=f"[MLP subspace: Z/W_d] layer={L}")
+
+                out_path = os.path.join(args.outdir, f"MLP_Z_topk_energy_stacks_L{L}.png")
+                _plot_z_topk_energy_stacks(
+                    Z_list=[Z0, Z1, Z8],
+                    tok_labels=["tok0", "tok1", "tok8"],
+                    topk=24,
+                    out_path=out_path,
+                    title=f"Z: norm + top-k energy segments per token | L={L}"
+                )
             
             def _print_mlp_g_section():
                 g_entropy_vals = [
