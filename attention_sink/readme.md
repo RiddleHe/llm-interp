@@ -14,24 +14,8 @@ The script uses CLI arguments to simulate a variety of attention sink related ph
 ### Progression of vector norms and spreads across layers
 
 ```bash
-python analyze_sink.py --scan --print qkv --sink-idx [list_of_idx] --scan-interval [itvl]
+python analyze_sink.py --scan --print qkv
 ```
-
-### Key vectors in a specific layer
-
-```bash
-python analyze_sink.py --find-key-subspace --layer [layer_idx] --head [head_idx] 
-```
-
-The output will have the following features:
-
-|                   | tok0 | tok1 | tok8 |
-|-------------------|------|------|------|
-|spread_radius      |      |      |      |
-|mean_norm          |      |      |      |
-|cos(Q, K)          |      |      |      |
-|cos_centered(Q, K) |      |      |      |
-|frac_Q_along_mean_K|      |      |      |
 
 ### Output activation in a specific layer
 
@@ -55,11 +39,16 @@ The output will have the following features:
 ### MLP module outputs in a specific layer
 
 ```bash
-python analyze_sink.py --find-mlp-subspace --layer [layer_idx]
+python analyze_sink.py --find-mlp-subspace --layer [layer_idx] --mlp z
 ```
 
 ### Ablating MLP outputs and see subsequent layer's attention scores
 
 ```bash
-python analyze_sink.py --layer [layer_idx] --ablate-mlp-out direction --vec-idx [list_of_idx]
+python analyze_sink.py --layer [layer_idx] --ablate-mlp-out [direction|magnitude]
 ```
+
+### Ablating MLP input and see important dimensions
+
+```bash
+python analyze_sink.py --layer [layer_idx] --decompose-mlp-in
