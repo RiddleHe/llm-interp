@@ -229,6 +229,171 @@ def _install_sink_key_ablation_hooks(
 
     return handles
 
+def _install_mlp_out_ablation_hooks(model, layers, tok_idxs, factor=0.0):
+    """
+    Selectively scale MLP output for certain token positions at certain layers.
+    This ablates the *write* step (your L6 MLP finding).
+    """
+    layers = [int(L) for L in layers]
+    tok_idxs = [int(t) for t in tok_idxs]
+    factor = float(factor)
+    handles = []
+    for L in layers:
+        mlp = model.model.layers[L].mlp
+
+        def _mk_hook(_L):
+            def fwd_hook(_module, args, output):
+                # output: [B, S, D]
+                out = output
+                try:
+                    B, S, D = out.shape
+                except Exception:
+                    return output
+                out2 = out.clone()
+                for t in tok_idxs:
+                    if 0 <= t < S:
+                        out2[:, t, :] *= factor
+                return out2
+            return fwd_hook
+
+        h = mlp.register_forward_hook(_mk_hook(L))
+        handles.append(h)
+    return handles
+
+def _install_attn_out_ablation_hooks(model, layers, tok_idxs, factor=0.0):
+    """
+    Selectively scale attention output (the tensor returned by self_attn, before residual add)
+    for certain token positions at certain layers.
+
+    This lets us do Experiment-2 style "output point = 0" interventions for the Attention branch.
+    """
+    layers = [int(L) for L in layers]
+    tok_idxs = [int(t) for t in tok_idxs]
+    factor = float(factor)
+    handles = []
+    for L in layers:
+        attn = model.model.layers[L].self_attn
+
+        def _mk_hook(_L):
+            def fwd_hook(_module, args, output):
+                # output: typically tuple(attn_out, attn_probs, ...)
+                try:
+                    attn_out = output[0]  # [B, S, D]
+                except Exception:
+                    return output
+                try:
+                    B, S, D = attn_out.shape
+                except Exception:
+                    return output
+                out2 = attn_out.clone()
+                for t in tok_idxs:
+                    if 0 <= t < S:
+                        out2[:, t, :] *= factor
+                out_list = list(output) if isinstance(output, (tuple, list)) else [output]
+                if out_list:
+                    out_list[0] = out2
+                    return tuple(out_list) if isinstance(output, tuple) else out_list
+                return output
+            return fwd_hook
+
+        h = attn.register_forward_hook(_mk_hook(L))
+        handles.append(h)
+    return handles
+
+def _install_mask_edit_hooks(
+    model,
+    layers,
+    split_boundary=None,
+    split_renorm=True,
+    q0_allow_k=None,
+):
+    """
+    Mask-edit interventions implemented as post-softmax probability edits + recompute attention output.
+
+    - split_boundary=m: for queries q>=m, set probs[..., :m]=0 then renorm (creates a second causal boundary).
+    - q0_allow_k=k: override q=0 probs to be uniform over keys [0..k-1] (breaks the unique q=0 boundary signature).
+    """
+    layers = [int(L) for L in layers]
+    split_boundary = None if split_boundary is None else int(split_boundary)
+    q0_allow_k = None if q0_allow_k is None else int(q0_allow_k)
+    split_renorm = bool(split_renorm)
+
+    handles = []
+    num_heads = model.config.num_attention_heads
+    num_kv = model.config.num_key_value_heads
+    num_groups = max(1, num_heads // max(1, num_kv))
+
+    # Reuse cache readers for heatmaps / sink-attn computations
+    model._lower_attn_cache = {}
+
+    for L in layers:
+        attn = model.model.layers[L].self_attn
+        cache = {}
+
+        def _prehook(_module, args, kwargs, _cache=cache,
+                     _num_heads=num_heads, _num_kv=num_kv, _num_groups=num_groups, _head_dim=model.config.head_dim):
+            hidden_states = kwargs["hidden_states"]
+            B, S, _ = hidden_states.shape
+            v = _module.v_proj(hidden_states).view(B, S, _num_kv, _head_dim)
+            v = v.transpose(1, 2).contiguous()
+            if _num_kv != _num_heads:
+                v = v.repeat_interleave(_num_groups, dim=1)
+            _cache["v"] = v
+
+        def _fwdhook(_module, args, output, _cache=cache, _L=L):
+            attn_output, attn_probs = output[0], output[1]  # [B,H,Q,K]
+            probs = attn_probs.clone()
+            B, H, Q, K = probs.shape
+
+            # 1) split boundary: second causal boundary at m
+            if split_boundary is not None:
+                m = max(0, min(split_boundary, Q))
+                if m < Q:
+                    probs[:, :, m:, :m] = 0.0
+                    if split_renorm:
+                        sub = probs[:, :, m:, :]
+                        denom = sub.sum(dim=-1, keepdim=True).clamp_min(EPS)
+                        probs[:, :, m:, :] = sub / denom
+
+            # 2) break q=0 boundary privilege: overwrite probs[q=0] to uniform over first k keys
+            if q0_allow_k is not None and Q > 0:
+                k = max(1, min(q0_allow_k, K))
+                probs[:, :, 0, :] = 0.0
+                probs[:, :, 0, :k] = 1.0 / float(k)
+
+            v = _cache["v"]
+            ctx = torch.matmul(probs, v)  # [B,H,Q,D]
+            ctx = ctx.transpose(1, 2).contiguous().view(B, Q, -1)
+            new_out = _module.o_proj(ctx)
+
+            model._lower_attn_cache[_L] = probs.detach().float().cpu()
+
+            out_list = list(output)
+            out_list[0] = new_out
+            out_list[1] = probs
+            return tuple(out_list)
+
+        h1 = attn.register_forward_pre_hook(_prehook, with_kwargs=True)
+        h2 = attn.register_forward_hook(_fwdhook)
+        handles.append([h1, h2])
+
+    return handles
+
+@torch.no_grad()
+def eval_loss(model, input_ids, position_ids):
+    device = next(model.parameters()).device
+    ids = input_ids.to(device)
+    pos = position_ids.to(device)
+    out = model(
+        input_ids=ids,
+        position_ids=pos,
+        labels=ids,
+        use_cache=False,
+        output_attentions=False,
+        output_hidden_states=False,
+    )
+    return float(out.loss.detach().float().item())
+
 def apply_perturbations(base_pos, rope_overrides=None, mask=None):
     pos_ids = base_pos
     applied = {}
@@ -809,6 +974,302 @@ def _plot_progression(stats_a, outdir, key, ylabel, title, fname, suffix="", sta
     plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
     plt.close()
 
+def _plot_step_cos(step_names, mean_cos_by_tok, outdir, fname, title):
+    """
+    step_names: list[str] for steps *excluding* the initial "embed" step, i.e. these are transitions
+               where y[i] = cos(step_i, step_{i-1}).
+    mean_cos_by_tok: dict[int -> list[float]] each list aligned with step_names.
+    """
+    if not step_names or not mean_cos_by_tok:
+        return
+    xs = np.arange(len(step_names))
+    plt.figure(figsize=(max(9, 0.55 * len(step_names)), 3.6))
+    ax = plt.gca()
+    for t, ys in sorted(mean_cos_by_tok.items(), key=lambda kv: kv[0]):
+        if ys is None or len(ys) != len(step_names):
+            continue
+        ax.plot(xs, ys, marker="o", linewidth=1.4, markersize=3, label=f"tok[{t}]")
+    ax.set_xticks(xs)
+    ax.set_xticklabels(step_names, rotation=55, ha="right")
+    ax.set_ylabel("cos(step_t, step_{t-1})")
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(alpha=0.25)
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=8, ncols=2)
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, fname), dpi=300)
+    plt.close()
+
+def _plot_zero_point_sweep(results, outdir, fname, title, sort=True, yerr=None, yerr_label=None):
+    """
+    results: list[dict] with keys:
+      - point (str), layer (int), kind (str)
+      - baseline_jump, ablated_jump, delta_jump
+      - baseline_L, baseline_Lm1, ablated_L, ablated_Lm1
+    """
+    if not results:
+        return
+    rows = results[:]
+    if sort:
+        rows = sorted(rows, key=lambda r: float(r.get("delta_jump", 0.0)), reverse=True)
+    labels = [r["point"] for r in rows]
+    ys = [float(r.get("delta_jump", 0.0)) for r in rows]
+    xs = np.arange(len(labels))
+    plt.figure(figsize=(max(10, 0.55 * len(labels)), 3.9))
+    ax = plt.gca()
+    if yerr is not None:
+        ax.bar(xs, ys, yerr=yerr, capsize=2.5, color="tab:blue", alpha=0.85, ecolor="black", linewidth=0.4)
+        if yerr_label:
+            ax.text(
+                0.99, 0.98, f"error bar: {yerr_label}",
+                transform=ax.transAxes, ha="right", va="top", fontsize=8, alpha=0.8
+            )
+    else:
+        ax.bar(xs, ys, color="tab:blue", alpha=0.85)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(labels, rotation=65, ha="right", fontsize=8)
+    ax.set_ylabel("delta jump = baseline_jump - ablated_jump")
+    ax.grid(axis="y", alpha=0.25)
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, fname), dpi=300)
+    plt.close()
+
+def _find_layer_attn_input_norm(layer):
+    """
+    Best-effort find the *pre-attention* norm module inside a decoder layer.
+    We hook this module to edit the tensor fed into attention (while keeping the residual path unchanged).
+    """
+    cand = [
+        "input_layernorm",           # LLaMA-style
+        "input_layer_norm",
+        "ln_1",                      # GPT-style
+        "norm1",
+        "self_attn_layer_norm",
+        "attention_norm",
+        "attn_norm",
+    ]
+    for name in cand:
+        if hasattr(layer, name):
+            return getattr(layer, name), name
+    # Fall back to a heuristic search by name/type.
+    for name, mod in layer.named_modules():
+        n = name.lower()
+        if any(k in n for k in ["input_layernorm", "input_layer_norm", "ln_1", "norm1", "attn_norm", "attention_norm", "self_attn_layer_norm"]):
+            return mod, name
+    return None, None
+
+def _install_l0mlp_path_split_hooks(model, tok_idx=0, mode="no_into_l1_attn"):
+    """
+    Split the influence of L0 MLP(t0) into two routes at L1:
+      - mode='no_into_l1_attn': remove L0_mlp[t0] from the tensor that is *normalized and fed into L1 attention*.
+                               Residual add around L1 attention still carries L0_mlp[t0] forward.
+      - mode='no_bypass_l1_attn': keep L1 attention computation unchanged, but subtract L0_mlp[t0] from L1 attn_out[t0]
+                                  so that after residual add, the direct bypass contribution is cancelled.
+    """
+    t = int(tok_idx)
+    handles = []
+    cache = {}
+
+    # 1) Capture L0 MLP output vector for tok t (per prompt).
+    mlp0 = model.model.layers[0].mlp
+
+    def _cap_mlp0(_module, _args, output, _cache=cache, _t=t):
+        out = output
+        try:
+            B, S, D = out.shape
+        except Exception:
+            return output
+        if 0 <= _t < S:
+            _cache["mlp0_tok"] = out[:, _t, :].detach()
+        else:
+            _cache["mlp0_tok"] = None
+        return output
+
+    handles.append(mlp0.register_forward_hook(_cap_mlp0))
+
+    if mode == "no_into_l1_attn":
+        # 2A) Edit the input to L1 pre-attn norm (runs after residual snapshot, before attention compute).
+        layer1 = model.model.layers[1]
+        norm_mod, norm_name = _find_layer_attn_input_norm(layer1)
+        if norm_mod is None:
+            raise RuntimeError("[l0mlp-path] Could not find L1 pre-attention norm module to hook (input_layernorm/ln_1/etc).")
+
+        def _pre_norm_hook(_module, args, _cache=cache, _t=t):
+            if not args:
+                return None
+            x = args[0]
+            vec = _cache.get("mlp0_tok", None)
+            if vec is None:
+                return None
+            try:
+                B, S, D = x.shape
+            except Exception:
+                return None
+            if not (0 <= _t < S):
+                return None
+            x2 = x.clone()
+            x2[:, _t, :] = x2[:, _t, :] - vec
+            return (x2,)
+
+        handles.append(norm_mod.register_forward_pre_hook(_pre_norm_hook))
+        return handles
+
+    if mode == "no_bypass_l1_attn":
+        # 2B) Cancel the bypass contribution by subtracting mlp0_tok from L1 attn_out[t].
+        attn1 = model.model.layers[1].self_attn
+
+        def _attn1_hook(_module, args, output, _cache=cache, _t=t):
+            vec = _cache.get("mlp0_tok", None)
+            if vec is None:
+                return output
+            try:
+                attn_out = output[0]
+            except Exception:
+                return output
+            try:
+                B, S, D = attn_out.shape
+            except Exception:
+                return output
+            if not (0 <= _t < S):
+                return output
+            out2 = attn_out.clone()
+            out2[:, _t, :] = out2[:, _t, :] - vec
+            out_list = list(output) if isinstance(output, (tuple, list)) else [output]
+            if out_list:
+                out_list[0] = out2
+                return tuple(out_list) if isinstance(output, tuple) else out_list
+            return output
+
+        handles.append(attn1.register_forward_hook(_attn1_hook))
+        return handles
+
+    raise ValueError(f"[l0mlp-path] Unknown mode: {mode}")
+
+@torch.no_grad()
+def run_step_cos_experiment(model, tokenized, rope_overrides, max_layer, tok_idxs, outdir):
+    """
+    Experiment 1 (user request):
+      token -> embedding -> L0_attn -> L0_mlp -> L1_attn -> ...
+    For each transition, compute cos(step_t, step_{t-1}) for selected token indices.
+
+    We define "step vectors" as RESIDUAL STREAM states:
+      embed = residual entering layer0 attention
+      L_attn = residual_pre + attn_out
+      L_mlp  = L_attn + mlp_out
+    """
+    os.makedirs(outdir, exist_ok=True)
+    device = next(model.parameters()).device
+    num_layers = int(model.config.num_hidden_layers)
+    max_L = max(0, min(int(max_layer), num_layers - 1))
+    layers = list(range(0, max_L + 1))
+
+    # Ensure token idxs are valid for all prompts.
+    min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
+    tok_idxs = [int(t) for t in tok_idxs if 0 <= int(t) < int(min_len)]
+    if not tok_idxs:
+        raise ValueError(f"[step-cos] No valid --step-cos-tok-idxs remain after min_len={int(min_len)} filter.")
+
+    # Capture residual + (attn_out, mlp_out) for each scanned layer.
+    store = {}
+    handles = _capture_qkv_multi(
+        model,
+        layers,
+        store,
+        capture_attn_out=True,
+        capture_mlp_out=True,
+    )
+
+    # Step names (transitions exclude the initial embed state).
+    step_names = []
+    for L in layers:
+        step_names.append(f"L{L}_attn")
+        step_names.append(f"L{L}_mlp")
+
+    # Accumulate per-prompt cos for each transition step.
+    # acc[tok_idx][step_i] where step_i aligns with step_names (i.e., current step index).
+    acc = {int(t): [[] for _ in step_names] for t in tok_idxs}
+    try:
+        for input_ids, base_pos in tqdm(tokenized, desc="[step-cos] prompts", position=0, leave=False):
+            for L in list(store.keys()):
+                store[L].clear()
+            pos_ids, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
+            _ = model(
+                input_ids=input_ids.to(device),
+                position_ids=pos_ids.to(device),
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
+
+            # Build residual-step tensors for this prompt.
+            # embed state: residual entering layer0 attn
+            R_prev = store[0]["residual"][0]  # [S, D]
+            step_vecs = []
+            for L in layers:
+                entry = store[L]
+                attn_out = entry.get("attn_out", None)
+                mlp_out = entry.get("mlp_out", None)
+                if attn_out is None or mlp_out is None:
+                    raise RuntimeError(f"[step-cos] Missing attn_out/mlp_out in store for layer {L}.")
+                attn_out = attn_out[0]
+                mlp_out = mlp_out[0]
+                R_attn = entry["residual"][0] + attn_out
+                R_mlp = R_attn + mlp_out
+                step_vecs.append(R_attn)
+                step_vecs.append(R_mlp)
+
+            # Compute transition cosines for selected tokens.
+            for si, cur in enumerate(step_vecs):
+                for t in tok_idxs:
+                    prev_v = R_prev[t]
+                    cur_v = cur[t]
+                    cos = float(F.cosine_similarity(cur_v, prev_v, dim=0).item())
+                    acc[int(t)][si].append(cos)
+                R_prev = cur
+    finally:
+        for h in handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+
+    # Summarize mean/std and plot.
+    report = {
+        "experiment": "step_cos",
+        "max_layer": int(max_L),
+        "tok_idxs": [int(t) for t in tok_idxs],
+        "step_names": step_names,
+        "n_prompts": int(len(tokenized)),
+        "min_len": int(min_len),
+        "series": {},  # tok -> list[{step, mean, std}]
+    }
+    mean_cos_by_tok = {}
+    for t in tok_idxs:
+        series = []
+        means = []
+        for si, name in enumerate(step_names):
+            vals = acc[int(t)][si]
+            mu = float(np.mean(vals)) if vals else float("nan")
+            sd = float(np.std(vals)) if vals else float("nan")
+            series.append({"step": name, "mean": mu, "std": sd})
+            means.append(mu)
+        report["series"][str(int(t))] = series
+        mean_cos_by_tok[int(t)] = means
+
+    out_json = os.path.join(outdir, "step_cos_report.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    _plot_step_cos(
+        step_names=step_names,
+        mean_cos_by_tok=mean_cos_by_tok,
+        outdir=outdir,
+        fname="step_cos.png",
+        title=f"Stepwise cosine drift (max_layer={int(max_L)}, prompts={int(len(tokenized))})",
+    )
+    print(f"[step-cos] wrote {out_json}")
+    print(f"[step-cos] wrote {os.path.join(outdir, 'step_cos.png')}")
+
 def _plot_sink_attn_heads(head_means_by_layer, outdir, fname, top_heads, title, suffix=""):
     """
     Plot sink-attention (mean prob to a fixed key) across layers for multiple heads.
@@ -831,6 +1292,40 @@ def _plot_sink_attn_heads(head_means_by_layer, outdir, fname, top_heads, title, 
     ax.xaxis.set_major_locator(ticker.MultipleLocator(2))
     ax.set_title(title)
     ax.legend(loc="best", ncols=2, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
+    plt.close()
+
+def _plot_sink_attn_jump_bars(jumps, outdir, fname, title, suffix="", sort=False):
+    """
+    Plot a bar chart of per-head jump in sink-attention between two layers, i.e.,
+    jump_h = sink_attn(L) - sink_attn(L_prev) for each head h.
+
+    jumps: np.ndarray shape [H]
+    """
+    if jumps is None:
+        return
+    jumps = np.asarray(jumps).astype(float)
+    if jumps.ndim != 1 or jumps.size == 0:
+        return
+    H = int(jumps.size)
+    idx = np.arange(H, dtype=int)
+    if sort:
+        order = np.argsort(jumps)[::-1]
+        idx = idx[order]
+        jumps = jumps[order]
+
+    plt.figure(figsize=(10.5, 3.8))
+    ax = plt.gca()
+    ax.bar(np.arange(H), jumps, color="tab:blue")
+    ax.axhline(0.0, color="black", linewidth=0.7)
+    ax.set_xlabel("Head")
+    ax.set_ylabel("jump in mean attn prob to sink key")
+    ax.set_title(title)
+    ax.set_xlim(-0.5, H - 0.5)
+    # Show head indices as labels (rotate for readability)
+    ax.set_xticks(np.arange(H))
+    ax.set_xticklabels([str(int(i)) for i in idx], rotation=90, fontsize=7)
     plt.tight_layout()
     plt.savefig(_append_suffix(os.path.join(outdir, fname), suffix), dpi=300)
     plt.close()
@@ -990,6 +1485,8 @@ def main():
     p.add_argument("--sink-attn-head-topk", type=int, default=8, help="Top-k heads to display when using --plot-sink-attn-heads")
     p.add_argument("--sink-attn-head-rank-layer", type=int, default=7, help="Layer to rank heads by (default: 7)")
     p.add_argument("--sink-attn-head-rank-metric", choices=["jump", "value"], default="jump", help="How to rank heads: jump=L-Lprev, value=at rank layer")
+    p.add_argument("--plot-sink-attn-jump-bars", action="store_true", help="Plot a bar chart of per-head sink-attn jump at rank layer (default: L7-L6)")
+    p.add_argument("--sink-attn-jump-sort", action="store_true", help="Sort heads by jump descending in the bar chart")
     # Experiment 2: Q/K metrics for multiple heads & layers (multi-query)
     p.add_argument("--k-metrics-headscan", action="store_true", help="Print K-metrics tables for multiple heads & layers using many query positions (q in [sink-attn-q-start, sink-attn-q-end))")
     p.add_argument("--k-metrics-heads", default=None, help="Comma-separated head indices, e.g. '6,23,5,9,22,4,20,7' (default: use --head)")
@@ -1003,6 +1500,33 @@ def main():
     p.add_argument("--ablate-renorm", action="store_true", help="Re-normalize attention rows after ablation (recommended)")
     p.add_argument("--ablate-q-start", type=int, default=None, help="Only ablate queries q in [start,end); default: all")
     p.add_argument("--ablate-q-end", type=int, default=None, help="Only ablate queries q in [start,end); default: all")
+    # Priority-1: ablate MLP_out (write step)
+    p.add_argument("--ablate-mlp-out", action="store_true", help="Ablate MLP output at specified layers/token indices (tests if L6 write causes L7 registration)")
+    p.add_argument("--ablate-mlp-layers", default="6", help="Comma-separated layer indices for MLP_out ablation (default: '6')")
+    p.add_argument("--ablate-mlp-tok-idxs", default="0", help="Comma-separated token indices to ablate in MLP_out (default: '0')")
+    p.add_argument("--ablate-mlp-factor", type=float, default=0.0, help="Multiply MLP_out by this factor at selected positions (default: 0.0)")
+    # Priority-2: eval loss / perplexity under interventions
+    p.add_argument("--eval-loss", action="store_true", help="Compute mean LM loss (and ppl) over prompts (supports ablations)")
+    # User Exp-1: stepwise cosine drift (token representation angle changes across sublayer steps)
+    p.add_argument("--step-cos", action="store_true", help="(User Exp1) Compute cos(step_t, step_{t-1}) over residual steps: embed -> L0_attn -> L0_mlp -> ...")
+    p.add_argument("--step-cos-max-layer", type=int, default=6, help="Max layer L to include in step sequence (default: 6)")
+    p.add_argument("--step-cos-tok-idxs", default="0,1,8", help="Comma-separated token indices to track (default: '0,1,8')")
+    # User Exp-2: sweep zeroing output points (attn_out/mlp_out) before a rank layer
+    p.add_argument("--zero-point-sweep", action="store_true", help="(User Exp2) Sweep zeroing one output point at a time (attn_out/mlp_out) and measure sink weakening at a rank layer")
+    p.add_argument("--zero-point-max-layer", type=int, default=6, help="Only sweep layers <= this (default: 6)")
+    p.add_argument("--zero-point-tok-idxs", default=None, help="Comma-separated token indices to zero at the output point (default: use --sink-idx)")
+    p.add_argument("--zero-point-rank-layer", type=int, default=7, help="Read sink metric at this layer (default: 7)")
+    p.add_argument("--zero-point-sort", action="store_true", help="Sort sweep bars by effect size")
+    p.add_argument("--zero-point-errorbar", choices=["none", "std", "sem"], default="none", help="Add error bars to sweep bars using per-prompt delta_jump dispersion (std or sem)")
+    # Path-split follow-up: isolate how L0_mlp[tok0] influences L1 (into attention vs residual bypass)
+    p.add_argument("--l0mlp-path-split", action="store_true", help="Split L0 MLP(tok) influence into 'into L1 attn' vs 'bypass around L1 attn' and measure effect on jump at rank layer")
+    p.add_argument("--l0mlp-path-tok-idx", type=int, default=0, help="Token index to use as 'tok0' for l0mlp path split (default: 0)")
+    p.add_argument("--l0mlp-path-rank-layer", type=int, default=7, help="Rank layer L to read sink jump (L-L-1) for l0mlp path split (default: 7)")
+    # Step1 mask experiments
+    p.add_argument("--mask-split", type=int, default=None, help="Create a second causal boundary at m: queries q>=m cannot attend to keys < m.")
+    p.add_argument("--mask-split-renorm", action="store_true", help="Renormalize probs after applying --mask-split (recommended)")
+    p.add_argument("--mask-q0-allow-k", type=int, default=None, help="Override q=0 probs to uniform over keys [0..k-1] (break q=0 boundary signature).")
+    p.add_argument("--mask-edit-layers", default=None, help="Comma-separated layer indices to apply mask edits (default: all layers)")
     # print mode
     p.add_argument("--print", dest="print_mode", choices=PRINT_CHOICES, default="qkv")
     p.add_argument("--qpos", default=None, help="Comma-separated list of query positions for --print qkv, eg. '256,512,768")
@@ -1087,6 +1611,92 @@ def main():
     num_layers = model.config.num_hidden_layers
     num_heads = model.config.num_attention_heads
     job_summary_stats = []
+
+    # Install mask-edit hooks (Step1 experiments)
+    mask_handles = []
+    if (args.mask_split is not None) or (args.mask_q0_allow_k is not None):
+        if args.lower_attn or args.ablate_sink_key:
+            raise ValueError("Mask-edit experiments cannot be combined with --lower-attn/--ablate-sink-key in the same run.")
+        layers_edit = parse_int_list(args.mask_edit_layers) if args.mask_edit_layers else list(range(num_layers))
+        print(f"[mask_edit] layers={layers_edit} split={args.mask_split} renorm={args.mask_split_renorm} q0_allow_k={args.mask_q0_allow_k}")
+        mask_handles = _install_mask_edit_hooks(
+            model,
+            layers=layers_edit,
+            split_boundary=args.mask_split,
+            split_renorm=bool(args.mask_split_renorm),
+            q0_allow_k=args.mask_q0_allow_k,
+        )
+
+    # If user only wants loss, run a fast evaluation and exit.
+    if args.eval_loss:
+        mlp_handles = []
+        attn_handles = []
+        if args.ablate_mlp_out:
+            mlp_layers = parse_int_list(args.ablate_mlp_layers)
+            mlp_tok = parse_int_list(args.ablate_mlp_tok_idxs)
+            print(f"[ablate_mlp_out] layers={mlp_layers} tok_idxs={mlp_tok} factor={args.ablate_mlp_factor}")
+            mlp_handles = _install_mlp_out_ablation_hooks(model, mlp_layers, mlp_tok, factor=args.ablate_mlp_factor)
+        if args.ablate_sink_key:
+            ablate_layers = parse_int_list(args.ablate_layers)
+            ablate_heads = parse_int_list(args.ablate_heads)
+            print(f"[ablate_sink_key] layers={ablate_layers} heads={ablate_heads} sink_idx={args.sink_idx} factor={args.ablate_factor} renorm={args.ablate_renorm}")
+            attn_handles = _install_sink_key_ablation_hooks(
+                model,
+                layers=ablate_layers,
+                head_idxs=ablate_heads,
+                sink_k_idx=int(args.sink_idx),
+                factor=float(args.ablate_factor),
+                renorm=bool(args.ablate_renorm),
+                q_start=args.ablate_q_start,
+                q_end=args.ablate_q_end,
+            )
+
+        losses = []
+        for input_ids, base_pos in tqdm(tokenized, desc="[eval-loss] prompts", position=0, leave=False):
+            pos_ids, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides)
+            losses.append(eval_loss(model, input_ids, pos_ids))
+        mean_loss = float(np.mean(losses)) if losses else float("nan")
+        ppl = float(np.exp(mean_loss)) if np.isfinite(mean_loss) else float("nan")
+        report = {"mean_loss": mean_loss, "ppl": ppl, "n_prompts": len(losses)}
+        out_path = os.path.join(args.outdir, "loss_report.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        print(f"[eval-loss] mean_loss={mean_loss:.6f}  ppl={ppl:.3f}  n={len(losses)}")
+        print(f"[eval-loss] wrote {out_path}")
+
+        for h in mlp_handles:
+            try: h.remove()
+            except Exception: pass
+        for pair in attn_handles:
+            for h in pair:
+                try: h.remove()
+                except Exception: pass
+        for pair in mask_handles:
+            for h in pair:
+                try: h.remove()
+                except Exception: pass
+        return
+
+    # -------------------------
+    # User Experiment 1: stepwise cosine drift
+    # -------------------------
+    if args.step_cos:
+        tok_idxs = parse_int_list(args.step_cos_tok_idxs)
+        if not tok_idxs:
+            tok_idxs = [int(args.sink_idx)]
+        run_step_cos_experiment(
+            model=model,
+            tokenized=tokenized,
+            rope_overrides=rope_overrides,
+            max_layer=int(args.step_cos_max_layer),
+            tok_idxs=tok_idxs,
+            outdir=args.outdir,
+        )
+        for pair in mask_handles:
+            for h in pair:
+                try: h.remove()
+                except Exception: pass
+        return
 
     # -------------------------
     # Experiment 2: head-level Q/K metrics across many queries
@@ -1205,7 +1815,7 @@ def main():
 
         return
 
-    def _run_scan_pass(scan_layers, rope_overrides_local):
+    def _run_scan_pass(scan_layers, rope_overrides_local, return_sink_series=False):
         per_layer_acc = {
             L: {"k_norm": [], "v_norm": [], "postln_norm": [], "out_norm": [], "cos": [], "sink_attn": [], "sink_attn_heads": []}
             for L in scan_layers
@@ -1276,7 +1886,7 @@ def main():
                         per_layer_acc[L]["out_norm"].append(out_norm)
                         per_layer_acc[L]["cos"].append(series[0][1])
                         per_layer_acc[L]["sink_attn"].append(sink_attn_val)
-                        if args.plot_sink_attn_heads:
+                        if args.plot_sink_attn_heads or args.plot_sink_attn_jump_bars:
                             per_layer_acc[L]["sink_attn_heads"].append(sink_attn_heads)
 
                         per_layer_kvecs[L].append(k[0, args.head, sink_idx].detach().cpu())
@@ -1295,9 +1905,12 @@ def main():
                 except Exception:
                     pass
         
+        sink_series = None
         if args.print_mode == "qkv":
             stats = []
             sink_attn_heads_by_layer = {}
+            if return_sink_series:
+                sink_series = {int(L): [float(x) for x in per_layer_acc[L]["sink_attn"]] for L in sorted(per_layer_acc.keys())}
             for L in sorted(per_layer_acc.keys()):
                 acc = per_layer_acc[L]
                 kvar = 0.0
@@ -1318,7 +1931,7 @@ def main():
                     Xo = torch.stack(per_layer_outvecs[L], dim=0)
                     outvar = _cloud_radius(Xo)
 
-                if args.plot_sink_attn_heads and acc["sink_attn_heads"]:
+                if (args.plot_sink_attn_heads or args.plot_sink_attn_jump_bars) and acc["sink_attn_heads"]:
                     Xh = np.stack(acc["sink_attn_heads"], axis=0)  # [N, H]
                     sink_attn_heads_by_layer[L] = Xh.mean(axis=0)  # [H]
 
@@ -1336,7 +1949,7 @@ def main():
                     "postln_spread": postlnvar,
                     "out_spread": outvar,
                 })
-            return stats, scan_maps, scan_titles, sink_attn_heads_by_layer
+            return stats, scan_maps, scan_titles, sink_attn_heads_by_layer, sink_series
         else:
             for L in sorted(per_layer_maps.keys()):
                 if per_layer_maps[L]:
@@ -1345,7 +1958,279 @@ def main():
                     # DEBUG
                     src = "CACHE" if (hasattr(model, "_lower_attn_cache") and L in model._lower_attn_cache) else "ATTNS"
                     scan_titles.append(f"Layer {L} Head {args.head} [{src}]")
-            return [], scan_maps, scan_titles, {}
+            return [], scan_maps, scan_titles, {}, None
+
+    # -------------------------
+    # User Experiment 2: output-point zero sweep (attn_out / mlp_out) before rank layer
+    # -------------------------
+    if args.zero_point_sweep:
+        if args.print_mode != "qkv":
+            raise ValueError("--zero-point-sweep requires '--print qkv' (default).")
+        if args.lower_attn or args.ablate_sink_key or args.ablate_mlp_out:
+            raise ValueError("--zero-point-sweep should not be combined with other interventions (--lower-attn/--ablate-sink-key/--ablate-mlp-out).")
+
+        rank_L = int(args.zero_point_rank_layer)
+        if not (1 <= rank_L < int(num_layers)):
+            raise ValueError(f"--zero-point-rank-layer must be in [1, {int(num_layers)-1}] (got {rank_L}).")
+
+        sweep_tok = parse_int_list(args.zero_point_tok_idxs) if args.zero_point_tok_idxs else [int(args.sink_idx)]
+        if not sweep_tok:
+            sweep_tok = [int(args.sink_idx)]
+
+        max_sweep_L = min(int(args.zero_point_max_layer), rank_L - 1, int(num_layers) - 1)
+        sweep_layers = list(range(0, max_sweep_L + 1))
+
+        # Scan only what we need: layers up to rank_L so we can read sink_attn(rank_L) and sink_attn(rank_L-1).
+        scan_layers = list(range(0, rank_L + 1))
+        print(f"[zero-point-sweep] rank_L={rank_L} sweep_layers={sweep_layers} tok_idxs={sweep_tok} scan_layers={scan_layers}")
+
+        # Baseline
+        baseline_stats, _scan_maps, _scan_titles, _heads, baseline_series = _run_scan_pass(scan_layers, rope_overrides, return_sink_series=True)
+        baseline_byL = {int(s["layer"]): s for s in (baseline_stats or [])}
+        baseline_L = float(baseline_byL.get(rank_L, {}).get("sink_attn", 0.0))
+        baseline_Lm1 = float(baseline_byL.get(rank_L - 1, {}).get("sink_attn", 0.0))
+        baseline_jump = baseline_L - baseline_Lm1
+        baseline_jump_by_prompt = None
+        baseline_jump_std = 0.0
+        if baseline_series is not None and (rank_L in baseline_series) and ((rank_L - 1) in baseline_series):
+            sL = baseline_series[int(rank_L)]
+            sLm1 = baseline_series[int(rank_L - 1)]
+            if len(sL) == len(sLm1) and len(sL) > 0:
+                baseline_jump_by_prompt = [float(a - b) for a, b in zip(sL, sLm1)]
+                if len(baseline_jump_by_prompt) > 1:
+                    baseline_jump_std = float(np.std(np.array(baseline_jump_by_prompt), ddof=1))
+
+        results = []
+        points = []
+        for L in sweep_layers:
+            points.append(("attn", int(L)))
+            points.append(("mlp", int(L)))
+
+        for kind, L in tqdm(points, desc="[zero-point-sweep] points", position=0, leave=False):
+            if kind == "attn":
+                handles = _install_attn_out_ablation_hooks(model, layers=[L], tok_idxs=sweep_tok, factor=0.0)
+            else:
+                handles = _install_mlp_out_ablation_hooks(model, layers=[L], tok_idxs=sweep_tok, factor=0.0)
+            try:
+                stats, _m, _t, _h, series = _run_scan_pass(scan_layers, rope_overrides, return_sink_series=True)
+            finally:
+                for hh in handles:
+                    try:
+                        hh.remove()
+                    except Exception:
+                        pass
+
+            byL = {int(s["layer"]): s for s in (stats or [])}
+            ab_L = float(byL.get(rank_L, {}).get("sink_attn", 0.0))
+            ab_Lm1 = float(byL.get(rank_L - 1, {}).get("sink_attn", 0.0))
+            ab_jump = ab_L - ab_Lm1
+            delta_by_prompt = None
+            delta_std = 0.0
+            delta_sem = 0.0
+            if baseline_jump_by_prompt is not None and series is not None and (rank_L in series) and ((rank_L - 1) in series):
+                sL = series[int(rank_L)]
+                sLm1 = series[int(rank_L - 1)]
+                if len(sL) == len(sLm1) and len(sL) == len(baseline_jump_by_prompt) and len(sL) > 0:
+                    ab_jump_by_prompt = [float(a - b) for a, b in zip(sL, sLm1)]
+                    delta_by_prompt = [float(bj - aj) for bj, aj in zip(baseline_jump_by_prompt, ab_jump_by_prompt)]
+                    if len(delta_by_prompt) > 1:
+                        delta_std = float(np.std(np.array(delta_by_prompt), ddof=1))
+                        delta_sem = float(delta_std / math.sqrt(len(delta_by_prompt)))
+
+            tok_str = ",".join(str(int(t)) for t in sweep_tok)
+            point = f"L{int(L)}_{kind}[tok={tok_str}]"
+            results.append({
+                "point": point,
+                "layer": int(L),
+                "kind": kind,
+                "tok_idxs": [int(t) for t in sweep_tok],
+                "rank_layer": int(rank_L),
+                "baseline_L": baseline_L,
+                "baseline_Lm1": baseline_Lm1,
+                "baseline_jump": baseline_jump,
+                "ablated_L": ab_L,
+                "ablated_Lm1": ab_Lm1,
+                "ablated_jump": ab_jump,
+                "delta_jump": float(baseline_jump - ab_jump),
+                "delta_jump_std": float(delta_std),
+                "delta_jump_sem": float(delta_sem),
+                "delta_jump_n": int(0 if delta_by_prompt is None else len(delta_by_prompt)),
+            })
+
+        report = {
+            "experiment": "zero_point_sweep",
+            "rank_layer": int(rank_L),
+            "scan_layers": [int(L) for L in scan_layers],
+            "sweep_layers": [int(L) for L in sweep_layers],
+            "tok_idxs": [int(t) for t in sweep_tok],
+            "n_prompts": int(len(tokenized)),
+            "sink_idx": int(args.sink_idx),
+            "sink_attn_head": int(args.head if args.sink_attn_head is None else args.sink_attn_head),
+            "sink_attn_q_start": int(args.sink_attn_q_start),
+            "sink_attn_q_end": None if args.sink_attn_q_end is None else int(args.sink_attn_q_end),
+            "baseline": {
+                "sink_attn_L": baseline_L,
+                "sink_attn_Lm1": baseline_Lm1,
+                "jump": baseline_jump,
+                "jump_std": float(baseline_jump_std),
+            },
+            "results": results,
+        }
+        os.makedirs(args.outdir, exist_ok=True)
+        out_json = os.path.join(args.outdir, "zero_point_sweep_report.json")
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        err_mode = str(args.zero_point_errorbar)
+        yerr = None
+        yerr_label = None
+        if err_mode in ("std", "sem"):
+            key = "delta_jump_std" if err_mode == "std" else "delta_jump_sem"
+            # yerr must align with sorting used in the plot, so recompute after sorting in _plot_zero_point_sweep.
+            # We pass yerr=None here and instead attach a pre-sorted list below.
+            rows_plot = results[:]
+            if bool(args.zero_point_sort):
+                rows_plot = sorted(rows_plot, key=lambda r: float(r.get("delta_jump", 0.0)), reverse=True)
+            yerr = [float(r.get(key, 0.0)) for r in rows_plot]
+            yerr_label = err_mode.upper()
+        _plot_zero_point_sweep(
+            results=results,
+            outdir=args.outdir,
+            fname="zero_point_sweep_delta_jump.png",
+            title=f"Zero-point sweep: delta jump at L{rank_L} (prompts={len(tokenized)}, q>={int(args.sink_attn_q_start)}, head={int(args.head if args.sink_attn_head is None else args.sink_attn_head)})",
+            sort=bool(args.zero_point_sort),
+            yerr=yerr,
+            yerr_label=yerr_label,
+        )
+        print(f"[zero-point-sweep] baseline jump(L{rank_L}-L{rank_L-1})={baseline_jump:.6f}")
+        print(f"[zero-point-sweep] wrote {out_json}")
+        print(f"[zero-point-sweep] wrote {os.path.join(args.outdir, 'zero_point_sweep_delta_jump.png')}")
+
+        for pair in mask_handles:
+            for h in pair:
+                try: h.remove()
+                except Exception: pass
+        return
+
+    # -------------------------
+    # Follow-up: isolate L0_mlp(tok0) route into L1 (into attention vs residual bypass)
+    # -------------------------
+    if args.l0mlp_path_split:
+        if args.print_mode != "qkv":
+            raise ValueError("--l0mlp-path-split requires '--print qkv' (default).")
+        if args.lower_attn or args.ablate_sink_key or args.ablate_mlp_out or args.zero_point_sweep:
+            raise ValueError("--l0mlp-path-split should not be combined with other interventions in the same run.")
+
+        rank_L = int(args.l0mlp_path_rank_layer)
+        if not (1 <= rank_L < int(num_layers)):
+            raise ValueError(f"--l0mlp-path-rank-layer must be in [1, {int(num_layers)-1}] (got {rank_L}).")
+        if int(num_layers) < 2:
+            raise ValueError("--l0mlp-path-split requires at least 2 layers.")
+        tok0 = int(args.l0mlp_path_tok_idx)
+
+        scan_layers = list(range(0, rank_L + 1))
+        print(f"[l0mlp-path] tok={tok0} rank_L={rank_L} scan_layers={scan_layers}")
+
+        # Baseline
+        baseline_stats, _m, _t, _h, baseline_series = _run_scan_pass(scan_layers, rope_overrides, return_sink_series=True)
+        baseline_byL = {int(s["layer"]): s for s in (baseline_stats or [])}
+        baseline_L = float(baseline_byL.get(rank_L, {}).get("sink_attn", 0.0))
+        baseline_Lm1 = float(baseline_byL.get(rank_L - 1, {}).get("sink_attn", 0.0))
+        baseline_jump = baseline_L - baseline_Lm1
+
+        baseline_jump_by_prompt = None
+        if baseline_series is not None and (rank_L in baseline_series) and ((rank_L - 1) in baseline_series):
+            sL = baseline_series[int(rank_L)]
+            sLm1 = baseline_series[int(rank_L - 1)]
+            if len(sL) == len(sLm1) and len(sL) > 0:
+                baseline_jump_by_prompt = [float(a - b) for a, b in zip(sL, sLm1)]
+
+        jobs = [
+            ("no_into_l1_attn", "no_into_l1_attn"),
+            ("no_bypass_l1_attn", "no_bypass_l1_attn"),
+        ]
+        results = []
+        for label, mode in jobs:
+            handles = _install_l0mlp_path_split_hooks(model, tok_idx=tok0, mode=mode)
+            try:
+                stats, _m2, _t2, _h2, series = _run_scan_pass(scan_layers, rope_overrides, return_sink_series=True)
+            finally:
+                for hh in handles:
+                    try:
+                        hh.remove()
+                    except Exception:
+                        pass
+
+            byL = {int(s["layer"]): s for s in (stats or [])}
+            ab_L = float(byL.get(rank_L, {}).get("sink_attn", 0.0))
+            ab_Lm1 = float(byL.get(rank_L - 1, {}).get("sink_attn", 0.0))
+            ab_jump = ab_L - ab_Lm1
+
+            delta_std = 0.0
+            delta_sem = 0.0
+            if baseline_jump_by_prompt is not None and series is not None and (rank_L in series) and ((rank_L - 1) in series):
+                sL = series[int(rank_L)]
+                sLm1 = series[int(rank_L - 1)]
+                if len(sL) == len(sLm1) and len(sL) == len(baseline_jump_by_prompt) and len(sL) > 1:
+                    ab_jump_by_prompt = [float(a - b) for a, b in zip(sL, sLm1)]
+                    delta_by_prompt = [float(bj - aj) for bj, aj in zip(baseline_jump_by_prompt, ab_jump_by_prompt)]
+                    delta_std = float(np.std(np.array(delta_by_prompt), ddof=1))
+                    delta_sem = float(delta_std / math.sqrt(len(delta_by_prompt)))
+
+            results.append({
+                "point": f"{label}[tok={tok0}]",
+                "layer": 0,
+                "kind": "path",
+                "tok_idxs": [tok0],
+                "rank_layer": int(rank_L),
+                "baseline_L": baseline_L,
+                "baseline_Lm1": baseline_Lm1,
+                "baseline_jump": baseline_jump,
+                "ablated_L": ab_L,
+                "ablated_Lm1": ab_Lm1,
+                "ablated_jump": ab_jump,
+                "delta_jump": float(baseline_jump - ab_jump),
+                "delta_jump_std": float(delta_std),
+                "delta_jump_sem": float(delta_sem),
+                "delta_jump_n": int(0 if baseline_jump_by_prompt is None else len(baseline_jump_by_prompt)),
+            })
+
+        report = {
+            "experiment": "l0mlp_path_split",
+            "tok_idx": int(tok0),
+            "rank_layer": int(rank_L),
+            "scan_layers": [int(L) for L in scan_layers],
+            "n_prompts": int(len(tokenized)),
+            "sink_idx": int(args.sink_idx),
+            "sink_attn_head": int(args.head if args.sink_attn_head is None else args.sink_attn_head),
+            "sink_attn_q_start": int(args.sink_attn_q_start),
+            "sink_attn_q_end": None if args.sink_attn_q_end is None else int(args.sink_attn_q_end),
+            "baseline": {
+                "sink_attn_L": baseline_L,
+                "sink_attn_Lm1": baseline_Lm1,
+                "jump": baseline_jump,
+            },
+            "results": results,
+        }
+        os.makedirs(args.outdir, exist_ok=True)
+        out_json = os.path.join(args.outdir, "l0mlp_path_split_report.json")
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+
+        # Plot with SEM error bars (most interpretable).
+        yerr = [float(r.get("delta_jump_sem", 0.0)) for r in results]
+        _plot_zero_point_sweep(
+            results=results,
+            outdir=args.outdir,
+            fname="l0mlp_path_split_delta_jump.png",
+            title=f"L0 MLP path-split (tok={tok0}): delta jump at L{rank_L} (prompts={len(tokenized)}, q>={int(args.sink_attn_q_start)}, head={int(args.head if args.sink_attn_head is None else args.sink_attn_head)})",
+            sort=False,
+            yerr=yerr,
+            yerr_label="SEM",
+        )
+        print(f"[l0mlp-path] baseline jump(L{rank_L}-L{rank_L-1})={baseline_jump:.6f}")
+        print(f"[l0mlp-path] wrote {out_json}")
+        print(f"[l0mlp-path] wrote {os.path.join(args.outdir, 'l0mlp_path_split_delta_jump.png')}")
+        return
 
     stop_jobs = [("baseline", None)]
     if args.lower_attn:
@@ -1398,6 +2283,13 @@ def main():
                 q_end=args.ablate_q_end,
             )
 
+        mlp_ablate_handles = []
+        if args.ablate_mlp_out:
+            mlp_layers = parse_int_list(args.ablate_mlp_layers)
+            mlp_tok = parse_int_list(args.ablate_mlp_tok_idxs)
+            print(f"[ablate_mlp_out] layers={mlp_layers} tok_idxs={mlp_tok} factor={args.ablate_mlp_factor}")
+            mlp_ablate_handles = _install_mlp_out_ablation_hooks(model, mlp_layers, mlp_tok, factor=args.ablate_mlp_factor)
+
         scan_stats = [] # aggregated per layer
         scan_maps, scan_titles = [], []
         summary = None
@@ -1405,7 +2297,7 @@ def main():
         if args.scan:
             # perturbed pass
             scan_layers = list(range(0, num_layers, args.scan_interval))
-            scan_stats, scan_maps, scan_titles, sink_attn_heads_by_layer = _run_scan_pass(scan_layers, rope_overrides)
+            scan_stats, scan_maps, scan_titles, sink_attn_heads_by_layer, _series = _run_scan_pass(scan_layers, rope_overrides, return_sink_series=False)
 
             if args.print_mode == "qkv" and len(scan_stats) > 0:
                 scan_stats = sorted(scan_stats, key=lambda s: s["layer"])
@@ -1472,7 +2364,7 @@ def main():
                 )
 
             # registration metric: head-level decomposition
-            if args.print_mode == "qkv" and args.plot_sink_attn_heads and sink_attn_heads_by_layer:
+            if args.print_mode == "qkv" and (args.plot_sink_attn_heads or args.plot_sink_attn_jump_bars) and sink_attn_heads_by_layer:
                 layers_avail = sorted(sink_attn_heads_by_layer.keys())
                 rank_layer = int(args.sink_attn_head_rank_layer)
                 if rank_layer not in sink_attn_heads_by_layer:
@@ -1491,6 +2383,7 @@ def main():
                     scores = v_rank
                     metric_str = f"value@L{rank_layer}"
 
+                # Always print ranking (useful for debugging)
                 topk = int(max(1, min(int(args.sink_attn_head_topk), scores.shape[0])))
                 order = np.argsort(scores)[::-1]
                 top_heads = [int(i) for i in order[:topk]]
@@ -1498,14 +2391,25 @@ def main():
                 for h in top_heads:
                     print(f"  head {h:>2d}: score={float(scores[h]):.4f}  value@L{rank_layer}={float(v_rank[h]):.4f}")
 
-                _plot_sink_attn_heads(
-                    sink_attn_heads_by_layer,
-                    args.outdir,
-                    fname="scan_sink_attn_heads_topk.png",
-                    top_heads=top_heads,
-                    title=f"Sink-attn by head (sink_idx={args.sink_idx}, top{topk} by {metric_str})",
-                    suffix=cur_suffix,
-                )
+                if args.plot_sink_attn_heads:
+                    _plot_sink_attn_heads(
+                        sink_attn_heads_by_layer,
+                        args.outdir,
+                        fname="scan_sink_attn_heads_topk.png",
+                        top_heads=top_heads,
+                        title=f"Sink-attn by head (sink_idx={args.sink_idx}, top{topk} by {metric_str})",
+                        suffix=cur_suffix,
+                    )
+
+                if args.plot_sink_attn_jump_bars and args.sink_attn_head_rank_metric == "jump":
+                    _plot_sink_attn_jump_bars(
+                        scores,
+                        args.outdir,
+                        fname=f"scan_sink_attn_jump_bars_L{rank_layer}-L{prev_layer}.png",
+                        title=f"Per-head sink-attn jump (sink_idx={args.sink_idx}, {metric_str})",
+                        suffix=cur_suffix,
+                        sort=bool(args.sink_attn_jump_sort),
+                    )
             
             if summary is not None:
                 print(f"[Summary] sink attention at layer {num_layers - 1}: {summary:.4f} | stop at {args._current_stop_layer}")
@@ -1878,6 +2782,19 @@ def main():
                     h.remove()
                 except Exception:
                     pass
+
+        for h in mlp_ablate_handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+
+    for pair in mask_handles:
+        for h in pair:
+            try:
+                h.remove()
+            except Exception:
+                pass
 
     if args.lower_attn and len(job_summary_stats) > 0 and (args.stop_layers is not None) and (args.only_stop_layer is None):
         job_summary_stats = sorted(job_summary_stats, key=lambda s: s["layer"])

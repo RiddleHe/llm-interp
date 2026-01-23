@@ -1,0 +1,65 @@
+{
+  "experiment": "l0mlp_path_split",
+  "tok_idx": 0,
+  "rank_layer": 7,
+  "scan_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "n_prompts": 56,
+  "sink_idx": 0,
+  "sink_attn_head": -1,
+  "sink_attn_q_start": 4,
+  "sink_attn_q_end": null,
+  "baseline": {
+    "sink_attn_L": 0.7312257311173848,
+    "sink_attn_Lm1": 0.11476631655490824,
+    "jump": 0.6164594145624765
+  },
+  "results": [
+    {
+      "point": "no_into_l1_attn[tok=0]",
+      "layer": 0,
+      "kind": "path",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7286001592874527,
+      "ablated_Lm1": 0.12202637043914624,
+      "ablated_jump": 0.6065737888483065,
+      "delta_jump": 0.009885625714170065,
+      "delta_jump_std": 0.012100075937495852,
+      "delta_jump_sem": 0.0016169406611448922,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "no_bypass_l1_attn[tok=0]",
+      "layer": 0,
+      "kind": "path",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.28045686799006425,
+      "ablated_Lm1": 0.016852184074066048,
+      "ablated_jump": 0.26360468391599823,
+      "delta_jump": 0.3528547306464783,
+      "delta_jump_std": 0.3144361084094471,
+      "delta_jump_sem": 0.042018292417809265,
+      "delta_jump_n": 56
+    }
+  ]
+}

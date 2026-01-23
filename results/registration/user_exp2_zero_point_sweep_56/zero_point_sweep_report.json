@@ -1,0 +1,305 @@
+{
+  "experiment": "zero_point_sweep",
+  "rank_layer": 7,
+  "scan_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "sweep_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "tok_idxs": [
+    0
+  ],
+  "n_prompts": 56,
+  "sink_idx": 0,
+  "sink_attn_head": -1,
+  "sink_attn_q_start": 4,
+  "sink_attn_q_end": null,
+  "baseline": {
+    "sink_attn_L": 0.7312257311173848,
+    "sink_attn_Lm1": 0.11476631655490824,
+    "jump": 0.6164594145624765,
+    "jump_std": 0.057297054613957156
+  },
+  "results": [
+    {
+      "point": "L0_attn[tok=0]",
+      "layer": 0,
+      "kind": "attn",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.5119607906339557,
+      "ablated_Lm1": 0.01670238362774918,
+      "ablated_jump": 0.49525840700620655,
+      "delta_jump": 0.12120100755627,
+      "delta_jump_std": 0.2971816206560951,
+      "delta_jump_sem": 0.03971256450504748,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L0_mlp[tok=0]",
+      "layer": 0,
+      "kind": "mlp",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.029677506964487423,
+      "ablated_Lm1": 0.031292522309481034,
+      "ablated_jump": -0.001615015344993611,
+      "delta_jump": 0.6180744299074702,
+      "delta_jump_std": 0.115408409153014,
+      "delta_jump_sem": 0.015422097378685863,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L1_attn[tok=0]",
+      "layer": 1,
+      "kind": "attn",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7299999445676804,
+      "ablated_Lm1": 0.12045028509705194,
+      "ablated_jump": 0.6095496594706284,
+      "delta_jump": 0.006909755091848102,
+      "delta_jump_std": 0.011877832481238202,
+      "delta_jump_sem": 0.0015872421300817275,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L1_mlp[tok=0]",
+      "layer": 1,
+      "kind": "mlp",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7352707226361547,
+      "ablated_Lm1": 0.06735751077732337,
+      "ablated_jump": 0.6679132118588313,
+      "delta_jump": -0.0514537972963548,
+      "delta_jump_std": 0.028683465601032958,
+      "delta_jump_sem": 0.0038329893194421864,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L2_attn[tok=0]",
+      "layer": 2,
+      "kind": "attn",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7307975579585347,
+      "ablated_Lm1": 0.11541467352903315,
+      "ablated_jump": 0.6153828844295016,
+      "delta_jump": 0.0010765301329749288,
+      "delta_jump_std": 0.0035126212770705545,
+      "delta_jump_sem": 0.00046939376243894127,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L2_mlp[tok=0]",
+      "layer": 2,
+      "kind": "mlp",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7320151233247348,
+      "ablated_Lm1": 0.09961498947814107,
+      "ablated_jump": 0.6324001338465938,
+      "delta_jump": -0.015940719284117222,
+      "delta_jump_std": 0.011147090078167256,
+      "delta_jump_sem": 0.0014895925690003224,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L3_attn[tok=0]",
+      "layer": 3,
+      "kind": "attn",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7308899089694023,
+      "ablated_Lm1": 0.11270236732837345,
+      "ablated_jump": 0.6181875416410288,
+      "delta_jump": -0.0017281270785522995,
+      "delta_jump_std": 0.002240682133055497,
+      "delta_jump_sem": 0.00029942374480569617,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L3_mlp[tok=0]",
+      "layer": 3,
+      "kind": "mlp",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.730771504342556,
+      "ablated_Lm1": 0.11992273127127971,
+      "ablated_jump": 0.6108487730712763,
+      "delta_jump": 0.0056106414912002744,
+      "delta_jump_std": 0.0030774996671695557,
+      "delta_jump_sem": 0.0004112481915164041,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L4_attn[tok=0]",
+      "layer": 4,
+      "kind": "attn",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.731078931263515,
+      "ablated_Lm1": 0.11415409010701946,
+      "ablated_jump": 0.6169248411564955,
+      "delta_jump": -0.00046542659401893616,
+      "delta_jump_std": 0.0010381480767156497,
+      "delta_jump_sem": 0.0001387283721360097,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L4_mlp[tok=0]",
+      "layer": 4,
+      "kind": "mlp",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7302731318133218,
+      "ablated_Lm1": 0.12957871239632368,
+      "ablated_jump": 0.6006944194169981,
+      "delta_jump": 0.015764995145478466,
+      "delta_jump_std": 0.008213903477348742,
+      "delta_jump_sem": 0.001097629022152503,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L5_attn[tok=0]",
+      "layer": 5,
+      "kind": "attn",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7318646056311471,
+      "ablated_Lm1": 0.11546336659895522,
+      "ablated_jump": 0.6164012390321919,
+      "delta_jump": 5.817553028464317e-05,
+      "delta_jump_std": 0.0024271433136870036,
+      "delta_jump_sem": 0.0003243406681577128,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L5_mlp[tok=0]",
+      "layer": 5,
+      "kind": "mlp",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7346502276403564,
+      "ablated_Lm1": 0.13632323566292012,
+      "ablated_jump": 0.5983269919774362,
+      "delta_jump": 0.01813242258504033,
+      "delta_jump_std": 0.007750985247576372,
+      "delta_jump_sem": 0.0010357689716560708,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L6_attn[tok=0]",
+      "layer": 6,
+      "kind": "attn",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.7315376954419273,
+      "ablated_Lm1": 0.11476631655490824,
+      "ablated_jump": 0.616771378887019,
+      "delta_jump": -0.0003119643245425019,
+      "delta_jump_std": 0.0005130788642653777,
+      "delta_jump_sem": 6.856304723129053e-05,
+      "delta_jump_n": 56
+    },
+    {
+      "point": "L6_mlp[tok=0]",
+      "layer": 6,
+      "kind": "mlp",
+      "tok_idxs": [
+        0
+      ],
+      "rank_layer": 7,
+      "baseline_L": 0.7312257311173848,
+      "baseline_Lm1": 0.11476631655490824,
+      "baseline_jump": 0.6164594145624765,
+      "ablated_L": 0.11076414950990252,
+      "ablated_Lm1": 0.11476631655490824,
+      "ablated_jump": -0.004002167045005722,
+      "delta_jump": 0.6204615816074823,
+      "delta_jump_std": 0.03509544567741603,
+      "delta_jump_sem": 0.004689826198608117,
+      "delta_jump_n": 56
+    }
+  ]
+}

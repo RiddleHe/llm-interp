@@ -1,0 +1,389 @@
+[transformers] Disabled packed-sequence split.
+[Tokenized] Tokens[0, 0] is 4498
+[Tokenized] Tokens[0, 0] text is When
+
+[K metrics headscan] q_range=[4,21) q_count=17 prompts=50 layers=[6, 7] heads=[6, 23, 5, 9, 22, 4, 20, 10, 7, 12, 15, 1, 29, 30, 31, 28, 8, 17, 27, 16, 21, 11, 18, 3]
+[K metrics multiQ] layer=6 head=6 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.0488e-02          3.2714e-02          3.8042e-02
+mean_norm                      2.4515e+01          2.0190e+01          2.0629e+01
+cos(Q, K)                          0.3108              0.3615              0.3630
+cos_centered(Q, K)                 0.0029             -0.0017              0.0269
+frac_Q_along_mean_K                0.1000              0.1534              0.1564
+
+[K metrics multiQ] layer=6 head=23 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.3675e-02          3.7610e-02          3.7740e-02
+mean_norm                      3.2821e+01          2.1191e+01          2.2083e+01
+cos(Q, K)                          0.1224              0.1730              0.1760
+cos_centered(Q, K)                -0.0069             -0.0034              0.0254
+frac_Q_along_mean_K                0.0157              0.0357              0.0349
+
+[K metrics multiQ] layer=6 head=5 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.0488e-02          3.2714e-02          3.8042e-02
+mean_norm                      2.4515e+01          2.0190e+01          2.0629e+01
+cos(Q, K)                          0.2406              0.2872              0.3008
+cos_centered(Q, K)                 0.0034              0.0036              0.0261
+frac_Q_along_mean_K                0.0608              0.0976              0.1080
+
+[K metrics multiQ] layer=6 head=9 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.1857e-02          3.7607e-02          3.9918e-02
+mean_norm                      2.1126e+01          2.0237e+01          2.0420e+01
+cos(Q, K)                          0.2596              0.2320              0.2420
+cos_centered(Q, K)                -0.0112             -0.0090              0.0335
+frac_Q_along_mean_K                0.0739              0.0670              0.0689
+
+[K metrics multiQ] layer=6 head=22 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.3675e-02          3.7610e-02          3.7740e-02
+mean_norm                      3.2821e+01          2.1191e+01          2.2083e+01
+cos(Q, K)                          0.1425              0.1950              0.2042
+cos_centered(Q, K)                 0.0026              0.0019              0.0125
+frac_Q_along_mean_K                0.0207              0.0434              0.0474
+
+[K metrics multiQ] layer=6 head=4 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.0488e-02          3.2714e-02          3.8042e-02
+mean_norm                      2.4515e+01          2.0190e+01          2.0629e+01
+cos(Q, K)                          0.1673              0.1789              0.1665
+cos_centered(Q, K)                 0.0060             -0.0114              0.0012
+frac_Q_along_mean_K                0.0298              0.0398              0.0349
+
+[K metrics multiQ] layer=6 head=20 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.3675e-02          3.7610e-02          3.7740e-02
+mean_norm                      3.2821e+01          2.1191e+01          2.2083e+01
+cos(Q, K)                          0.1494              0.2024              0.2111
+cos_centered(Q, K)                -0.0025             -0.0057             -0.0022
+frac_Q_along_mean_K                0.0228              0.0479              0.0535
+
+[K metrics multiQ] layer=6 head=10 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.1857e-02          3.7607e-02          3.9918e-02
+mean_norm                      2.1126e+01          2.0237e+01          2.0420e+01
+cos(Q, K)                          0.2595              0.2383              0.2535
+cos_centered(Q, K)                 0.0018              0.0026              0.0383
+frac_Q_along_mean_K                0.0728              0.0686              0.0739
+
+[K metrics multiQ] layer=6 head=7 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.0488e-02          3.2714e-02          3.8042e-02
+mean_norm                      2.4515e+01          2.0190e+01          2.0629e+01
+cos(Q, K)                          0.3679              0.4111              0.3777
+cos_centered(Q, K)                 0.0037              0.0009              0.0388
+frac_Q_along_mean_K                0.1393              0.1965              0.1652
+
+[K metrics multiQ] layer=6 head=12 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.1736e-02          3.9819e-02          4.3441e-02
+mean_norm                      2.6749e+01          2.2546e+01          2.3461e+01
+cos(Q, K)                          0.1350              0.1400              0.1266
+cos_centered(Q, K)                -0.0033              0.0042              0.0312
+frac_Q_along_mean_K                0.0199              0.0216              0.0158
+
+[K metrics multiQ] layer=6 head=15 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.1736e-02          3.9819e-02          4.3441e-02
+mean_norm                      2.6749e+01          2.2546e+01          2.3461e+01
+cos(Q, K)                          0.1631              0.1787              0.1855
+cos_centered(Q, K)                 0.0037             -0.0024              0.0133
+frac_Q_along_mean_K                0.0279              0.0380              0.0426
+
+[K metrics multiQ] layer=6 head=1 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.8766e-02          4.0977e-02          4.7013e-02
+mean_norm                      2.7585e+01          1.9017e+01          1.9251e+01
+cos(Q, K)                          0.1631              0.2201              0.2318
+cos_centered(Q, K)                 0.0119             -0.0047              0.0205
+frac_Q_along_mean_K                0.0281              0.0600              0.0653
+
+[K metrics multiQ] layer=6 head=29 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  3.8104e-02          5.1584e-02          5.1505e-02
+mean_norm                      1.3471e+01          2.0363e+01          2.2199e+01
+cos(Q, K)                          0.3389              0.1960              0.1726
+cos_centered(Q, K)                -0.0010             -0.0096              0.0102
+frac_Q_along_mean_K                0.1311              0.0446              0.0339
+
+[K metrics multiQ] layer=6 head=30 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  3.8104e-02          5.1584e-02          5.1505e-02
+mean_norm                      1.3471e+01          2.0363e+01          2.2199e+01
+cos(Q, K)                          0.2880              0.1517              0.1516
+cos_centered(Q, K)                -0.0069             -0.0060             -0.0006
+frac_Q_along_mean_K                0.0928              0.0240              0.0264
+
+[K metrics multiQ] layer=6 head=31 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  3.8104e-02          5.1584e-02          5.1505e-02
+mean_norm                      1.3471e+01          2.0363e+01          2.2199e+01
+cos(Q, K)                          0.3234              0.1619              0.1508
+cos_centered(Q, K)                 0.0038             -0.0066              0.0095
+frac_Q_along_mean_K                0.1133              0.0249              0.0241
+
+[K metrics multiQ] layer=6 head=28 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  3.8104e-02          5.1584e-02          5.1505e-02
+mean_norm                      1.3471e+01          2.0363e+01          2.2199e+01
+cos(Q, K)                          0.2613              0.1008              0.0875
+cos_centered(Q, K)                 0.0009              0.0009              0.0528
+frac_Q_along_mean_K                0.0720              0.0077              0.0034
+
+[K metrics multiQ] layer=6 head=8 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.1857e-02          3.7607e-02          3.9918e-02
+mean_norm                      2.1126e+01          2.0237e+01          2.0420e+01
+cos(Q, K)                          0.2920              0.2732              0.2731
+cos_centered(Q, K)                 0.0004              0.0005              0.0313
+frac_Q_along_mean_K                0.0906              0.0878              0.0840
+
+[K metrics multiQ] layer=6 head=17 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.4853e-02          4.1383e-02          4.0523e-02
+mean_norm                      1.6903e+01          2.4036e+01          2.5816e+01
+cos(Q, K)                          0.2810              0.1927              0.1671
+cos_centered(Q, K)                -0.0013             -0.0094              0.0002
+frac_Q_along_mean_K                0.0858              0.0436              0.0320
+
+[K metrics multiQ] layer=6 head=27 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.8556e-02          4.4079e-02          4.5482e-02
+mean_norm                      1.6993e+01          2.0845e+01          2.1921e+01
+cos(Q, K)                          0.3359              0.2386              0.2371
+cos_centered(Q, K)                -0.0086             -0.0042              0.0233
+frac_Q_along_mean_K                0.1254              0.0687              0.0657
+
+[K metrics multiQ] layer=6 head=16 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.4853e-02          4.1383e-02          4.0523e-02
+mean_norm                      1.6903e+01          2.4036e+01          2.5816e+01
+cos(Q, K)                          0.2183              0.1181              0.1226
+cos_centered(Q, K)                -0.0083             -0.0032             -0.0075
+frac_Q_along_mean_K                0.0518              0.0147              0.0175
+
+[K metrics multiQ] layer=6 head=21 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.3675e-02          3.7610e-02          3.7740e-02
+mean_norm                      3.2821e+01          2.1191e+01          2.2083e+01
+cos(Q, K)                          0.1499              0.2163              0.2082
+cos_centered(Q, K)                -0.0073             -0.0130              0.0019
+frac_Q_along_mean_K                0.0235              0.0566              0.0508
+
+[K metrics multiQ] layer=6 head=11 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.1857e-02          3.7607e-02          3.9918e-02
+mean_norm                      2.1126e+01          2.0237e+01          2.0420e+01
+cos(Q, K)                          0.2465              0.2257              0.2292
+cos_centered(Q, K)                 0.0044             -0.0119              0.0072
+frac_Q_along_mean_K                0.0660              0.0634              0.0638
+
+[K metrics multiQ] layer=6 head=18 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  2.4853e-02          4.1383e-02          4.0523e-02
+mean_norm                      1.6903e+01          2.4036e+01          2.5816e+01
+cos(Q, K)                          0.1605              0.0562              0.0451
+cos_centered(Q, K)                 0.0005              0.0098              0.0708
+frac_Q_along_mean_K                0.0285              0.0036              0.0019
+
+[K metrics multiQ] layer=6 head=3 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  1.8766e-02          4.0977e-02          4.7013e-02
+mean_norm                      2.7585e+01          1.9017e+01          1.9251e+01
+cos(Q, K)                          0.1638              0.2096              0.2295
+cos_centered(Q, K)                 0.0045             -0.0016              0.0058
+frac_Q_along_mean_K                0.0281              0.0524              0.0683
+
+[K metrics multiQ] layer=7 head=6 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  4.0095e-04          5.8209e-02          6.3918e-02
+mean_norm                      3.2321e+01          2.6447e+01          2.5871e+01
+cos(Q, K)                          0.6247              0.3880              0.3841
+cos_centered(Q, K)                 0.0077             -0.0006              0.0245
+frac_Q_along_mean_K                0.3909              0.2687              0.2913
+
+[K metrics multiQ] layer=7 head=23 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  7.5838e-04          5.2881e-02          5.5453e-02
+mean_norm                      2.6001e+01          2.3164e+01          2.4062e+01
+cos(Q, K)                          0.6198              0.3370              0.3779
+cos_centered(Q, K)                 0.0074              0.0115              0.0985
+frac_Q_along_mean_K                0.3860              0.1742              0.1907
+
+[K metrics multiQ] layer=7 head=5 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  4.0095e-04          5.8209e-02          6.3918e-02
+mean_norm                      3.2321e+01          2.6447e+01          2.5871e+01
+cos(Q, K)                          0.4588              0.3187              0.3139
+cos_centered(Q, K)                 0.0132              0.0148              0.0842
+frac_Q_along_mean_K                0.2109              0.1758              0.1705
+
+[K metrics multiQ] layer=7 head=9 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  6.4321e-04          4.4723e-02          5.1613e-02
+mean_norm                      2.6453e+01          2.1929e+01          2.0821e+01
+cos(Q, K)                          0.4513              0.2574              0.2308
+cos_centered(Q, K)                 0.0022              0.0024              0.0158
+frac_Q_along_mean_K                0.2064              0.0920              0.0799
+
+[K metrics multiQ] layer=7 head=22 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  7.5838e-04          5.2881e-02          5.5453e-02
+mean_norm                      2.6001e+01          2.3164e+01          2.4062e+01
+cos(Q, K)                          0.5957              0.3427              0.3504
+cos_centered(Q, K)                 0.0057              0.0208              0.1177
+frac_Q_along_mean_K                0.3570              0.1766              0.1561
+
+[K metrics multiQ] layer=7 head=4 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  4.0095e-04          5.8209e-02          6.3918e-02
+mean_norm                      3.2321e+01          2.6447e+01          2.5871e+01
+cos(Q, K)                          0.5662              0.2969              0.2978
+cos_centered(Q, K)                 0.0126              0.0158              0.0772
+frac_Q_along_mean_K                0.3210              0.1506              0.1445
+
+[K metrics multiQ] layer=7 head=20 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  7.5838e-04          5.2881e-02          5.5453e-02
+mean_norm                      2.6001e+01          2.3164e+01          2.4062e+01
+cos(Q, K)                          0.4511              0.2580              0.2485
+cos_centered(Q, K)                 0.0047              0.0129              0.0767
+frac_Q_along_mean_K                0.2061              0.1018              0.0796
+
+[K metrics multiQ] layer=7 head=10 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  6.4321e-04          4.4723e-02          5.1613e-02
+mean_norm                      2.6453e+01          2.1929e+01          2.0821e+01
+cos(Q, K)                          0.4179              0.3121              0.2603
+cos_centered(Q, K)                 0.0018              0.0013             -0.0047
+frac_Q_along_mean_K                0.1766              0.1330              0.1078
+
+[K metrics multiQ] layer=7 head=7 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  4.0095e-04          5.8209e-02          6.3918e-02
+mean_norm                      3.2321e+01          2.6447e+01          2.5871e+01
+cos(Q, K)                          0.4575              0.2306              0.2460
+cos_centered(Q, K)                 0.0171              0.0168              0.0984
+frac_Q_along_mean_K                0.2098              0.0912              0.0945
+
+[K metrics multiQ] layer=7 head=12 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  6.5824e-04          2.7738e-02          3.0396e-02
+mean_norm                      2.3083e+01          2.0300e+01          1.9704e+01
+cos(Q, K)                          0.4150              0.2592              0.2754
+cos_centered(Q, K)                -0.0035              0.0060              0.0001
+frac_Q_along_mean_K                0.1733              0.0773              0.0892
+
+[K metrics multiQ] layer=7 head=15 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  6.5824e-04          2.7738e-02          3.0396e-02
+mean_norm                      2.3083e+01          2.0300e+01          1.9704e+01
+cos(Q, K)                          0.4116              0.2049              0.2709
+cos_centered(Q, K)                -0.0029              0.0015              0.0081
+frac_Q_along_mean_K                0.1706              0.0534              0.0871
+
+[K metrics multiQ] layer=7 head=1 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  7.0067e-04          3.4300e-02          3.8124e-02
+mean_norm                      2.3375e+01          2.2132e+01          2.1912e+01
+cos(Q, K)                          0.3152              0.1721              0.1554
+cos_centered(Q, K)                 0.0150             -0.0082             -0.0132
+frac_Q_along_mean_K                0.1001              0.0373              0.0325
+
+[K metrics multiQ] layer=7 head=29 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  5.0777e-04          5.2222e-02          5.7650e-02
+mean_norm                      2.1865e+01          1.8891e+01          1.8860e+01
+cos(Q, K)                          0.3554              0.1158              0.1522
+cos_centered(Q, K)                 0.0000             -0.0064              0.0054
+frac_Q_along_mean_K                0.1271              0.0295              0.0482
+
+[K metrics multiQ] layer=7 head=30 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  5.0777e-04          5.2222e-02          5.7650e-02
+mean_norm                      2.1865e+01          1.8891e+01          1.8860e+01
+cos(Q, K)                          0.3772              0.0791              0.1225
+cos_centered(Q, K)                -0.0042              0.0019              0.0165
+frac_Q_along_mean_K                0.1432              0.0147              0.0338
+
+[K metrics multiQ] layer=7 head=31 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  5.0777e-04          5.2222e-02          5.7650e-02
+mean_norm                      2.1865e+01          1.8891e+01          1.8860e+01
+cos(Q, K)                          0.3573              0.0957              0.1475
+cos_centered(Q, K)                -0.0029             -0.0018              0.0042
+frac_Q_along_mean_K                0.1284              0.0194              0.0463
+
+[K metrics multiQ] layer=7 head=28 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  5.0777e-04          5.2222e-02          5.7650e-02
+mean_norm                      2.1865e+01          1.8891e+01          1.8860e+01
+cos(Q, K)                          0.3423              0.0893              0.1337
+cos_centered(Q, K)                -0.0001             -0.0080              0.0055
+frac_Q_along_mean_K                0.1176              0.0220              0.0443
+
+[K metrics multiQ] layer=7 head=8 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  6.4321e-04          4.4723e-02          5.1613e-02
+mean_norm                      2.6453e+01          2.1929e+01          2.0821e+01
+cos(Q, K)                          0.3936              0.2335              0.2621
+cos_centered(Q, K)                -0.0034             -0.0093              0.0011
+frac_Q_along_mean_K                0.1567              0.0801              0.1098
+
+[K metrics multiQ] layer=7 head=17 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  5.3261e-04          5.4103e-02          5.8082e-02
+mean_norm                      2.1960e+01          1.9082e+01          1.8927e+01
+cos(Q, K)                          0.3779              0.1725              0.1923
+cos_centered(Q, K)                 0.0021             -0.0061              0.0079
+frac_Q_along_mean_K                0.1446              0.0557              0.0678
+
+[K metrics multiQ] layer=7 head=27 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  5.0794e-04          4.8210e-02          5.1712e-02
+mean_norm                      2.1928e+01          1.8393e+01          1.9289e+01
+cos(Q, K)                          0.3718              0.1553              0.2287
+cos_centered(Q, K)                -0.0004              0.0029              0.0039
+frac_Q_along_mean_K                0.1393              0.0429              0.0845
+
+[K metrics multiQ] layer=7 head=16 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  5.3261e-04          5.4103e-02          5.8082e-02
+mean_norm                      2.1960e+01          1.9082e+01          1.8927e+01
+cos(Q, K)                          0.3639              0.1609              0.2033
+cos_centered(Q, K)                -0.0018             -0.0122             -0.0027
+frac_Q_along_mean_K                0.1335              0.0502              0.0800
+
+[K metrics multiQ] layer=7 head=21 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  7.5838e-04          5.2881e-02          5.5453e-02
+mean_norm                      2.6001e+01          2.3164e+01          2.4062e+01
+cos(Q, K)                          0.2734              0.1433              0.1416
+cos_centered(Q, K)                 0.0003              0.0012              0.0235
+frac_Q_along_mean_K                0.0760              0.0355              0.0309
+
+[K metrics multiQ] layer=7 head=11 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  6.4321e-04          4.4723e-02          5.1613e-02
+mean_norm                      2.6453e+01          2.1929e+01          2.0821e+01
+cos(Q, K)                          0.4782              0.3181              0.3840
+cos_centered(Q, K)                 0.0002             -0.0067             -0.0036
+frac_Q_along_mean_K                0.2297              0.1408              0.2390
+
+[K metrics multiQ] layer=7 head=18 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  5.3261e-04          5.4103e-02          5.8082e-02
+mean_norm                      2.1960e+01          1.9082e+01          1.8927e+01
+cos(Q, K)                          0.3554              0.1816              0.2228
+cos_centered(Q, K)                -0.0021             -0.0083              0.0098
+frac_Q_along_mean_K                0.1273              0.0603              0.0887
+
+[K metrics multiQ] layer=7 head=3 q=[4,21)
+                                     tok0                tok1                tok8
+spread_radius                  7.0067e-04          3.4300e-02          3.8124e-02
+mean_norm                      2.3375e+01          2.2132e+01          2.1912e+01
+cos(Q, K)                          0.4239              0.2320              0.2985
+cos_centered(Q, K)                -0.0035             -0.0150              0.0026
+frac_Q_along_mean_K                0.1821              0.0674              0.1109
+
