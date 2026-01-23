@@ -1,0 +1,44 @@
+
+Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]
+Loading checkpoint shards:  20%|██        | 1/5 [00:00<00:02,  1.98it/s]
+Loading checkpoint shards:  40%|████      | 2/5 [00:00<00:01,  2.06it/s]
+Loading checkpoint shards:  60%|██████    | 3/5 [00:01<00:00,  2.09it/s]
+Loading checkpoint shards:  80%|████████  | 4/5 [00:01<00:00,  2.06it/s]
+Loading checkpoint shards: 100%|██████████| 5/5 [00:02<00:00,  2.75it/s]
+Loading checkpoint shards: 100%|██████████| 5/5 [00:02<00:00,  2.39it/s]
+
+Collecting MLP internals at L=6:   0%|          | 0/56 [00:00<?, ?it/s]
+Collecting MLP internals at L=6:   2%|▏         | 1/56 [00:00<00:44,  1.24it/s]
+Collecting MLP internals at L=6:   5%|▌         | 3/56 [00:00<00:13,  4.02it/s]
+Collecting MLP internals at L=6:   9%|▉         | 5/56 [00:01<00:07,  6.58it/s]
+Collecting MLP internals at L=6:  14%|█▍        | 8/56 [00:01<00:04, 10.94it/s]
+Collecting MLP internals at L=6:  18%|█▊        | 10/56 [00:01<00:06,  7.41it/s]
+Collecting MLP internals at L=6:  23%|██▎       | 13/56 [00:01<00:04, 10.74it/s]
+Collecting MLP internals at L=6:  29%|██▊       | 16/56 [00:01<00:02, 13.99it/s]
+Collecting MLP internals at L=6:  34%|███▍      | 19/56 [00:02<00:03,  9.38it/s]
+Collecting MLP internals at L=6:  39%|███▉      | 22/56 [00:02<00:02, 12.06it/s]
+Collecting MLP internals at L=6:  45%|████▍     | 25/56 [00:02<00:02, 14.74it/s]
+Collecting MLP internals at L=6:  52%|█████▏    | 29/56 [00:02<00:01, 18.38it/s]
+Collecting MLP internals at L=6:  57%|█████▋    | 32/56 [00:02<00:01, 20.42it/s]
+Collecting MLP internals at L=6:  62%|██████▎   | 35/56 [00:02<00:00, 22.18it/s]
+Collecting MLP internals at L=6:  68%|██████▊   | 38/56 [00:02<00:00, 23.68it/s]
+Collecting MLP internals at L=6:  73%|███████▎  | 41/56 [00:03<00:00, 24.20it/s]
+Collecting MLP internals at L=6:  80%|████████  | 45/56 [00:03<00:00, 26.26it/s]
+Collecting MLP internals at L=6:  88%|████████▊ | 49/56 [00:03<00:00, 27.86it/s]
+Collecting MLP internals at L=6:  93%|█████████▎| 52/56 [00:03<00:00, 28.24it/s]
+Collecting MLP internals at L=6: 100%|██████████| 56/56 [00:03<00:00, 29.30it/s]
+                                                                                
+
+[transformers] Disabled packed-sequence split.
+[Tokenized] Tokens[0, 0] is 4498
+[Tokenized] Tokens[0, 0] text is When
+[Sanity check] reconstruction mean_rel_l2=1.3244e-03
+
+[MLP subspace: Z/W_d] layer=6
+                                                    tok0                tok1                tok8
+z_norm                                          5573±6e2                10±2                 9±2
+z_frac_energy [.25/.75/.99]              [1±0, 1±0, 3±0][6±6, 369±2e2, 4802±8e2][12±10, 739±4e2, 5852±9e2]
+z_topk_act_idx k=3                     [5723, 8518, 422]                  []                  []
+W_down_cos_to_top1_aligned_vec k=3   [1.00, -1.00, 1.00]                 N/A                 N/A
+W_down_topk_act_norm k=3                          1.4756              1.6654              1.4446
+

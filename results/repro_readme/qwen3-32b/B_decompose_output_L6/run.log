@@ -1,0 +1,67 @@
+
+Loading checkpoint shards:   0%|          | 0/17 [00:00<?, ?it/s]
+Loading checkpoint shards:   6%|▌         | 1/17 [00:00<00:08,  1.80it/s]
+Loading checkpoint shards:  12%|█▏        | 2/17 [00:01<00:07,  1.91it/s]
+Loading checkpoint shards:  18%|█▊        | 3/17 [00:01<00:07,  1.92it/s]
+Loading checkpoint shards:  24%|██▎       | 4/17 [00:02<00:06,  1.90it/s]
+Loading checkpoint shards:  29%|██▉       | 5/17 [00:02<00:06,  1.90it/s]
+Loading checkpoint shards:  35%|███▌      | 6/17 [00:03<00:05,  1.90it/s]
+Loading checkpoint shards:  41%|████      | 7/17 [00:03<00:05,  1.93it/s]
+Loading checkpoint shards:  47%|████▋     | 8/17 [00:04<00:04,  1.91it/s]
+Loading checkpoint shards:  53%|█████▎    | 9/17 [00:04<00:04,  1.92it/s]
+Loading checkpoint shards:  59%|█████▉    | 10/17 [00:05<00:03,  1.93it/s]
+Loading checkpoint shards:  65%|██████▍   | 11/17 [00:05<00:03,  1.93it/s]
+Loading checkpoint shards:  71%|███████   | 12/17 [00:06<00:02,  1.93it/s]
+Loading checkpoint shards:  76%|███████▋  | 13/17 [00:06<00:02,  1.93it/s]
+Loading checkpoint shards:  82%|████████▏ | 14/17 [00:07<00:01,  1.94it/s]
+Loading checkpoint shards:  88%|████████▊ | 15/17 [00:07<00:01,  1.94it/s]
+Loading checkpoint shards:  94%|█████████▍| 16/17 [00:08<00:00,  1.95it/s]
+Loading checkpoint shards: 100%|██████████| 17/17 [00:08<00:00,  2.03it/s]
+Loading checkpoint shards: 100%|██████████| 17/17 [00:08<00:00,  1.94it/s]
+
+Collecting raw R/A/M at L=6:   0%|          | 0/56 [00:00<?, ?it/s]
+Collecting raw R/A/M at L=6:   2%|▏         | 1/56 [00:00<00:44,  1.24it/s]
+Collecting raw R/A/M at L=6:   5%|▌         | 3/56 [00:00<00:13,  3.91it/s]
+Collecting raw R/A/M at L=6:   7%|▋         | 4/56 [00:01<00:15,  3.44it/s]
+Collecting raw R/A/M at L=6:  11%|█         | 6/56 [00:01<00:09,  5.50it/s]
+Collecting raw R/A/M at L=6:  14%|█▍        | 8/56 [00:01<00:06,  7.61it/s]
+Collecting raw R/A/M at L=6:  18%|█▊        | 10/56 [00:02<00:08,  5.61it/s]
+Collecting raw R/A/M at L=6:  21%|██▏       | 12/56 [00:02<00:06,  7.32it/s]
+Collecting raw R/A/M at L=6:  25%|██▌       | 14/56 [00:02<00:04,  9.08it/s]
+Collecting raw R/A/M at L=6:  29%|██▊       | 16/56 [00:02<00:03, 10.78it/s]
+Collecting raw R/A/M at L=6:  32%|███▏      | 18/56 [00:02<00:04,  8.61it/s]
+Collecting raw R/A/M at L=6:  36%|███▌      | 20/56 [00:02<00:03,  9.78it/s]
+Collecting raw R/A/M at L=6:  39%|███▉      | 22/56 [00:03<00:03, 11.27it/s]
+Collecting raw R/A/M at L=6:  43%|████▎     | 24/56 [00:03<00:02, 12.54it/s]
+Collecting raw R/A/M at L=6:  46%|████▋     | 26/56 [00:03<00:02, 13.82it/s]
+Collecting raw R/A/M at L=6:  50%|█████     | 28/56 [00:03<00:01, 14.94it/s]
+Collecting raw R/A/M at L=6:  54%|█████▎    | 30/56 [00:03<00:01, 15.50it/s]
+Collecting raw R/A/M at L=6:  57%|█████▋    | 32/56 [00:03<00:01, 16.25it/s]
+Collecting raw R/A/M at L=6:  61%|██████    | 34/56 [00:03<00:01, 16.80it/s]
+Collecting raw R/A/M at L=6:  64%|██████▍   | 36/56 [00:03<00:01, 17.04it/s]
+Collecting raw R/A/M at L=6:  68%|██████▊   | 38/56 [00:03<00:01, 17.21it/s]
+Collecting raw R/A/M at L=6:  71%|███████▏  | 40/56 [00:04<00:00, 16.79it/s]
+Collecting raw R/A/M at L=6:  75%|███████▌  | 42/56 [00:04<00:00, 16.99it/s]
+Collecting raw R/A/M at L=6:  79%|███████▊  | 44/56 [00:04<00:00, 17.58it/s]
+Collecting raw R/A/M at L=6:  82%|████████▏ | 46/56 [00:04<00:00, 17.96it/s]
+Collecting raw R/A/M at L=6:  86%|████████▌ | 48/56 [00:04<00:00, 18.28it/s]
+Collecting raw R/A/M at L=6:  89%|████████▉ | 50/56 [00:04<00:00, 18.12it/s]
+Collecting raw R/A/M at L=6:  93%|█████████▎| 52/56 [00:04<00:00, 18.08it/s]
+Collecting raw R/A/M at L=6:  96%|█████████▋| 54/56 [00:04<00:00, 18.24it/s]
+Collecting raw R/A/M at L=6: 100%|██████████| 56/56 [00:04<00:00, 18.48it/s]
+                                                                            
+
+[transformers] Disabled packed-sequence split.
+[Tokenized] Tokens[0, 0] is 4498
+[Tokenized] Tokens[0, 0] text is When
+[Block Output L=6]
+                                 tok0                tok1                tok8
+norm_Y                     2.0381e+04          9.8200e+01          8.2390e+01
+spread_Y                   8.6274e-05          1.0585e-02          1.0230e-02
+norm_residual              2.3284e+02          9.2071e+01          7.7791e+01
+norm_attn                  9.0914e+00          9.5585e+00          1.2135e+01
+norm_mlp                   2.0174e+04          2.5212e+01          2.0671e+01
+spread_residual            3.6288e-03          1.0608e-02          1.0028e-02
+spread_attn                6.7356e-03          9.6779e-03          1.0986e-02
+spread_mlp                 7.0067e-05          1.1989e-02          1.2452e-02
+

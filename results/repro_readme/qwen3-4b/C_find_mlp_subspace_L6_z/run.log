@@ -1,0 +1,40 @@
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s]
+Loading checkpoint shards:  33%|███▎      | 1/3 [00:00<00:01,  1.90it/s]
+Loading checkpoint shards:  67%|██████▋   | 2/3 [00:01<00:00,  1.95it/s]
+Loading checkpoint shards: 100%|██████████| 3/3 [00:01<00:00,  2.88it/s]
+
+Collecting MLP internals at L=6:   0%|          | 0/56 [00:00<?, ?it/s]
+Collecting MLP internals at L=6:   2%|▏         | 1/56 [00:00<00:44,  1.25it/s]
+Collecting MLP internals at L=6:   5%|▌         | 3/56 [00:00<00:13,  4.05it/s]
+Collecting MLP internals at L=6:   9%|▉         | 5/56 [00:01<00:07,  6.71it/s]
+Collecting MLP internals at L=6:  14%|█▍        | 8/56 [00:01<00:05,  9.21it/s]
+Collecting MLP internals at L=6:  18%|█▊        | 10/56 [00:01<00:05,  8.12it/s]
+Collecting MLP internals at L=6:  23%|██▎       | 13/56 [00:01<00:03, 11.36it/s]
+Collecting MLP internals at L=6:  29%|██▊       | 16/56 [00:01<00:02, 14.56it/s]
+Collecting MLP internals at L=6:  34%|███▍      | 19/56 [00:02<00:03, 10.20it/s]
+Collecting MLP internals at L=6:  39%|███▉      | 22/56 [00:02<00:02, 12.82it/s]
+Collecting MLP internals at L=6:  45%|████▍     | 25/56 [00:02<00:02, 15.30it/s]
+Collecting MLP internals at L=6:  52%|█████▏    | 29/56 [00:02<00:01, 18.89it/s]
+Collecting MLP internals at L=6:  57%|█████▋    | 32/56 [00:02<00:01, 20.71it/s]
+Collecting MLP internals at L=6:  64%|██████▍   | 36/56 [00:02<00:00, 23.18it/s]
+Collecting MLP internals at L=6:  70%|██████▉   | 39/56 [00:02<00:00, 24.09it/s]
+Collecting MLP internals at L=6:  75%|███████▌  | 42/56 [00:03<00:00, 24.23it/s]
+Collecting MLP internals at L=6:  82%|████████▏ | 46/56 [00:03<00:00, 26.47it/s]
+Collecting MLP internals at L=6:  89%|████████▉ | 50/56 [00:03<00:00, 27.63it/s]
+Collecting MLP internals at L=6:  96%|█████████▋| 54/56 [00:03<00:00, 28.54it/s]
+                                                                                
+
+[transformers] Disabled packed-sequence split.
+[Tokenized] Tokens[0, 0] is 4498
+[Tokenized] Tokens[0, 0] text is When
+[Sanity check] reconstruction mean_rel_l2=1.5959e-03
+
+[MLP subspace: Z/W_d] layer=6
+                                                    tok0                tok1                tok8
+z_norm                                          4399±1e3                12±2                10±2
+z_frac_energy [.25/.75/.99]              [1±0, 1±0, 4±0][6±6, 463±2e2, 4750±4e2][13±10, 738±3e2, 5223±4e2]
+z_topk_act_idx k=3                    [8046, 1226, 3565]                  []                  []
+W_down_cos_to_top1_aligned_vec k=3  [1.00, -1.00, -1.00]                 N/A                 N/A
+W_down_topk_act_norm k=3                          1.0393              1.1331              1.1205
+

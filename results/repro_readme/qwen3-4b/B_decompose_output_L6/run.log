@@ -1,0 +1,41 @@
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s]
+Loading checkpoint shards:  33%|███▎      | 1/3 [00:00<00:01,  1.89it/s]
+Loading checkpoint shards:  67%|██████▋   | 2/3 [00:01<00:00,  1.94it/s]
+Loading checkpoint shards: 100%|██████████| 3/3 [00:01<00:00,  2.86it/s]
+
+Collecting raw R/A/M at L=6:   0%|          | 0/56 [00:00<?, ?it/s]
+Collecting raw R/A/M at L=6:   2%|▏         | 1/56 [00:00<00:46,  1.18it/s]
+Collecting raw R/A/M at L=6:   5%|▌         | 3/56 [00:00<00:13,  3.84it/s]
+Collecting raw R/A/M at L=6:   9%|▉         | 5/56 [00:01<00:07,  6.43it/s]
+Collecting raw R/A/M at L=6:  14%|█▍        | 8/56 [00:01<00:05,  9.22it/s]
+Collecting raw R/A/M at L=6:  18%|█▊        | 10/56 [00:01<00:05,  7.91it/s]
+Collecting raw R/A/M at L=6:  23%|██▎       | 13/56 [00:01<00:03, 11.13it/s]
+Collecting raw R/A/M at L=6:  29%|██▊       | 16/56 [00:01<00:02, 14.30it/s]
+Collecting raw R/A/M at L=6:  34%|███▍      | 19/56 [00:02<00:03, 10.07it/s]
+Collecting raw R/A/M at L=6:  39%|███▉      | 22/56 [00:02<00:02, 12.72it/s]
+Collecting raw R/A/M at L=6:  45%|████▍     | 25/56 [00:02<00:02, 15.23it/s]
+Collecting raw R/A/M at L=6:  52%|█████▏    | 29/56 [00:02<00:01, 18.95it/s]
+Collecting raw R/A/M at L=6:  57%|█████▋    | 32/56 [00:02<00:01, 20.82it/s]
+Collecting raw R/A/M at L=6:  64%|██████▍   | 36/56 [00:02<00:00, 23.31it/s]
+Collecting raw R/A/M at L=6:  70%|██████▉   | 39/56 [00:02<00:00, 24.31it/s]
+Collecting raw R/A/M at L=6:  75%|███████▌  | 42/56 [00:03<00:00, 24.56it/s]
+Collecting raw R/A/M at L=6:  82%|████████▏ | 46/56 [00:03<00:00, 26.84it/s]
+Collecting raw R/A/M at L=6:  89%|████████▉ | 50/56 [00:03<00:00, 28.02it/s]
+Collecting raw R/A/M at L=6:  96%|█████████▋| 54/56 [00:03<00:00, 28.90it/s]
+                                                                            
+
+[transformers] Disabled packed-sequence split.
+[Tokenized] Tokens[0, 0] is 4498
+[Tokenized] Tokens[0, 0] text is When
+[Block Output L=6]
+                                 tok0                tok1                tok8
+norm_Y                     7.7016e+03          3.3279e+01          3.1970e+01
+spread_Y                   1.4375e-04          1.5594e-02          1.5609e-02
+norm_residual              5.1377e+01          4.1467e+01          3.3549e+01
+norm_attn                  4.0246e+01          2.2899e+01          1.3585e+01
+norm_mlp                   7.6921e+03          1.5064e+01          1.3251e+01
+spread_residual            1.0139e-02          1.2883e-02          1.4472e-02
+spread_attn                7.4468e-03          8.5763e-03          1.6443e-02
+spread_mlp                 1.3410e-04          1.7954e-02          1.8460e-02
+
