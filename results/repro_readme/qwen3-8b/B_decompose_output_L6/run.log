@@ -1,0 +1,44 @@
+
+Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]
+Loading checkpoint shards:  20%|██        | 1/5 [00:00<00:02,  1.99it/s]
+Loading checkpoint shards:  40%|████      | 2/5 [00:00<00:01,  2.06it/s]
+Loading checkpoint shards:  60%|██████    | 3/5 [00:01<00:00,  2.09it/s]
+Loading checkpoint shards:  80%|████████  | 4/5 [00:01<00:00,  2.09it/s]
+Loading checkpoint shards: 100%|██████████| 5/5 [00:02<00:00,  2.80it/s]
+Loading checkpoint shards: 100%|██████████| 5/5 [00:02<00:00,  2.42it/s]
+
+Collecting raw R/A/M at L=6:   0%|          | 0/56 [00:00<?, ?it/s]
+Collecting raw R/A/M at L=6:   2%|▏         | 1/56 [00:00<00:40,  1.34it/s]
+Collecting raw R/A/M at L=6:   7%|▋         | 4/56 [00:00<00:09,  5.61it/s]
+Collecting raw R/A/M at L=6:  12%|█▎        | 7/56 [00:00<00:05,  9.78it/s]
+Collecting raw R/A/M at L=6:  16%|█▌        | 9/56 [00:01<00:06,  6.84it/s]
+Collecting raw R/A/M at L=6:  20%|█▉        | 11/56 [00:01<00:05,  8.56it/s]
+Collecting raw R/A/M at L=6:  25%|██▌       | 14/56 [00:01<00:03, 12.08it/s]
+Collecting raw R/A/M at L=6:  30%|███       | 17/56 [00:01<00:02, 15.37it/s]
+Collecting raw R/A/M at L=6:  36%|███▌      | 20/56 [00:02<00:03,  9.72it/s]
+Collecting raw R/A/M at L=6:  41%|████      | 23/56 [00:02<00:02, 12.43it/s]
+Collecting raw R/A/M at L=6:  46%|████▋     | 26/56 [00:02<00:01, 15.12it/s]
+Collecting raw R/A/M at L=6:  54%|█████▎    | 30/56 [00:02<00:01, 18.46it/s]
+Collecting raw R/A/M at L=6:  59%|█████▉    | 33/56 [00:02<00:01, 20.74it/s]
+Collecting raw R/A/M at L=6:  66%|██████▌   | 37/56 [00:02<00:00, 23.32it/s]
+Collecting raw R/A/M at L=6:  71%|███████▏  | 40/56 [00:02<00:00, 24.06it/s]
+Collecting raw R/A/M at L=6:  77%|███████▋  | 43/56 [00:03<00:00, 25.46it/s]
+Collecting raw R/A/M at L=6:  84%|████████▍ | 47/56 [00:03<00:00, 27.39it/s]
+Collecting raw R/A/M at L=6:  91%|█████████ | 51/56 [00:03<00:00, 28.28it/s]
+Collecting raw R/A/M at L=6:  98%|█████████▊| 55/56 [00:03<00:00, 29.32it/s]
+                                                                            
+
+[transformers] Disabled packed-sequence split.
+[Tokenized] Tokens[0, 0] is 4498
+[Tokenized] Tokens[0, 0] text is When
+[Block Output L=6]
+                                 tok0                tok1                tok8
+norm_Y                     1.1167e+04          4.9651e+01          4.5832e+01
+spread_Y                   1.3117e-04          1.1642e-02          1.1134e-02
+norm_residual              4.9691e+01          5.0324e+01          4.2813e+01
+norm_attn                  2.0112e+01          1.7953e+01          1.1622e+01
+norm_mlp                   1.1152e+04          1.8708e+01          1.5582e+01
+spread_residual            9.2902e-03          9.7958e-03          1.0329e-02
+spread_attn                7.3213e-03          8.9018e-03          1.4113e-02
+spread_mlp                 1.1794e-04          1.4236e-02          1.4359e-02
+
