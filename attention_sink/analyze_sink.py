@@ -2078,6 +2078,49 @@ def _plot_bias_energy_3d(bias_sets, out_path, x_label):
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
 
+def _plot_pullback_contrib_two_panel(
+    comp_names,
+    share_tok0_mu,
+    share_tok0_sd,
+    delta_mu,
+    delta_sd,
+    out_path,
+    title
+):
+    K = int(len(comp_names))
+    x = np.arange(K, dtype=np.int32)
+
+    share_tok0_mu = np.asarray(share_tok0_mu, dtype=np.float32)
+    share_tok0_sd = np.asarray(share_tok0_sd, dtype=np.float32)
+
+    delta_mu = np.asarray(delta_mu, dtype=np.float32)
+    delta_sd = np.asarray(delta_sd, dtype=np.float32)
+
+    fig, axes = plt.subplots(2, 1, figsize=(max(12.0, 0.55 * K), 6.8), sharex=True)
+    ax1, ax2 = axes
+
+    ax1.bar(x, share_tok0_mu, alpha=0.90, edgecolor="none")
+    ax1.errorbar(x, share_tok0_mu, yerr=share_tok0_sd, fmt="none", ecolor="black", elinewidth=0.8, capsize=2, alpha=0.55)
+    ax1.axhline(0.0, color="black", linewidth=0.8)
+    ax1.set_ylabel("share @ tok0")
+    ax1.set_title("Signed additive share onto sink subspace in residual space (tok0)", fontsize=11)
+    ax1.grid(True, axis="y", linewidth=0.35, alpha=0.25)
+
+    ax2.bar(x, delta_mu, alpha=0.90, edgecolor="none")
+    ax2.errorbar(x, delta_mu, yerr=delta_sd, fmt="none", ecolor="black", elinewidth=0.8, capsize=2, alpha=0.55)
+    ax2.axhline(0.0, color="black", linewidth=0.8)
+    ax2.set_ylabel("Δ share (tok0 - tok8)")
+    ax2.set_title("Projection share delta (tok0 - tok8)", fontsize=11)
+    ax2.grid(True, axis="y", linewidth=0.35, alpha=0.25)
+
+    ax2.set_xticks(x.tolist())
+    ax2.set_xticklabels(comp_names, rotation=65, ha="right", fontsize=8)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0.02, 1, 0.98])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
 def _plot_heatmap_grid(attn_maps, titles, out_path, rows=4, suffix="", suptitle="Attention heatmaps"):
     n = len(attn_maps)
     if n == 0:
@@ -2400,41 +2443,28 @@ def main():
 
             return _prehook
 
-        def _make_tok0_Uk_gproj_ablation_preln_prehook(
-            Uk_basis,
-            gamma_vec,
+        def _make_tok0_ablation_preln_prehook(
+            Ue_basis,
             tok_ablate=0,
-            cache=None
         ):
-            assert Uk_basis is not None and Uk_basis.ndim == 2
-            B0 = Uk_basis.to(dtype=torch.float32).contiguous()
-            g = gamma_vec.to(dtype=torch.float32).contiguous()
-            if cache is None:
-                cache = {}
-            cache.setdefault("proj_s_list", [])
-            cache.setdefault("coeff_list", [])
+            assert Ue_basis is not None and Ue_basis.ndim == 2
+            Ue = Ue_basis.to(dtype=torch.float32).contiguous()
 
             def _prehook(_module, args):
                 s = args[0]
                 s2 = s.clone()
                 v = s2[:, tok_ablate, :].to(dtype=torch.float32)
 
-                Bd = B0.to(device=v.device, dtype=torch.float32)
-                gd = g.to(device=v.device, dtype=torch.float32).clamp_min(1e-6)
-                g2d = gd * gd
+                U = Ue.to(device=v.device, dtype=torch.float32)
 
-                vG = v * g2d.view(1, -1)
-                coeff = vG @ Bd
-                proj_s = coeff @ Bd.T
+                coeff = v @ U
+                proj = coeff @ U.T
 
-                cache["proj_s_list"].append(proj_s.detach().cpu())
-                cache["coeff_list"].append(coeff.detach().cpu())
-
-                v_new = v - proj_s
+                v_new = v - proj
                 s2[:, tok_ablate, :] = v_new.to(dtype=s2.dtype)
                 return (s2,)
 
-            return _prehook, cache
+            return _prehook
 
         def _sample_random_subspace_orth_to(Q_ref, D, r):
             assert Q_ref is not None and Q_ref.ndim == 2
@@ -2589,38 +2619,21 @@ def main():
         gamma = ln.weight.detach().float().cpu()
         gamma_safe = gamma.sign() * gamma.abs().clamp_min(1e-6)
         
-        Uk_basis = (Q_joint / gamma_safe[:, None]).contiguous()
-
-        def _compute_g_energy(S, Qb, g, name):
-            S = S.to(dtype=torch.float32)
-            Qd = Qb.to(dtype=torch.float32, device=S.device)
-            gd = g.to(dtype=torch.float32, device=S.device).clamp_min(1e-6)
-
-            xlin = S * gd.view(1, -1)
-            C = xlin @ Qd
-            e = (C ** 2).sum(dim=1)
-            tot = (xlin ** 2).sum(dim=1).clamp_min(EPS)
-            frac = e / tot
-
-            mu_e = float(e.mean().item()); sd_e = float(e.std(unbiased=False).item())
-            mu_f = float(frac.mean().item()); sd_f = float(frac.std(unbiased=False).item())
-            print(f"[Uk energy @S] {name}: E={mu_e:.3e}±{sd_e:.3e} | F={mu_f:.3f}±{sd_f:.3f}")
+        GammaQ = (Q_joint * gamma_safe[:, None]).contiguous()
+        Ue_S = _orth_basis(GammaQ)
         
         run_base = _run_tok0_subspace_ablation(Q_basis=None)
         run_joint = _run_tok0_subspace_ablation(Q_basis=Q_joint)
         run_rand_orth = _run_tok0_subspace_ablation(Q_basis=Q_rand_orth)
 
-        def _run_tok0_preln_gorth_ablation(do_ablate):
+        def _run_tok0_preln_ablation(do_ablate):
             h = None
             ln2 = model.model.layers[L].post_attention_layernorm
-            hook_cache = {}
             try:
                 if do_ablate:
-                    prehook, hook_cache = _make_tok0_Uk_gproj_ablation_preln_prehook(
-                        Uk_basis,
-                        gamma_safe,
+                    prehook = _make_tok0_ablation_preln_prehook(
+                        Ue_S,
                         tok_ablate,
-                        hook_cache,
                     )
                     h = ln2.register_forward_pre_hook(prehook)
 
@@ -2636,34 +2649,27 @@ def main():
                     "S0": S0,
                     "S8": S8,
                     "attn_stats": attn_stats,
-                    "hook_cache": hook_cache,
                 }
             finally:
                 if h is not None:
                     h.remove()
 
-        run_pre_base = _run_tok0_preln_gorth_ablation(do_ablate=False)
-        run_pre_joint = _run_tok0_preln_gorth_ablation(do_ablate=True)
+        run_pre_base = _run_tok0_preln_ablation(do_ablate=False)
+        run_pre_joint = _run_tok0_preln_ablation(do_ablate=True)
+        S0_base = run_pre_base["S0"].to(dtype=torch.float32)
+        S8_base = run_pre_base["S8"].to(dtype=torch.float32)
+        Ue = Ue_S.to(dtype=torch.float32, device=S0_base.device)
 
-        def _uk_gcoords(S, Uk_basis, gamma_safe):
-            S = S.to(dtype=torch.float32)
-            B = Uk_basis.to(device=S.device, dtype=torch.float32)
-            g2 = (gamma_safe.to(device=S.device, dtype=torch.float32) ** 2).clamp_min(EPS)
-            return (S * g2.view(1, -1)) @ B
-
-        S0_base = run_pre_base["S0"]
-        S8_base = run_pre_base["S8"]
-
-        C0 = _uk_gcoords(S0_base, Uk_basis, gamma_safe).detach().cpu().numpy()
-        C8 = _uk_gcoords(S8_base, Uk_basis, gamma_safe).detach().cpu().numpy()
+        C0 = (S0_base @ Ue).detach().cpu().numpy()
+        C8 = (S8_base @ Ue).detach().cpu().numpy()
 
         r_eff = int(C0.shape[1])
         p0_list = [C0[:, i] for i in range(r_eff)]
         p8_list = [C8[:, i] for i in range(r_eff)]
-        labels = [f"gcoord_{i} = (Uk^T G S)_{i}" for i in range(r_eff)]
+        labels = [f"coord_{i}" for i in range(r_eff)]
 
-        out_path_proj_pre = os.path.join(args.outdir, f"preln_Uk_gcoords_L{L}.png")
-        title = f"G-orth coordinates onto Uk in S-space | L={L}\n"
+        out_path_proj_pre = os.path.join(args.outdir, f"preln_GammaQ_coords_L{L}.png")
+        title = f"Coordinates onto gamma-scaled pullback subspace in S-space | L={L}\n"
         _plot_projection_histogram_stacked(
             p0_list=p0_list,
             pb_list=p8_list,
@@ -2672,14 +2678,6 @@ def main():
             title=title,
             bins=60,
         )
-
-        Pall = torch.cat(run_pre_joint["hook_cache"]["proj_s_list"], dim=0)
-        g2 = (gamma_safe ** 2).to(dtype=torch.float32)
-        Pg = (Pall.to(dtype=torch.float32) ** 2) * g2.view(1, -1)
-        e = Pg.sum(dim=1)
-        mu_e = float(e.mean().item())
-        sd_e = float(e.std(unbiased=False).item())
-        print(f"[Uk proj] dataset mean ||Proj_Uk^G(S0)|| = {mu_e:.3e}±{sd_e:.3e}")
 
         Z0_base, Z8_base = run_base["Z0"], run_base["Z8"]
         Z0_joint = run_joint["Z0"]
@@ -2747,6 +2745,67 @@ def main():
             title=f"Sink attention after ablating direction @ L={L}",
             fname=out_path_sink,
             mode="prob",
+        )
+
+        decomp = _collect_residual_decomp_to_layer(
+            model,
+            L,
+            tok_idxs=[tok_ablate, tok_ref],
+            tokenized=tokenized,
+        )
+        labels_map = decomp["labels"]
+        data_map = decomp["data"]
+
+        comp_keys = []
+        comp_names = []
+        comp_keys.append("embed")
+        comp_names.append(labels_map["embed"])
+        for i in range(0, L):
+            comp_keys.append(f"attn_{i}")
+            comp_names.append(labels_map[f"attn_{i}"])
+            comp_keys.append(f"mlp_{i}")
+            comp_names.append(labels_map[f"mlp_{i}"])
+        comp_keys.append(f"attn_{L}")
+        comp_names.append(labels_map[f"attn_{L}"])
+
+        Ue_cpu = Ue_S.detach().to(dtype=torch.float32, device="cpu").contiguous()
+
+        def _shares_for_token(t):
+            coords = []
+            for k in comp_keys:
+                X = data_map[k].get(int(t), None)
+                assert X is not None
+                X = X.to(dtype=torch.float32, device="cpu")
+                coords.append(X @ Ue_cpu)
+            Ctot = torch.zeros_like(coords[0])
+            for Cc in coords:
+                Ctot += Cc
+            denom = (Ctot.pow(2).sum(dim=1)).clamp_min(EPS)
+
+            shares = []
+            for Cc in coords:
+                num = (Cc * Ctot).sum(dim=1)
+                shares.append(num / denom)
+
+            S = torch.stack(shares, dim=1)
+            mu = S.mean(dim=0)
+            sd = S.std(dim=0, unbiased=False)
+            return mu, sd, S
+
+        share0_mu, share0_sd, S0 = _shares_for_token(tok_ablate)
+        share8_mu, share8_sd, S8 = _shares_for_token(tok_ref)
+        delta_mu = share0_mu - share8_mu
+        delta_sd = (S0 - S8).std(dim=0, unbiased=False)
+
+        out_path_shares = os.path.join(args.outdir, f"preln_GammaQ_shares_L{L}.png")
+        _plot_pullback_contrib_two_panel(
+            comp_names,
+            share0_mu.numpy(),
+            share0_sd.numpy(),
+            delta_mu.numpy(),
+            delta_sd.numpy(),
+            out_path_shares,
+            title=f"Attribution of S0 special projection back in residual stream"
         )
 
         return
