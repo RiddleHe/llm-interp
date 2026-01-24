@@ -832,6 +832,74 @@ def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
                 out[name][t] = torch.stack(vecs, dim=0)
     return out
 
+def _collect_preln_gradients_for_Qproj(
+    model,
+    layer_idx,
+    tok_idx,
+    tokenized,
+    Q_basis,
+):
+    assert Q_basis is not None and Q_basis.ndim == 2
+
+    blk = model.model.layers[layer_idx]
+    ln = blk.post_attention_layernorm
+
+    grads = []
+    cache = {}
+
+    def _ln_prehook(_module, args):
+        s = args[0]
+        s2 = s.detach().clone().requires_grad_(True)
+        cache["s"] = s2
+        return (s2,)
+
+    def _ln_fwdhook(_module, args, output):
+        cache["x_post"] = output
+
+    h_pre = ln.register_forward_pre_hook(_ln_prehook)
+    h_fwd = ln.register_forward_hook(_ln_fwdhook)
+
+    try:
+        with _no_param_grads(model):
+            for input_ids, base_pos in tqdm(
+                tokenized,
+                desc=f"[decompose_preln_Q_proj] grads @ L={layer_idx} tok={tok_idx}",
+                leave=False,
+            ):
+                cache.clear()
+                model.zero_grad(set_to_none=True)
+
+                _ = model(
+                    input_ids=input_ids.to(next(model.parameters()).device),
+                    position_ids=base_pos.to(next(model.parameters()).device),
+                    use_cache=False,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                )
+
+                s = cache.get("s", None)
+                x_post = cache.get("x_post", None)
+                if s is None or x_post is None:
+                    continue
+
+                x0 = x_post[:, tok_idx, :].to(dtype=torch.float32)
+                Qd = Q_basis.to(device=x0.device, dtype=torch.float32)
+                coeff = x0 @ Qd
+                f = (coeff.pow(2).sum(dim=1)).mean()
+                f.backward()
+
+                g = s.grad[:, tok_idx, :].detach().float().cpu()
+                grads.append(g[0].clone())
+
+    finally:
+        h_pre.remove()
+        h_fwd.remove()
+
+    if not grads:
+        return None
+    
+    return torch.stack(grads, dim=0)
+
 def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
     mlp = model.model.layers[layer_idx].mlp
     attn = model.model.layers[layer_idx].self_attn
@@ -1335,6 +1403,46 @@ def _pick_all_heads_with_caches(model, attns, layer_idx):
     return a[0].detach().float().cpu()
 
 # plots
+
+def _plot_projection_histogram_before_after_stacked(
+    p_before_list,
+    p_after_list,
+    labels,
+    out_path,
+    title,
+    bins=60,
+):
+    assert len(p_before_list) == len(p_after_list) == len(labels)
+    k = int(len(labels))
+
+    fig, axes = plt.subplots(k, 1, figsize=(9.5, max(3.2, 2.6 * k)), sharex=False)
+    if k == 1:
+        axes = [axes]
+
+    for i, (pbef, paft, lab) in enumerate(zip(p_before_list, p_after_list, labels)):
+        ax = axes[i]
+        pbef = np.asarray(pbef, dtype=np.float32)
+        paft = np.asarray(paft, dtype=np.float32)
+
+        lo = float(min(pbef.min(), paft.min()))
+        hi = float(max(pbef.max(), paft.max()))
+        edges = np.linspace(lo, hi, int(bins))
+
+        ax.hist(pbef, bins=edges, density=True, alpha=0.55, label="before")
+        ax.hist(paft, bins=edges, density=True, alpha=0.55, label="after")
+        ax.axvline(0.0, color="black", linewidth=0.8)
+
+        ax.set_ylabel("density")
+        ax.set_title(str(lab), loc="left", fontsize=10)
+        ax.grid(True, which="major", axis="both", linewidth=0.4, alpha=0.25)
+        if i == 0:
+            ax.legend(loc="best", frameon=False, fontsize=9)
+
+    axes[-1].set_xlabel("projection value at coordinate")
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0.0, 1, 0.985])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
 
 def _plot_projection_histogram_stacked(
     p0_list, 
@@ -2259,6 +2367,7 @@ def main():
     if args.decompose_mlp_in:
         L = int(args.layer)
         tok_ablate = 0
+        tok_ref = 8
         scan_layers = list(range(L + 1, model.config.num_hidden_layers))
 
         def _orth_unit(u):
@@ -2275,7 +2384,7 @@ def main():
             return Qb[:, keep].contiguous()
 
         def _make_tok0_subspace_ablation_mlp_prehook(Q_basis, tok_ablate=0):
-            assert Q_basis is not None and Q_basis.ndim == 2
+            assert Q_basis is not None
             Qb = Q_basis.to(dtype=torch.float32).contiguous()
 
             def _prehook(_module, args):
@@ -2290,6 +2399,42 @@ def main():
                 return (x2,)
 
             return _prehook
+
+        def _make_tok0_Uk_gproj_ablation_preln_prehook(
+            Uk_basis,
+            gamma_vec,
+            tok_ablate=0,
+            cache=None
+        ):
+            assert Uk_basis is not None and Uk_basis.ndim == 2
+            B0 = Uk_basis.to(dtype=torch.float32).contiguous()
+            g = gamma_vec.to(dtype=torch.float32).contiguous()
+            if cache is None:
+                cache = {}
+            cache.setdefault("proj_s_list", [])
+            cache.setdefault("coeff_list", [])
+
+            def _prehook(_module, args):
+                s = args[0]
+                s2 = s.clone()
+                v = s2[:, tok_ablate, :].to(dtype=torch.float32)
+
+                Bd = B0.to(device=v.device, dtype=torch.float32)
+                gd = g.to(device=v.device, dtype=torch.float32).clamp_min(1e-6)
+                g2d = gd * gd
+
+                vG = v * g2d.view(1, -1)
+                coeff = vG @ Bd
+                proj_s = coeff @ Bd.T
+
+                cache["proj_s_list"].append(proj_s.detach().cpu())
+                cache["coeff_list"].append(coeff.detach().cpu())
+
+                v_new = v - proj_s
+                s2[:, tok_ablate, :] = v_new.to(dtype=s2.dtype)
+                return (s2,)
+
+            return _prehook, cache
 
         def _sample_random_subspace_orth_to(Q_ref, D, r):
             assert Q_ref is not None and Q_ref.ndim == 2
@@ -2315,9 +2460,9 @@ def main():
                             tok_ablate=0
                         )
                     )
-                data = _collect_mlp_internals_for_layer(model, L, [0, 8], tokenized)
-                Z0 = data["Z"][0]
-                Z8 = data["Z"][8]
+                data = _collect_mlp_internals_for_layer(model, L, [tok_ablate, tok_ref], tokenized)
+                Z0 = data["Z"][tok_ablate]
+                Z8 = data["Z"][tok_ref]
 
                 attn_stats = _scan_sink_attention_only(model, tokenized, scan_layers)
 
@@ -2331,7 +2476,7 @@ def main():
                 if h is not None:
                     h.remove()
 
-        mlp_data = _collect_mlp_internals_for_layer(model, L, [tok_ablate, 8], tokenized)
+        mlp_data = _collect_mlp_internals_for_layer(model, L, [tok_ablate, tok_ref], tokenized)
         Z0 = mlp_data["Z"][tok_ablate]
 
         z_idx, z_stats = _topk_energy_dims(Z0, k=3, min_median_mass=0.55)
@@ -2339,7 +2484,7 @@ def main():
             raise ValueError(f"No consistent top-k energy dimensions found.")
 
         X0 = mlp_data["X"][tok_ablate]
-        Xb = mlp_data["X"][8]
+        Xb = mlp_data["X"][tok_ref]
         mu_b = Xb.mean(dim=0)
 
         lambdas_list = []
@@ -2413,11 +2558,11 @@ def main():
             proj_pb_list.append(pb)
             labels.append(f"zdim={int(j)} | f=z[{int(j)}]^2")
 
-        out_path = os.path.join(args.outdir, f"decompose_mlp_in_L{L}_tok{tok_ablate}_eig.png")
+        out_path = os.path.join(args.outdir, f"mlp_in_eig_L{L}_tok{tok_ablate}.png")
         title = f"Active subspace spectrum | L={L} tok={tok_ablate} | f=z[idx]^2 | z_idx={z_idx}"
         _plot_grad_second_moment_spectrum_stacked(lambdas_list, labels, out_path, title)
 
-        out_path_proj = os.path.join(args.outdir, f"decompose_mlp_in_L{L}_tok{tok_ablate}_proj.png")
+        out_path_proj = os.path.join(args.outdir, f"mlp_in_eig_proj_L{L}_tok{tok_ablate}.png")
         title_proj = (
             f"Projection onto top v | L={L} tok={tok_ablate} \n"
             f"p = v^T (x - mu_b)"
@@ -2439,20 +2584,112 @@ def main():
         Q_joint = _orth_basis(Vmat.cpu())
         r = int(Q_joint.size(1))
         Q_rand_orth = _sample_random_subspace_orth_to(Q_joint, Dm, r)
+
+        ln = model.model.layers[L].post_attention_layernorm
+        gamma = ln.weight.detach().float().cpu()
+        gamma_safe = gamma.sign() * gamma.abs().clamp_min(1e-6)
+        
+        Uk_basis = (Q_joint / gamma_safe[:, None]).contiguous()
+
+        def _compute_g_energy(S, Qb, g, name):
+            S = S.to(dtype=torch.float32)
+            Qd = Qb.to(dtype=torch.float32, device=S.device)
+            gd = g.to(dtype=torch.float32, device=S.device).clamp_min(1e-6)
+
+            xlin = S * gd.view(1, -1)
+            C = xlin @ Qd
+            e = (C ** 2).sum(dim=1)
+            tot = (xlin ** 2).sum(dim=1).clamp_min(EPS)
+            frac = e / tot
+
+            mu_e = float(e.mean().item()); sd_e = float(e.std(unbiased=False).item())
+            mu_f = float(frac.mean().item()); sd_f = float(frac.std(unbiased=False).item())
+            print(f"[Uk energy @S] {name}: E={mu_e:.3e}±{sd_e:.3e} | F={mu_f:.3f}±{sd_f:.3f}")
         
         run_base = _run_tok0_subspace_ablation(Q_basis=None)
         run_joint = _run_tok0_subspace_ablation(Q_basis=Q_joint)
         run_rand_orth = _run_tok0_subspace_ablation(Q_basis=Q_rand_orth)
 
+        def _run_tok0_preln_gorth_ablation(do_ablate):
+            h = None
+            ln2 = model.model.layers[L].post_attention_layernorm
+            hook_cache = {}
+            try:
+                if do_ablate:
+                    prehook, hook_cache = _make_tok0_Uk_gproj_ablation_preln_prehook(
+                        Uk_basis,
+                        gamma_safe,
+                        tok_ablate,
+                        hook_cache,
+                    )
+                    h = ln2.register_forward_pre_hook(prehook)
+
+                data = _collect_mlp_internals_for_layer(model, L, [tok_ablate, tok_ref], tokenized)
+                X0 = data["X"][tok_ablate]
+                X8 = data["X"][tok_ref]
+                S0 = data["LN_in"][tok_ablate]
+                S8 = data["LN_in"][tok_ref]
+                attn_stats = _scan_sink_attention_only(model, tokenized, scan_layers)
+                return {
+                    "X0": X0,
+                    "X8": X8,
+                    "S0": S0,
+                    "S8": S8,
+                    "attn_stats": attn_stats,
+                    "hook_cache": hook_cache,
+                }
+            finally:
+                if h is not None:
+                    h.remove()
+
+        run_pre_base = _run_tok0_preln_gorth_ablation(do_ablate=False)
+        run_pre_joint = _run_tok0_preln_gorth_ablation(do_ablate=True)
+
+        def _uk_gcoords(S, Uk_basis, gamma_safe):
+            S = S.to(dtype=torch.float32)
+            B = Uk_basis.to(device=S.device, dtype=torch.float32)
+            g2 = (gamma_safe.to(device=S.device, dtype=torch.float32) ** 2).clamp_min(EPS)
+            return (S * g2.view(1, -1)) @ B
+
+        S0_base = run_pre_base["S0"]
+        S8_base = run_pre_base["S8"]
+
+        C0 = _uk_gcoords(S0_base, Uk_basis, gamma_safe).detach().cpu().numpy()
+        C8 = _uk_gcoords(S8_base, Uk_basis, gamma_safe).detach().cpu().numpy()
+
+        r_eff = int(C0.shape[1])
+        p0_list = [C0[:, i] for i in range(r_eff)]
+        p8_list = [C8[:, i] for i in range(r_eff)]
+        labels = [f"gcoord_{i} = (Uk^T G S)_{i}" for i in range(r_eff)]
+
+        out_path_proj_pre = os.path.join(args.outdir, f"preln_Uk_gcoords_L{L}.png")
+        title = f"G-orth coordinates onto Uk in S-space | L={L}\n"
+        _plot_projection_histogram_stacked(
+            p0_list=p0_list,
+            pb_list=p8_list,
+            labels=labels,
+            out_path=out_path_proj_pre,
+            title=title,
+            bins=60,
+        )
+
+        Pall = torch.cat(run_pre_joint["hook_cache"]["proj_s_list"], dim=0)
+        g2 = (gamma_safe ** 2).to(dtype=torch.float32)
+        Pg = (Pall.to(dtype=torch.float32) ** 2) * g2.view(1, -1)
+        e = Pg.sum(dim=1)
+        mu_e = float(e.mean().item())
+        sd_e = float(e.std(unbiased=False).item())
+        print(f"[Uk proj] dataset mean ||Proj_Uk^G(S0)|| = {mu_e:.3e}±{sd_e:.3e}")
+
         Z0_base, Z8_base = run_base["Z0"], run_base["Z8"]
         Z0_joint = run_joint["Z0"]
         Z0_rand_orth = run_rand_orth["Z0"]
 
-        out_path_zstack = os.path.join(args.outdir, f"decompose_mlp_in_L{L}_tok{tok_ablate}_zstack.png")
+        out_path_zstack = os.path.join(args.outdir, f"mlp_in_ablate_Qproj_zstack_L{L}_tok{tok_ablate}.png")
         _plot_z_topk_energy_stacks(
             Z_list=[Z0_base, Z0_joint, Z0_rand_orth, Z8_base],
             tok_labels=[
-                "tok0 (base)", "tok0 (-span(v1))", "tok0 (-span(rand⊥))", "tok8 (base)",
+                "tok0 (base)", "tok0 (-span(Q))", "tok0 (-span(rand⊥))", "tok8 (base)",
             ],
             topk=24,
             out_path=out_path_zstack,
@@ -2461,23 +2698,53 @@ def main():
             ),
         )
 
+        X0_pre_base = run_pre_base["X0"]
+        X0_pre_joint = run_pre_joint["X0"]
+
+        def _coords_uncentered(X):
+            Xf = X.to(dtype=torch.float32)
+            Qd = Q_joint.to(dtype=torch.float32, device=X.device)
+            C = Xf @ Qd # [N, r]
+            return C.detach().cpu().numpy()
+
+        C_before = _coords_uncentered(X0_pre_base)
+        C_after_joint = _coords_uncentered(X0_pre_joint)
+
+        r_eff = int(C_before.shape[1])
+        proj_before_list = [C_before[:, i] for i in range(r_eff)]
+        proj_after_joint_list = [C_after_joint[:, i] for i in range(r_eff)]
+        proj_labels = [f"coord_{i} = X0·Q[:,{i}]" for i in range(r_eff)]
+
+        out_path_proj_pre = os.path.join(args.outdir, f"preln_ablate_S0_target_projQ_L{L}.png")
+        _plot_projection_histogram_before_after_stacked(
+            p_before_list=proj_before_list,
+            p_after_list=proj_after_joint_list,
+            labels=proj_labels,
+            out_path=out_path_proj_pre,
+            title=f"Projection onto sink subspace in MLP space | S0 ablation @ L={L} tok={tok_ablate}",
+            bins=60,
+        )
+
         stats_base = run_base["attn_stats"]
         stats_joint = run_joint["attn_stats"]
         stats_rand_orth = run_rand_orth["attn_stats"]
 
+        stats_pre_joint = run_pre_joint["attn_stats"]
+
         series = [
             ("baseline", sorted(stats_base, key=lambda x: x["layer"])),
-            ("tok0 (-span(v1))", sorted(stats_joint, key=lambda x: x["layer"])),
-            ("tok0 (-span(rand⊥))", sorted(stats_rand_orth, key=lambda x: x["layer"])),
+            ("X0 (-span(X subspace))", sorted(stats_joint, key=lambda x: x["layer"])),
+            ("X0 (-span(X rand⊥))", sorted(stats_rand_orth, key=lambda x: x["layer"])),
+            ("S0 (-span(S subspace))", sorted(stats_pre_joint, key=lambda x: x["layer"])),
         ]
         
-        out_path_sink = f"decompose_mlp_in_L{L}_tok{tok_ablate}_sink_attn.png"
+        out_path_sink = f"mlp_in_ablate_Qproj_attnL{L}_tok{tok_ablate}.png"
         _plot_progression_multi(
             series,
             args.outdir,
             key="sink_attn",
             ylabel=f"Attn(Q -> K[0]) (var across heads)",
-            title=f"Sink attention after ablating MLP-in direction @ L={L}",
+            title=f"Sink attention after ablating direction @ L={L}",
             fname=out_path_sink,
             mode="prob",
         )
