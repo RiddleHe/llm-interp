@@ -1,0 +1,51 @@
+
+Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]
+Loading checkpoint shards:  20%|██        | 1/5 [00:00<00:02,  1.86it/s]
+Loading checkpoint shards:  40%|████      | 2/5 [00:01<00:01,  2.00it/s]
+Loading checkpoint shards:  60%|██████    | 3/5 [00:01<00:00,  2.06it/s]
+Loading checkpoint shards:  80%|████████  | 4/5 [00:01<00:00,  2.24it/s]
+Loading checkpoint shards: 100%|██████████| 5/5 [00:02<00:00,  2.98it/s]
+Loading checkpoint shards: 100%|██████████| 5/5 [00:02<00:00,  2.49it/s]
+
+Scanning (attn only):   0%|          | 0/56 [00:00<?, ?it/s]
+Scanning (attn only):   2%|▏         | 1/56 [00:00<00:38,  1.42it/s]
+Scanning (attn only):   5%|▌         | 3/56 [00:00<00:11,  4.49it/s]
+Scanning (attn only):   9%|▉         | 5/56 [00:00<00:06,  7.42it/s]
+Scanning (attn only):  14%|█▍        | 8/56 [00:01<00:03, 12.07it/s]
+Scanning (attn only):  20%|█▉        | 11/56 [00:01<00:05,  8.69it/s]
+Scanning (attn only):  25%|██▌       | 14/56 [00:01<00:03, 11.83it/s]
+Scanning (attn only):  30%|███       | 17/56 [00:01<00:02, 14.86it/s]
+Scanning (attn only):  36%|███▌      | 20/56 [00:02<00:03,  9.74it/s]
+Scanning (attn only):  41%|████      | 23/56 [00:02<00:02, 12.33it/s]
+Scanning (attn only):  46%|████▋     | 26/56 [00:02<00:01, 15.06it/s]
+Scanning (attn only):  54%|█████▎    | 30/56 [00:02<00:01, 18.35it/s]
+Scanning (attn only):  59%|█████▉    | 33/56 [00:02<00:01, 20.55it/s]
+Scanning (attn only):  66%|██████▌   | 37/56 [00:02<00:00, 22.69it/s]
+Scanning (attn only):  71%|███████▏  | 40/56 [00:02<00:00, 23.55it/s]
+Scanning (attn only):  77%|███████▋  | 43/56 [00:03<00:00, 24.95it/s]
+Scanning (attn only):  84%|████████▍ | 47/56 [00:03<00:00, 26.89it/s]
+Scanning (attn only):  91%|█████████ | 51/56 [00:03<00:00, 27.77it/s]
+Scanning (attn only):  98%|█████████▊| 55/56 [00:03<00:00, 28.85it/s]
+                                                                     
+
+Scanning (attn only):   0%|          | 0/56 [00:00<?, ?it/s]
+Scanning (attn only):   5%|▌         | 3/56 [00:00<00:02, 24.59it/s]
+Scanning (attn only):  12%|█▎        | 7/56 [00:00<00:01, 28.70it/s]
+Scanning (attn only):  18%|█▊        | 10/56 [00:00<00:01, 28.94it/s]
+Scanning (attn only):  25%|██▌       | 14/56 [00:00<00:01, 29.93it/s]
+Scanning (attn only):  32%|███▏      | 18/56 [00:00<00:01, 30.31it/s]
+Scanning (attn only):  39%|███▉      | 22/56 [00:00<00:01, 30.72it/s]
+Scanning (attn only):  46%|████▋     | 26/56 [00:00<00:00, 30.91it/s]
+Scanning (attn only):  54%|█████▎    | 30/56 [00:00<00:00, 30.98it/s]
+Scanning (attn only):  61%|██████    | 34/56 [00:01<00:00, 30.99it/s]
+Scanning (attn only):  68%|██████▊   | 38/56 [00:01<00:00, 31.01it/s]
+Scanning (attn only):  75%|███████▌  | 42/56 [00:01<00:00, 30.23it/s]
+Scanning (attn only):  82%|████████▏ | 46/56 [00:01<00:00, 30.57it/s]
+Scanning (attn only):  89%|████████▉ | 50/56 [00:01<00:00, 30.83it/s]
+Scanning (attn only):  96%|█████████▋| 54/56 [00:01<00:00, 31.02it/s]
+                                                                     
+
+[transformers] Disabled packed-sequence split.
+[Tokenized] Tokens[0, 0] is 4498
+[Tokenized] Tokens[0, 0] text is When
+
