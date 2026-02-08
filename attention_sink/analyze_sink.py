@@ -1261,7 +1261,7 @@ def _append_suffix(path, suffix):
 # Forward & capture functions
 
 @torch.no_grad()
-def prefill(model, input_ids, position_ids):
+def prefill(model, input_ids, position_ids, return_hidden_states: bool = False):
     device = next(model.parameters()).device
     out = model(
         input_ids=input_ids.to(device),
@@ -1270,6 +1270,8 @@ def prefill(model, input_ids, position_ids):
         output_attentions=True,
         output_hidden_states=True,
     )
+    if return_hidden_states:
+        return out.attentions, out.hidden_states
     return out.attentions # tuple(len=layers) of [B, H, Q, K]
 
 def _capture_qkv_multi(model, layer_idxs, cache, capture_attn_out=False, capture_mlp_out=False):
@@ -2042,6 +2044,97 @@ def _plot_progression_multi(series, outdir, key, ylabel, title, fname, mode=None
     plt.savefig(os.path.join(outdir, fname), dpi=300)
     plt.close()
 
+def _plot_progression_multi_with_overlay(
+    main_series,
+    overlay_series,
+    outdir,
+    key_main,
+    key_overlay,
+    ylabel,
+    title,
+    fname,
+    mode=None,
+):
+    """
+    Plot multiple series for key_main, and overlay additional series for key_overlay
+    on the same axes.  Intended for MLP_out norm + block hidden-state norm overlay.
+    """
+    if not main_series and not overlay_series:
+        return
+
+    layers_all = sorted({
+        s["layer"]
+        for _lbl, stats in (main_series or []) + (overlay_series or [])
+        for s in (stats or [])
+    })
+    if not layers_all:
+        return
+
+    plt.figure(figsize=(12, 6))
+    ax = plt.gca()
+
+    # Main series (default style)
+    for lbl, stats in (main_series or []):
+        if not stats:
+            continue
+        by = {s["layer"]: s for s in stats}
+        x = [L for L in layers_all if L in by]
+        y = [by[L][key_main] for L in x]
+        yerr = None
+        if len(stats) > 0 and (key_main + "_var") in stats[0]:
+            yerr = [math.sqrt(max(0.0, float(by[L].get(key_main + "_var", 0.0)))) for L in x]
+        if yerr is not None:
+            ax.errorbar(x, y, yerr=yerr, marker="o", linewidth=1.0, elinewidth=0.8, capsize=2, label=lbl)
+        else:
+            ax.plot(x, y, marker="o", label=lbl)
+
+    # Overlay series (distinct style: black dashed)
+    for _i, (lbl, stats) in enumerate(overlay_series or []):
+        if not stats:
+            continue
+        by = {s["layer"]: s for s in stats}
+        x = [L for L in layers_all if L in by]
+        y = [by[L][key_overlay] for L in x]
+        yerr = None
+        if len(stats) > 0 and (key_overlay + "_var") in stats[0]:
+            yerr = [math.sqrt(max(0.0, float(by[L].get(key_overlay + "_var", 0.0)))) for L in x]
+        style = dict(color="black", linestyle="--", linewidth=2.0, marker="s", markersize=4, alpha=0.95)
+        if yerr is not None:
+            ax.errorbar(x, y, yerr=yerr, elinewidth=0.9, capsize=2, label=lbl, **style)
+        else:
+            ax.plot(x, y, label=lbl, **style)
+
+    ax.set_xlabel("Layer")
+    ax.set_ylabel(ylabel)
+
+    if mode == "cos":
+        ax.set_ylim(-1, 1)
+    elif mode == "prob":
+        ax.set_ylim(0, 1)
+    elif mode == "res":
+        vals = []
+        for _lbl, stats in (main_series or []):
+            for s in (stats or []):
+                vals.append(float(s.get(key_main, 0.0)))
+        for _lbl, stats in (overlay_series or []):
+            for s in (stats or []):
+                vals.append(float(s.get(key_overlay, 0.0)))
+        vmax = max(vals) if vals else 10.0
+        ax.set_ylim(0.0, max(10.0, vmax * 1.15))
+
+    ax.set_title(title)
+    ax.legend(loc="best", frameon=False, fontsize=8)
+    ax.grid(True, which="major", axis="both", linewidth=0.5, alpha=0.35)
+
+    if len(layers_all) > 0:
+        ax.set_xlim(min(layers_all), max(layers_all))
+        ax.set_xticks(layers_all)
+        ax.set_xticklabels([str(L) for L in layers_all], rotation=0)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, fname), dpi=300)
+    plt.close()
+
 def _plot_bias_energy_3d(bias_sets, out_path, x_label):
     Ys = [Y for (Y, _t) in bias_sets if Y is not None]
     if not Ys:
@@ -2264,6 +2357,7 @@ def main():
                 "cos_h": {int(s): [] for s in sink_idxs_local},
                 "sink_attn_h": {int(s): [] for s in sink_idxs_local},
                 "out_norm": {int(s): [] for s in sink_idxs_local}, 
+                "hid_out_norm": {int(s): [] for s in sink_idxs_local},  # block output hidden-state norm
                 "k_vecs_h": {int(s): [] for s in sink_idxs_local}, # list of [H, D]
                 "v_vecs_h": {int(s): [] for s in sink_idxs_local},
                 "out_vecs": {int(s): [] for s in sink_idxs_local}, # list of [D]
@@ -2290,7 +2384,11 @@ def main():
                 for L in list(store.keys()):
                     store[L].clear()
                 pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides_local)
-                attns = prefill(model, input_ids, pos_ids_perturbed)
+                if args.print_mode == "qkv":
+                    attns, hidden_states = prefill(model, input_ids, pos_ids_perturbed, return_hidden_states=True)
+                else:
+                    attns = prefill(model, input_ids, pos_ids_perturbed)
+                    hidden_states = None
 
                 for L in scan_layers:
                     if args.print_mode == "qkv":
@@ -2319,12 +2417,22 @@ def main():
                             h_sink = H[0, sink_idx]
                         
                             out_norm = float(torch.log(out_sink.norm().clamp_min(EPS)).item())
+                            # Block-output hidden-state norm (cumulative residual stream)
+                            # hidden_states[L+1] = output of layer L (before final RMSNorm)
+                            hid_out_norm = float("nan")
+                            if hidden_states is not None:
+                                try:
+                                    hs_vec = hidden_states[int(L) + 1][0, sink_idx, :].to(dtype=torch.float32)
+                                    hid_out_norm = float(torch.log(hs_vec.norm().clamp_min(EPS)).item())
+                                except Exception:
+                                    pass
 
                             per_layer_acc[L]["k_norm_h"][sink_idx].append(k_norm_h.detach().cpu())
                             per_layer_acc[L]["v_norm_h"][sink_idx].append(v_norm_h.detach().cpu())
                             per_layer_acc[L]["cos_h"][sink_idx].append(cos_h.detach().cpu())
                             per_layer_acc[L]["sink_attn_h"][sink_idx].append(sink_qmean_per_head.detach().cpu())
                             per_layer_acc[L]["out_norm"][sink_idx].append(out_norm)
+                            per_layer_acc[L]["hid_out_norm"][sink_idx].append(hid_out_norm)
                             per_layer_acc[L]["k_vecs_h"][sink_idx].append(k_sink.detach().float().cpu())
                             per_layer_acc[L]["v_vecs_h"][sink_idx].append(v_sink.detach().float().cpu())
                             per_layer_acc[L]["out_vecs"][sink_idx].append(out_sink.detach().float().cpu())
@@ -2356,6 +2464,11 @@ def main():
                     out_mu = float(np.mean(out_list))
                     out_var = float(np.var(out_list))
 
+                    hid_list = acc["hid_out_norm"][sink_idx]
+                    hid_list_clean = [x for x in hid_list if not math.isnan(x)]
+                    hid_mu = float(np.mean(hid_list_clean)) if hid_list_clean else float("nan")
+                    hid_var = float(np.var(hid_list_clean)) if hid_list_clean else 0.0
+
                     k_spread_mu, k_spread_var = _headwise_cloud_radius_mu_var(acc["k_vecs_h"][sink_idx])
                     v_spread_mu, v_spread_var = _headwise_cloud_radius_mu_var(acc["v_vecs_h"][sink_idx])
                     o_spread = _cloud_radius(torch.stack(acc["out_vecs"][sink_idx], dim=0))
@@ -2371,6 +2484,8 @@ def main():
                         "sink_attn_var": sink_var,
                         "out_norm": out_mu,
                         "out_norm_var": out_var,
+                        "hid_out_norm": hid_mu,
+                        "hid_out_norm_var": hid_var,
                         "layer": L, 
                         "head": args.head,
                         "target_q": target_q,
@@ -2910,6 +3025,20 @@ def main():
                 title=f"MLP output activation norm progression", fname="scan_mlp_out_norm.png",
                 mode="res",
             )
+            # Overlay: MLP-out norm + block hidden-state norm (cumulative residual stream)
+            overlay_idx = int(sorted(scan_stats_by_sink.keys())[0]) if scan_stats_by_sink else None
+            if overlay_idx is not None and overlay_idx in scan_stats_by_sink:
+                _plot_progression_multi_with_overlay(
+                    main_series=series,
+                    overlay_series=[(f"hidden(sink={int(overlay_idx)})", scan_stats_by_sink[int(overlay_idx)])],
+                    outdir=args.outdir,
+                    key_main="out_norm",
+                    key_overlay="hid_out_norm",
+                    ylabel=f"log L2 norm (var across samples)",
+                    title=f"MLP_out norm + block hidden-state norm (cumulative)",
+                    fname="scan_mlp_out_norm_with_hidden.png",
+                    mode="res",
+                )
             _plot_progression_multi(
                 series, args.outdir, key="k_spread", ylabel=f"spread(K) (var across heads)",
                 title=f"K spread progression", fname="scan_k_spread.png",
