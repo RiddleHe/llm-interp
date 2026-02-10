@@ -2044,6 +2044,81 @@ def _plot_progression_multi(series, outdir, key, ylabel, title, fname, mode=None
     plt.savefig(os.path.join(outdir, fname), dpi=300)
     plt.close()
 
+def _plot_progression_multi_interleaved_block_norms(
+    series,
+    outdir,
+    title,
+    fname,
+    key_attn="attn_out_norm",
+    key_mlp="out_norm",
+    key_hidden="hid_out_norm",
+):
+    if not series:
+        return
+
+    layers_all = sorted({s["layer"] for _lbl, stats in series for s in (stats or [])})
+    if not layers_all:
+        return
+
+    plt.figure(figsize=(12, 6))
+    ax = plt.gca()
+
+    for lbl, stats in series:
+        if not stats:
+            continue
+
+        by = {s["layer"]: s for s in stats}
+        xs, ys = [], []
+        for L in layers_all:
+            if L not in by:
+                continue
+            xs.extend([2 * L, 2 * L + 1])
+            ys.extend([by[L][key_attn], by[L][key_mlp]])
+
+        ax.plot(xs, ys, marker="o", label=lbl)
+
+    for _i, (lbl, stats) in enumerate(series):
+        if not stats:
+            continue
+        by = {s["layer"]: s for s in stats}
+        xs_h, ys_h = [], []
+        for L in layers_all:
+            if L not in by:
+                continue
+            v = by[L].get(key_hidden, float("nan"))
+            if math.isnan(float(v)):
+                continue
+            xs_h.append(2 * L + 1)
+            ys_h.append(v)
+
+        if xs_h:
+            ax.plot(
+                xs_h,
+                ys_h,
+                color="black",
+                linestyle="--",
+                linewidth=2.0,
+                marker="s",
+                markersize=4,
+                alpha=0.95,
+                label="hidden (block out)",
+            )
+        break
+
+    ax.set_xlabel("Layer (attn + mlp)")
+    ax.set_ylabel("Log L2 Norm")
+    ax.set_title(title)
+    ax.legend(loc="best", frameon=False, fontsize=8)
+    ax.grid(True, which="major", axis="both", linewidth=0.5, alpha=0.35)
+
+    xt = [2 * L for L in layers_all]
+    ax.set_xticks(xt)
+    ax.set_xticklabels([str(L) for L in layers_all], rotation=0)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, fname), dpi=300)
+    plt.close()
+
 def _plot_progression_multi_with_overlay(
     main_series,
     overlay_series,
@@ -2286,7 +2361,7 @@ def main():
     p.add_argument("--model", default="Qwen/Qwen3-8B")
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32"])
-    p.add_argument("--prompt-file", default="prompts.txt")
+    p.add_argument("--prompt-file", default="prompt_sets_v512_t32/natural_mixed.txt")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--head", type=int, default=0)
     # scanning mode
@@ -2357,6 +2432,7 @@ def main():
                 "cos_h": {int(s): [] for s in sink_idxs_local},
                 "sink_attn_h": {int(s): [] for s in sink_idxs_local},
                 "out_norm": {int(s): [] for s in sink_idxs_local}, 
+                "attn_out_norm": {int(s): [] for s in sink_idxs_local},
                 "hid_out_norm": {int(s): [] for s in sink_idxs_local},  # block output hidden-state norm
                 "k_vecs_h": {int(s): [] for s in sink_idxs_local}, # list of [H, D]
                 "v_vecs_h": {int(s): [] for s in sink_idxs_local},
@@ -2378,6 +2454,7 @@ def main():
             scan_layers, 
             store,
             capture_mlp_out=True,
+            capture_attn_out=True,
         )
         try:
             for input_ids, base_pos in tqdm(tokenized, desc="Scanning prompts", position=0, leave=False):
@@ -2395,6 +2472,7 @@ def main():
                         qkv = store[L]
                         q, k, v = qkv["q"], qkv["k"], qkv["v"]
                         H = qkv["residual"]
+                        attn_out = qkv["attn_out"]
                         mlp_out = qkv["mlp_out"]
 
                         hm_all = _pick_all_heads_with_caches(model, attns, L)
@@ -2414,9 +2492,10 @@ def main():
                             sink_qmean_per_head = hm_all[:, 4:, sink_idx].mean(dim=1) # [H]
 
                             out_sink = mlp_out[0, sink_idx] 
-                            h_sink = H[0, sink_idx]
+                            aout_sink = attn_out[0, sink_idx]
                         
                             out_norm = float(torch.log(out_sink.norm().clamp_min(EPS)).item())
+                            attn_out_norm = float(torch.log(aout_sink.norm().clamp_min(EPS)).item())
                             # Block-output hidden-state norm (cumulative residual stream)
                             # hidden_states[L+1] = output of layer L (before final RMSNorm)
                             hid_out_norm = float("nan")
@@ -2432,6 +2511,7 @@ def main():
                             per_layer_acc[L]["cos_h"][sink_idx].append(cos_h.detach().cpu())
                             per_layer_acc[L]["sink_attn_h"][sink_idx].append(sink_qmean_per_head.detach().cpu())
                             per_layer_acc[L]["out_norm"][sink_idx].append(out_norm)
+                            per_layer_acc[L]["attn_out_norm"][sink_idx].append(attn_out_norm)
                             per_layer_acc[L]["hid_out_norm"][sink_idx].append(hid_out_norm)
                             per_layer_acc[L]["k_vecs_h"][sink_idx].append(k_sink.detach().float().cpu())
                             per_layer_acc[L]["v_vecs_h"][sink_idx].append(v_sink.detach().float().cpu())
@@ -2464,6 +2544,10 @@ def main():
                     out_mu = float(np.mean(out_list))
                     out_var = float(np.var(out_list))
 
+                    aout_list = acc["attn_out_norm"][sink_idx]
+                    aout_mu = float(np.mean(aout_list))
+                    aout_var = float(np.var(aout_list))
+
                     hid_list = acc["hid_out_norm"][sink_idx]
                     hid_list_clean = [x for x in hid_list if not math.isnan(x)]
                     hid_mu = float(np.mean(hid_list_clean)) if hid_list_clean else float("nan")
@@ -2484,6 +2568,8 @@ def main():
                         "sink_attn_var": sink_var,
                         "out_norm": out_mu,
                         "out_norm_var": out_var,
+                        "attn_out_norm": aout_mu,
+                        "attn_out_norm_var": aout_var,
                         "hid_out_norm": hid_mu,
                         "hid_out_norm_var": hid_var,
                         "layer": L, 
@@ -3025,20 +3111,12 @@ def main():
                 title=f"MLP output activation norm progression", fname="scan_mlp_out_norm.png",
                 mode="res",
             )
-            # Overlay: MLP-out norm + block hidden-state norm (cumulative residual stream)
-            overlay_idx = int(sorted(scan_stats_by_sink.keys())[0]) if scan_stats_by_sink else None
-            if overlay_idx is not None and overlay_idx in scan_stats_by_sink:
-                _plot_progression_multi_with_overlay(
-                    main_series=series,
-                    overlay_series=[(f"hidden(sink={int(overlay_idx)})", scan_stats_by_sink[int(overlay_idx)])],
-                    outdir=args.outdir,
-                    key_main="out_norm",
-                    key_overlay="hid_out_norm",
-                    ylabel=f"log L2 norm (var across samples)",
-                    title=f"MLP_out norm + block hidden-state norm (cumulative)",
-                    fname="scan_mlp_out_norm_with_hidden.png",
-                    mode="res",
-                )
+            _plot_progression_multi_interleaved_block_norms(
+                series,
+                args.outdir,
+                title=f"Attn_out + MLP_out Norm",
+                fname="scan_block_norms_attn_mlp.png",
+            )
             _plot_progression_multi(
                 series, args.outdir, key="k_spread", ylabel=f"spread(K) (var across heads)",
                 title=f"K spread progression", fname="scan_k_spread.png",
