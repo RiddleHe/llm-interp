@@ -2394,6 +2394,10 @@ def main():
     # ablation
     p.add_argument("--ablate-mlp-out", choices=["magnitude", "direction"], default=None, help="Ablate MLP output at token 0.")
     p.add_argument("--vec-idx", type=int, nargs="+", default=None, help="Indices of the vectors to ablate.")
+    # compare special vs non-special token 0
+    p.add_argument("--compare-special", type=int, default=None,
+                   help="Run paired comparison: natural tok0 vs this special token ID at position 0. "
+                        "Produces comparison plots for sink_attn, MLP/attn out norm, hidden norm.")
     # output
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
@@ -2424,7 +2428,8 @@ def main():
     num_layers = model.config.num_hidden_layers
     num_heads = model.config.num_attention_heads
 
-    def _run_scan_pass(scan_layers, rope_overrides_local, sink_idxs_local):
+    def _run_scan_pass(scan_layers, rope_overrides_local, sink_idxs_local, tokenized_override=None):
+        _tok_data = tokenized_override if tokenized_override is not None else tokenized
         per_layer_acc = {
             L: {
                 "k_norm_h": {int(s): [] for s in sink_idxs_local}, # list of [H]
@@ -2444,7 +2449,7 @@ def main():
         per_layer_maps = {L: [] for L in scan_layers}
 
         scan_maps, scan_titles = [], []
-        min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
+        min_len = min(ids.shape[1] for (ids, _bp) in _tok_data)
         last_q = min_len - 1
         target_q = last_q if args.target_idx is None else max(0, min(last_q, args.target_idx))
 
@@ -2457,7 +2462,7 @@ def main():
             capture_attn_out=True,
         )
         try:
-            for input_ids, base_pos in tqdm(tokenized, desc="Scanning prompts", position=0, leave=False):
+            for input_ids, base_pos in tqdm(_tok_data, desc="Scanning prompts", position=0, leave=False):
                 for L in list(store.keys()):
                     store[L].clear()
                 pos_ids_perturbed, _ = apply_perturbations(base_pos, rope_overrides=rope_overrides_local)
@@ -3132,7 +3137,73 @@ def main():
                 title=f"MLP_out spread progression", fname="scan_mlp_out_spread.png",
                 mode="spread",
             )
-        
+
+            # ── Compare special vs non-special token 0 ──
+            if args.compare_special is not None and args.print_mode == "qkv":
+                special_tid = int(args.compare_special)
+                special_tok_str = tok.decode([special_tid])
+                print(f"\n{'='*60}")
+                print(f"[compare-special] Running paired comparison:")
+                print(f"  Group 1 (natural): token 0 = natural first token")
+                print(f"  Group 2 (special): token 0 = {repr(special_tok_str)} (id={special_tid})")
+                print(f"  Prompts: {len(tokenized)}")
+                print(f"{'='*60}")
+
+                # Build tokenized_special: same prompts, but token 0 replaced
+                tokenized_special = []
+                for input_ids, base_pos in tokenized:
+                    ids2 = input_ids.clone()
+                    ids2[0, 0] = special_tid
+                    tokenized_special.append((ids2, base_pos))
+
+                sp_stats_by_sink, _, _ = _run_scan_pass(
+                    scan_layers, rope_overrides, [0],
+                    tokenized_override=tokenized_special,
+                )
+                for s in sp_stats_by_sink:
+                    sp_stats_by_sink[s] = sorted(sp_stats_by_sink[s], key=lambda x: x["layer"])
+
+                nat_stats = scan_stats_by_sink.get(0, [])
+                sp_stats = sp_stats_by_sink.get(0, [])
+
+                def _plot_compare(key, ylabel, title_suffix, fname, mode=None):
+                    cmp_series = [
+                        ("natural tok0", nat_stats),
+                        (f"special tok0 ({repr(special_tok_str)})", sp_stats),
+                    ]
+                    _plot_progression_multi(
+                        cmp_series, args.outdir, key=key, ylabel=ylabel,
+                        title=f"Compare: {title_suffix}",
+                        fname=fname, mode=mode,
+                    )
+
+                _plot_compare("sink_attn",
+                              "Attn(Q[q>=4]→K[0]) mean±std across heads",
+                              "Sink attention progression",
+                              "compare_sink_attn.png", mode="prob")
+                _plot_compare("out_norm",
+                              "log ‖MLP_out[tok0]‖",
+                              "MLP output norm at token 0",
+                              "compare_mlp_out_norm.png", mode="res")
+                _plot_compare("attn_out_norm",
+                              "log ‖Attn_out[tok0]‖",
+                              "Attention output norm at token 0",
+                              "compare_attn_out_norm.png", mode="res")
+                _plot_compare("hid_out_norm",
+                              "log ‖hidden[tok0]‖ (cumulative residual)",
+                              "Hidden-state norm at token 0",
+                              "compare_hidden_norm.png", mode="res")
+                _plot_compare("cos",
+                              "cos(Q[q>=4], K[0]) mean±std",
+                              "Cosine similarity to K at token 0",
+                              "compare_cosine.png", mode="cos")
+                _plot_compare("k_norm",
+                              "‖K[0]‖ mean±std across heads",
+                              "K norm at token 0",
+                              "compare_k_norm.png")
+
+                print(f"[compare-special] Saved 6 comparison plots to {args.outdir}/")
+
         elif args.print_mode == "heatmap" and len(scan_maps) > 0:
             grid_title = "Attention heatmaps"
             if rope_overrides:
