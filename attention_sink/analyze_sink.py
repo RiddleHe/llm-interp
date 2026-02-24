@@ -1,4 +1,5 @@
-import argparse, os, numpy as np, torch, matplotlib.pyplot as plt, math, copy
+import argparse, os, json, numpy as np, torch, matplotlib.pyplot as plt, math, copy
+from tkinter import Y
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -42,6 +43,21 @@ def load_model(model_name, device, dtype, random_init=False):
     model.eval()
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     return tok, model
+
+def _parse_plot_activations_spec(spec):
+    if spec is None:
+        return None, None
+    s = str(spec).strip().lower()
+    if not s:
+        return None, None
+    if "." not in s:
+        raise ValueError
+    a, b = s.split(".", 1)
+    if a not in ("mlp", "attn"):
+        raise ValueError
+    if not b.isdigit():
+        raise ValueError
+    return a, int(b)
 
 def tokenize(tok, text):
     enc = tok(text, return_tensors="pt", add_special_tokens=True)
@@ -439,6 +455,8 @@ def _k_for_energy_frac_str(X, fracs=(0.25, 0.75, 0.99)):
     return _print_list(parts)
 
 def _mean_std_scalar_str(x):
+    if not torch.is_tensor(x):
+        x = torch.as_tensor(x)
     x = x.to(dtype=torch.float32)
     mu = float(x.mean().item())
     sd = float(x.std(unbiased=False).item())
@@ -832,73 +850,57 @@ def _collect_raw_components_for_layer(model, layer_idx, tok_idxs, tokenized):
                 out[name][t] = torch.stack(vecs, dim=0)
     return out
 
-def _collect_preln_gradients_for_Qproj(
+def _collect_component_mean_activations(
     model,
-    layer_idx,
-    tok_idx,
     tokenized,
-    Q_basis,
+    layer_idx, 
+    kind,
 ):
-    assert Q_basis is not None and Q_basis.ndim == 2
-
-    blk = model.model.layers[layer_idx]
-    ln = blk.post_attention_layernorm
-
-    grads = []
-    cache = {}
-
-    def _ln_prehook(_module, args):
-        s = args[0]
-        s2 = s.detach().clone().requires_grad_(True)
-        cache["s"] = s2
-        return (s2,)
-
-    def _ln_fwdhook(_module, args, output):
-        cache["x_post"] = output
-
-    h_pre = ln.register_forward_pre_hook(_ln_prehook)
-    h_fwd = ln.register_forward_hook(_ln_fwdhook)
+    layer_idx = int(layer_idx)
+    if kind not in ("attn", "mlp"):
+        raise ValueError
+    store = {}
+    handles = _capture_qkv_multi(
+        model,
+        [layer_idx],
+        store,
+        capture_attn_out=(kind == "attn"),
+        capture_mlp_out=(kind == "mlp"),
+    )
 
     try:
-        with _no_param_grads(model):
-            for input_ids, base_pos in tqdm(
-                tokenized,
-                desc=f"[decompose_preln_Q_proj] grads @ L={layer_idx} tok={tok_idx}",
-                leave=False,
-            ):
-                cache.clear()
-                model.zero_grad(set_to_none=True)
+        min_len = min(8, min(ids.shape[1] for (ids, _bp) in tokenized))
+        acc = None
+        n = 0
+        for input_ids, base_pos in tqdm(
+            tokenized,
+            desc=f"Collecting {kind} internals at L={layer_idx}",
+            leave=False,
+        ):
+            store.get(layer_idx, {}).clear()
+            _ = prefill(model, input_ids, base_pos)
+            entry = store.get(layer_idx, None)
+            if not entry:
+                continue
 
-                _ = model(
-                    input_ids=input_ids.to(next(model.parameters()).device),
-                    position_ids=base_pos.to(next(model.parameters()).device),
-                    use_cache=False,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                )
+            key = "attn_out" if kind == "attn" else "mlp_out"
+            Y = entry.get(key, None)
+            if Y is None:
+                continue
+            Y0 = Y[0, :min_len, :].to(dtype=torch.float32).cpu()
 
-                s = cache.get("s", None)
-                x_post = cache.get("x_post", None)
-                if s is None or x_post is None:
-                    continue
+            if acc is None:
+                acc = torch.zeros_like(Y0)
+            acc += Y0
+            n += 1
 
-                x0 = x_post[:, tok_idx, :].to(dtype=torch.float32)
-                Qd = Q_basis.to(device=x0.device, dtype=torch.float32)
-                coeff = x0 @ Qd
-                f = (coeff.pow(2).sum(dim=1)).mean()
-                f.backward()
+        if acc is None or n == 0:
+            return None
 
-                g = s.grad[:, tok_idx, :].detach().float().cpu()
-                grads.append(g[0].clone())
-
+        return (acc / float(n)).numpy().astype(np.float32)
     finally:
-        h_pre.remove()
-        h_fwd.remove()
-
-    if not grads:
-        return None
-    
-    return torch.stack(grads, dim=0)
+        for h in handles:
+            h.remove()
 
 def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
     mlp = model.model.layers[layer_idx].mlp
@@ -985,33 +987,90 @@ def _collect_mlp_internals_for_layer(model, layer_idx, tok_idxs, tokenized):
 
     return out
 
-def _make_preln_component_ablation_prehook(
-    Xc_by_key,
-    tok_ablate,
+def _collect_mlp_grid_mean_tensors(
+    model,
+    tokenized,
+    layer_idx,
+    max_tok=9,
 ):
-    ctr = {"i": 0}
-    keys = list(Xc_by_key.keys())
+    L = int(layer_idx)
+    blk = model.model.layers[L]
+    mlp = blk.mlp
+    ln = blk.post_attention_layernorm
 
-    def _prehook(_module, args, _ctr=ctr, _keys=keys, _Xc_by_key=Xc_by_key):
-        x = args[0]
-        i = int(_ctr["i"])
-        _ctr["i"] = i + 1
+    cache = {}
+    handles = []
 
-        any_X = _Xc_by_key[_keys[0]]
-        if i < 0 or i >= int(any_X.size(0)):
-            return (x,)
+    def _ln_prehook(_module, args, _cache=cache):
+        _cache["rms_in"] = args[0].detach()
 
-        x2 = x.clone()
-        v_sum = None
-        for k in _keys:
-            v = _Xc_by_key[k][i]
-            v_sum = v if (v_sum is None) else (v_sum + v)
+    def _mlp_hook(_module, inputs, output, _cache=cache):
+        x = inputs[0]
+        with torch.no_grad():
+            g = _module.gate_proj(x)
+            u = _module.up_proj(x)
+            a = _module.act_fn(g)
+            z = a * u
+            y = output
 
-        v_sum = v_sum.to(device=x2.device, dtype=x2.dtype)
-        x2[:, tok_ablate, :] = x2[:, tok_ablate, :] - v_sum.view(1, -1)
-        return (x2,)
+            _cache["rms_out"] = x.detach()
+            _cache["gate_out"] = g.detach()
+            _cache["up_out"] = u.detach()
+            _cache["act_out"] = a.detach()
+            _cache["down_in"] = z.detach()
+            _cache["down_out"] = y.detach()
 
-    return _prehook, ctr
+    h1 = ln.register_forward_pre_hook(_ln_prehook)
+    h2 = mlp.register_forward_hook(_mlp_hook)
+    handles.extend([h1, h2])
+
+    keys = ["rms_in", "rms_out", "up_out", "gate_out", "act_out", "down_in", "down_out"]
+    acc = {k: None for k in keys}
+    n = 0
+
+    try:
+        for input_ids, base_pos in tqdm(
+            tokenized,
+            desc=f"Collecting MLP grid means at L={L}",
+        ):
+            cache.clear()
+            T = min(max_tok, input_ids.shape[1])
+            input_ids_t = input_ids[:, :T]
+            base_pos_t = base_pos[:, :T]
+            _ = prefill(model, input_ids_t, base_pos_t)
+            if not all(k in cache for k in keys):
+                continue
+
+            B = 0
+            for k in keys:
+                X = cache[k][B, :, :].to(dtype=torch.float32)
+                if acc[k] is None:
+                    acc[k] = torch.zeros_like(X, device=X.device, dtype=torch.float32)
+                acc[k] += X
+            n += 1
+
+        if n == 0:
+            return None
+
+        acts = {}
+        for k in keys:
+            acts[k] = (acc[k] / float(n)).detach().cpu().numpy().astype(np.float32)
+ 
+        W_up = mlp.up_proj.weight.detach().float().cpu().numpy().astype(np.float32)
+        W_gate = mlp.gate_proj.weight.detach().float().cpu().numpy().astype(np.float32)
+        W_down = mlp.down_proj.weight.detach().float().cpu().numpy().astype(np.float32)
+
+        projs = {
+            "up_proj": W_up,
+            "gate_proj": W_gate,
+            "down_proj": W_down,
+        }
+
+        return {"acts": acts, "projs": projs, "n": int(n)}
+
+    finally:
+        for h in handles:
+            h.remove()
 
 def _collect_mlp_in_gradients_for_single_zdim(
     model,
@@ -1078,123 +1137,6 @@ def _collect_mlp_in_gradients_for_single_zdim(
 
     return torch.stack(grads, dim=0)
 
-def _scan_sink_and_collect_mlp_scalars(
-    model,
-    tokenized,
-    scan_layers,
-    layer_idx,
-    tok_idx,
-    Wu,
-    wu_rows,
-    z_idx,
-):
-    # attention metrics
-    per_layer_acc = {L: {"sink_attn_h": []} for L in scan_layers}
-    
-    mlp = model.model.layers[layer_idx].mlp
-    ln = model.model.layers[layer_idx].post_attention_layernorm
-    
-    scal = {
-        "wu_dot": [],
-        "z_frac": [],
-        "out_log_norm": [],
-        "g_norm": [],
-        "u_norm": [],
-        "z_norm": [],
-        "g_frac3": [],
-        "u_frac3": [],
-        "z_frac3": [],
-        "wu_dot_pre": [],
-    }
-
-    attn_out_norm = []
-    preln_queue = []
-
-    def _ln_capture_prehook(_module, args):
-        x_pre = args[0]
-        preln_queue.append(x_pre[:, tok_idx, :].detach())
-
-    def _mlp_hook(_module, inputs, output):
-        x = inputs[0]
-        y = output
-        x0 = x[:, tok_idx, :].detach()
-        y0 = y[:, tok_idx, :].detach()
-
-        with torch.no_grad():
-            g = _module.gate_proj(x).detach()
-            u = _module.up_proj(x).detach()
-            a = _module.act_fn(g).detach()
-            z = (a * u).detach()
-
-            g0 = g[:, tok_idx, :]
-            u0 = u[:, tok_idx, :]
-            z0 = z[:, tok_idx, :]
-
-            wu_dot = _mean_cos_to_rows(x0.to(dtype=torch.float32), Wu, wu_rows)
-            zfrac = _frac_energy_on_set_per_sample(z0, z_idx)
-            outln = torch.log(y0.norm(dim=1).clamp_min(EPS))
-
-            scal["wu_dot"].append(wu_dot.detach().float().cpu())
-            scal["z_frac"].append(zfrac.detach().float().cpu())
-            scal["out_log_norm"].append(outln.detach().float().cpu())
-
-            scal["g_norm"].append(g0.norm(dim=1).detach().float().cpu())
-            scal["u_norm"].append(u0.norm(dim=1).detach().float().cpu())
-            scal["z_norm"].append(z0.norm(dim=1).detach().float().cpu())
-
-            scal["g_frac3"].append(_frac_energy_on_dims_per_sample(g0, z_idx).detach().float().cpu())
-            scal["u_frac3"].append(_frac_energy_on_dims_per_sample(u0, z_idx).detach().float().cpu())
-            scal["z_frac3"].append(_frac_energy_on_dims_per_sample(z0, z_idx).detach().float().cpu())
-
-            if preln_queue:
-                xpre0 = preln_queue.pop(0)
-                wu_dot_pre = _mean_cos_to_rows(xpre0.to(dtype=torch.float32), Wu, wu_rows)
-                scal["wu_dot_pre"].append(wu_dot_pre.detach().float().cpu()) 
-
-    attn = model.model.layers[layer_idx].self_attn
-    def _attn_hook(_module, args, output):
-        aout = output[0]
-        v = aout[:, tok_idx, :].detach().to(dtype=torch.float32)
-        attn_out_norm.append(v.norm(dim=1).detach().cpu())
-
-    h_ln = ln.register_forward_pre_hook(_ln_capture_prehook)
-    h_attn = attn.register_forward_hook(_attn_hook)
-    h = mlp.register_forward_hook(_mlp_hook)
-
-    try:
-        preln_queue.clear()
-        for input_ids, base_pos in tqdm(
-            tokenized,
-            desc=f"Collecting MLP metrics and sink attention at L={layer_idx} | token={tok_idx}",
-            leave=False,
-        ):
-            attns = prefill(model, input_ids, base_pos)
-
-            for L in scan_layers:
-                hm_all = _pick_all_heads_with_caches(model, attns, L)
-                sink_qmean_per_head = hm_all[:, 4:, 0].mean(dim=1)
-                per_layer_acc[L]["sink_attn_h"].append(sink_qmean_per_head.detach().cpu())
-
-    finally:
-        h.remove()
-        h_attn.remove()
-        h_ln.remove()
-
-    attn_stats = []
-    for L in sorted(per_layer_acc.keys()):
-        acc = per_layer_acc[L]
-        sink_mu, sink_var = _reduce_headwise(acc["sink_attn_h"])
-        attn_stats.append({"sink_attn": sink_mu, "sink_attn_var": sink_var, "layer": L})
-
-    mlp_scal_np = {}
-    for k, chunks in scal.items():
-        v = torch.cat(chunks, dim=0).numpy().astype(np.float32) # some are [N,] and some are [N, K]
-        mlp_scal_np[k] = v
-
-    attn_out_norm_mu = float(torch.cat(attn_out_norm, dim=0).mean().item())
-
-    return attn_stats, mlp_scal_np, attn_out_norm_mu
-
 # Parsing functions
 
 def parse_overrides(s):
@@ -1226,31 +1168,6 @@ def _parse_component_spec(spec):
             return key, f"{a}.{idx}"
     
     raise ValueError(f"Invalid component spec: {spec}")
-
-def _parse_ablate_layers_spec(spec_list, valid_comp_keys):
-    if not spec_list:
-        return [], []
-
-    keys = []
-    pretty = []
-    seen = set()
-    valid = set(valid_comp_keys)
-
-    for s in spec_list:
-        k, p = _parse_component_spec(s)
-        if k is None:
-            continue
-        if k not in valid:
-            raise ValueError(f"'{s}' -> '{k}' not in valid comp keys: {valid}")
-
-        if k in seen:
-            continue
-
-        seen.add(k)
-        keys.append(k)
-        pretty.append(p)
-        
-    return keys, pretty
 
 def _append_suffix(path, suffix):
     if not suffix:
@@ -1405,6 +1322,557 @@ def _pick_all_heads_with_caches(model, attns, layer_idx):
     return a[0].detach().float().cpu()
 
 # plots
+def _tok0_special_dims_from_act(A, mult_global=50.0, mult_dim=5.0):
+    A = np.asarray(A, dtype=np.float32)
+    if A.ndim != 2 or A.shape[0] < 2:
+        return []
+
+    absA = np.abs(A)
+    tok0 = absA[0, :]
+
+    global_mean = float(np.mean(absA))
+    thr_global = float(mult_global) * max(1e-12, global_mean)
+    c_global = tok0 >= thr_global
+
+    dim_mean_non0 = np.mean(absA[1:, :], axis=0)
+    thr_dim = float(mult_dim) * np.maximum(1e-12, dim_mean_non0)
+    c_dim = tok0 >= thr_dim
+
+    idx = np.where(c_global & c_dim)[0]
+    return idx.astype(np.int32).tolist()
+
+
+def _special_dims_binned_ticks(special_dims, D, n_bins):
+    special_dims = sorted(set(int(d) for d in special_dims if 0 <= int(d) < int(D)))
+    if not special_dims:
+        return []
+
+    n_bins = max(1, int(n_bins))
+    edges = np.linspace(0, D, n_bins + 1)
+    ticks = []
+    for b in range(n_bins):
+        lo = int(math.floor(edges[b]))
+        hi = int(math.floor(edges[b + 1]))
+        if b == n_bins - 1:
+            in_bin = [d for d in special_dims if lo <= d < D]
+        else:
+            in_bin = [d for d in special_dims if lo <= d < hi]
+        if in_bin:
+            ticks.append(in_bin[0])
+    return ticks
+
+
+def _rank_act_outlier_dims(A, mult_global=50.0, mult_dim=5.0):
+    A = np.asarray(A, dtype=np.float32)
+    if A.ndim != 2 or A.shape[0] < 1:
+        return []
+
+    tok0_abs = np.abs(A[0, :])
+    special = _tok0_special_dims_from_act(A, mult_global=float(mult_global), mult_dim=float(mult_dim))
+    ranked = sorted(
+        set(int(d) for d in special if 0 <= int(d) < int(A.shape[1])),
+        key=lambda d: -float(tok0_abs[int(d)]),
+    )
+    return ranked
+
+
+def _rank_proj_dims_from_focus_vectors(
+    M,
+    focus_input_dims,
+    focus_scalars=None,
+    min_rel_to_top1=0.1,
+):
+    M = np.asarray(M, dtype=np.float32)
+    if M.ndim != 2:
+        return []
+    R, D = int(M.shape[0]), int(M.shape[1])
+    focus = [int(d) for d in (focus_input_dims or []) if 0 <= int(d) < D]
+    if not focus:
+        return []
+
+    absM = np.abs(M)
+    if isinstance(focus_scalars, dict):
+        w = np.asarray([abs(float(focus_scalars.get(int(d), 0.0))) for d in focus], dtype=np.float32)
+    elif focus_scalars is None:
+        w = np.ones((len(focus),), dtype=np.float32)
+    else:
+        ws = np.asarray(focus_scalars, dtype=np.float32).reshape(-1)
+        if ws.size == len(focus):
+            w = np.abs(ws)
+        else:
+            w = np.ones((len(focus),), dtype=np.float32)
+    if float(np.max(w)) <= 0.0:
+        w = np.ones((len(focus),), dtype=np.float32)
+
+    weighted = absM[:, focus] * w[np.newaxis, :]
+    scores = np.max(weighted, axis=1)  # rank by strongest |outlier_scalar * dim_value|
+    ranked = np.argsort(-scores).astype(np.int32).tolist()
+    ranked = [int(r) for r in ranked if 0 <= int(r) < R]
+    if not ranked:
+        return []
+
+    top1 = float(scores[int(ranked[0])])
+    rel = float(min_rel_to_top1)
+    if top1 > 0.0 and rel > 0.0:
+        thr = rel * top1
+        ranked = [int(r) for r in ranked if float(scores[int(r)]) >= thr]
+    return ranked
+
+
+def _select_spaced_outlier_dims(ranked_dims, axis_size, max_keep=4, min_dist=None):
+    axis_size = int(axis_size)
+    if axis_size <= 0:
+        return []
+
+    keep = int(max(0, max_keep))
+    if keep == 0:
+        return []
+
+    if min_dist is None:
+        min_dist = max(1, int(math.ceil(axis_size / 8.0)))
+    else:
+        min_dist = max(1, int(min_dist))
+
+    chosen = []
+    for d in ranked_dims:
+        di = int(d)
+        if di < 0 or di >= axis_size:
+            continue
+        if not chosen:
+            chosen.append(di)
+            if len(chosen) >= keep:
+                break
+            continue
+
+        if min(abs(di - sj) for sj in chosen) >= min_dist:
+            chosen.append(di)
+            if len(chosen) >= keep:
+                break
+    return chosen
+
+
+def _dims_title_line(ranked_dims, topk=4, label="top dims"):
+    top = [int(d) for d in (ranked_dims or [])[: int(max(0, topk))]]
+    if top:
+        return f"{label}: {' > '.join(str(int(d)) for d in top)}"
+    return f"{label}: none"
+
+
+def _dims_title_block(ranked_dims, label="top dims", max_show=12, per_line=4):
+    dims = [int(d) for d in (ranked_dims or [])]
+    if not dims:
+        return f"{label}: none"
+
+    keep = int(max(1, max_show))
+    chunk = int(max(1, per_line))
+    shown = [str(int(d)) for d in dims[:keep]]
+    if len(dims) > keep:
+        shown.append("...")
+
+    lines = []
+    for i in range(0, len(shown), chunk):
+        lines.append(" > ".join(shown[i:i + chunk]))
+
+    if not lines:
+        return f"{label}: none"
+    lines[0] = f"{label}: {lines[0]}"
+    return "\n".join(lines)
+
+
+def _set_panel_title(ax, name, subtitle, fontsize=10):
+    # Place name and subtitle at fixed axes coordinates so all panels share a common top line.
+    ax.set_title("")
+    ax.text2D(
+        0.5,
+        1.07,
+        str(name),
+        transform=ax.transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=fontsize,
+        clip_on=False,
+    )
+    ax.text2D(
+        0.5,
+        1.03,
+        str(subtitle),
+        transform=ax.transAxes,
+        ha="center",
+        va="top",
+        fontsize=fontsize,
+        clip_on=False,
+    )
+
+
+def _focus_input_dims_from_act(A, max_keep):
+    A = np.asarray(A, dtype=np.float32)
+    if A.ndim != 2 or A.shape[0] < 1:
+        return []
+    keep = int(max(1, min(int(max_keep), int(A.shape[1]))))
+    tok0_abs = np.abs(A[0, :])
+    special = _tok0_special_dims_from_act(A, mult_global=50.0, mult_dim=5.0)
+    outlier_order = sorted(
+        set(int(d) for d in special if 0 <= int(d) < int(A.shape[1])),
+        key=lambda d: -float(tok0_abs[int(d)]),
+    )
+    tok0_order = np.argsort(-tok0_abs).astype(np.int32).tolist()
+
+    chosen = []
+    chosen_set = set()
+    for d in outlier_order:
+        if len(chosen) >= keep:
+            break
+        chosen.append(int(d))
+        chosen_set.add(int(d))
+
+    if len(chosen) < keep:
+        for d in tok0_order:
+            di = int(d)
+            if di in chosen_set:
+                continue
+            chosen.append(di)
+            chosen_set.add(di)
+            if len(chosen) >= keep:
+                break
+    return chosen
+
+
+def _pick_proj_background_input_dims(M, focus_dims, total_bins=8, total_target=8):
+    M = np.asarray(M, dtype=np.float32)
+    _R, D = int(M.shape[0]), int(M.shape[1])
+    focus_set = set(int(d) for d in (focus_dims or []) if 0 <= int(d) < D)
+    target_total = int(max(0, total_target))
+    n_bg = int(max(0, min(D, target_total - len(focus_set))))
+    if n_bg == 0 or D == 0:
+        return []
+
+    n_bins = int(max(1, total_bins))
+    edges = np.linspace(0, D, n_bins + 1)
+
+    def _bin_of_dim(dim_idx):
+        pos = int(np.searchsorted(edges, int(dim_idx), side="right") - 1)
+        return int(min(max(pos, 0), n_bins - 1))
+
+    occupied_bins = set(_bin_of_dim(d) for d in focus_set)
+
+    def _pick_mid_in_bin(bin_idx, used):
+        lo = int(math.floor(edges[bin_idx]))
+        hi = int(math.floor(edges[bin_idx + 1]))
+        if bin_idx == n_bins - 1:
+            hi = D
+        lo = max(0, min(lo, D - 1))
+        hi = max(lo + 1, min(hi, D))
+        mid = int((lo + hi - 1) // 2)
+        if mid not in focus_set and mid not in used:
+            return mid
+        for off in range(1, max(mid - lo, hi - 1 - mid) + 1):
+            left = mid - off
+            right = mid + off
+            if lo <= left < hi and left not in focus_set and left not in used:
+                return int(left)
+            if lo <= right < hi and right not in focus_set and right not in used:
+                return int(right)
+        return None
+
+    bg = []
+    used = set()
+    for b in range(n_bins):
+        if b in occupied_bins:
+            continue
+        picked = _pick_mid_in_bin(b, used)
+        if picked is None:
+            continue
+        bg.append(int(picked))
+        used.add(int(picked))
+        if len(bg) >= n_bg:
+            break
+
+    if len(bg) < n_bg:
+        for b in range(n_bins):
+            picked = _pick_mid_in_bin(b, used)
+            if picked is None:
+                continue
+            bg.append(int(picked))
+            used.add(int(picked))
+            if len(bg) >= n_bg:
+                break
+
+    if len(bg) < n_bg:
+        fallback = np.linspace(0, max(0, D - 1), max(1, target_total)).astype(np.int32).tolist()
+        for cc in fallback:
+            ci = int(cc)
+            if ci in focus_set or ci in used:
+                continue
+            bg.append(ci)
+            used.add(ci)
+            if len(bg) >= n_bg:
+                break
+
+    return bg
+
+
+def _proj_display_matrix(W, input_tok0_vec=None, proj_view="weight"):
+    W = np.asarray(W, dtype=np.float32)
+    if str(proj_view).lower() != "contrib":
+        return W, "weight"
+
+    x = np.asarray(input_tok0_vec, dtype=np.float32) if input_tok0_vec is not None else None
+    if x is None or x.ndim != 1 or W.ndim != 2 or int(W.shape[1]) != int(x.shape[0]):
+        return W, "weight"
+
+    C = W * x[np.newaxis, :]
+    return C.astype(np.float32), "contribution"
+
+
+def _plot_act3d_lines(ax, A, name, max_dims_act=4096):
+    A = np.asarray(A, dtype=np.float32)
+    T, D = int(A.shape[0]), int(A.shape[1])
+    step = max(1, int(math.ceil(D / float(max_dims_act))))
+    ranked_special = _rank_act_outlier_dims(A, mult_global=50.0, mult_dim=5.0)
+    y_ticks = _select_spaced_outlier_dims(
+        ranked_special,
+        axis_size=D,
+        max_keep=4,
+        min_dist=max(1, int(math.ceil(D / 8.0))),
+    )
+    y_base = np.arange(0, D, step, dtype=np.int32).tolist()
+    y_idx = np.array(sorted(set(y_base + [int(d) for d in y_ticks])), dtype=np.int32)
+    if y_idx.size == 0:
+        y_idx = np.arange(0, D, dtype=np.int32)
+
+    ax.plot(
+        np.zeros_like(y_idx, dtype=np.int32),
+        y_idx,
+        A[0, y_idx],
+        color="magenta",
+        linewidth=2.0,
+        alpha=0.95,
+    )
+
+    for t in range(1, T):
+        xs = np.full_like(y_idx, t, dtype=np.int32)
+        ys = y_idx
+        zs = A[t, y_idx]
+        ax.plot(xs, ys, zs, color="royalblue", linewidth=0.9, alpha=0.95)
+
+    _set_panel_title(ax, name, _dims_title_line(ranked_special, topk=4, label="outliers"), fontsize=10)
+    ax.set_xlabel("token idx")
+    ax.set_ylabel("dim")
+    ax.set_zlabel("activation value")
+    ax.view_init(elev=22, azim=-60)
+
+    if y_ticks:
+        ax.set_yticks(y_ticks)
+        ax.set_yticklabels(
+            [str(int(d)) for d in y_ticks],
+            fontsize=8,
+            fontweight="bold",
+        )
+        ax.yaxis.set_tick_params(pad=-5)
+    else:
+        ax.set_yticks([])
+        ax.yaxis.set_major_locator(ticker.NullLocator())
+
+    ax.set_xticks(list(range(T)))
+    ax.set_xticklabels([str(i) for i in range(T)], fontsize=8)
+    return [int(d) for d in y_ticks]
+
+
+def _plot_proj3d_lines(
+    ax,
+    M,
+    name,
+    input_special_dims=None,
+    input_special_scalars=None,
+    input_label="input dim",
+    output_label="output dim",
+    max_dims_proj=4096,
+    *,
+    max_keep,
+    z_label="weight",
+):
+    M = np.asarray(M, dtype=np.float32)
+    R, D = int(M.shape[0]), int(M.shape[1])  # [out_dim, in_dim]
+
+    keep = int(max(1, min(int(max_keep), D)))
+    dims = [int(d) for d in (input_special_dims or []) if 0 <= int(d) < D]
+
+    focus_dims = [int(d) for d in dims[:keep]]
+
+    ranked_special_y = _rank_proj_dims_from_focus_vectors(
+        M,
+        focus_dims,
+        focus_scalars=input_special_scalars,
+        min_rel_to_top1=0.1,
+    )
+    ranked_title_y = _rank_proj_dims_from_focus_vectors(
+        M,
+        focus_dims,
+        focus_scalars=input_special_scalars,
+        min_rel_to_top1=0.20,
+    )
+    min_dist = max(1, int(math.ceil(R / 8.0)))
+    max_y = 4
+    y_ticks = []
+    for d in ranked_special_y:
+        di = int(d)
+        if di < 0 or di >= R or di in y_ticks:
+            continue
+        if not y_ticks or min(abs(di - sj) for sj in y_ticks) >= min_dist:
+            y_ticks.append(di)
+        if len(y_ticks) >= max_y:
+            break
+
+    step_y = max(1, int(math.ceil(R / 128.0)))
+    y_base = np.arange(0, R, step_y, dtype=np.int32).tolist()
+    y_idx = np.array(sorted(set(y_base + [int(y) for y in y_ticks])), dtype=np.int32)
+    if y_idx.size == 0:
+        y_idx = np.arange(0, R, dtype=np.int32)
+
+    bg_dims = _pick_proj_background_input_dims(
+        M,
+        focus_dims,
+        total_bins=8,
+        total_target=8,
+    )
+
+    for cc in bg_dims:
+        ys = y_idx
+        xs = np.full_like(y_idx, int(cc), dtype=np.int32)
+        zs = M[y_idx, int(cc)]
+        ax.plot(xs, ys, zs, color="seagreen", linewidth=1.2, alpha=0.90)
+
+    for cc in focus_dims:
+        ys = y_idx
+        xs = np.full_like(y_idx, int(cc), dtype=np.int32)
+        zs = M[y_idx, int(cc)]
+        ax.plot(xs, ys, zs, color="magenta", linewidth=1.9, alpha=0.95)
+
+    _set_panel_title(
+        ax,
+        name,
+        _dims_title_block(ranked_title_y, label="top dims", max_show=8, per_line=4),
+        fontsize=10,
+    )
+    ax.set_xlabel(input_label)
+    ax.set_ylabel(output_label)
+    ax.set_zlabel(z_label)
+    ax.view_init(elev=22, azim=-60)
+
+    if focus_dims:
+        ax.set_xticks(focus_dims)
+        ax.set_xticklabels(
+            [str(int(d)) for d in focus_dims],
+            fontsize=7,
+            fontweight="bold",
+        )
+    else:
+        ax.set_xticks([])
+
+    if y_ticks:
+        ax.set_yticks(y_ticks)
+        ax.set_yticklabels([str(int(r)) for r in y_ticks], fontsize=7, fontweight="bold")
+    else:
+        ax.set_yticks([])
+        ax.yaxis.set_major_locator(ticker.NullLocator())
+    return np.asarray(focus_dims, dtype=np.int32)
+
+
+def _plot_mlp_grid_3d(
+    acts,
+    projs,
+    out_path,
+    title,
+    max_dims_act=4096,
+    max_dims_proj=4096,
+    *,
+    max_keep,
+    proj_view="weight",
+):
+    order = [
+        "rms_in",
+        "rms_out",
+        "up_proj",
+        "gate_proj",
+        "up_out",
+        "gate_out",
+        "act_out",
+        "down_in",
+        "down_proj",
+        "down_out",
+    ]
+    proj_prev = {
+        "up_proj": "rms_out",
+        "gate_proj": "rms_out",
+        "down_proj": "down_in",
+    }
+
+    fig = plt.figure(figsize=(22.0, 9.8))
+    act_special_cache = {}
+
+    for i, key in enumerate(order):
+        r, c = divmod(i, 5)
+        ax = fig.add_subplot(2, 5, r * 5 + c + 1, projection="3d")
+
+        if key in acts:
+            special_dims = _plot_act3d_lines(
+                ax,
+                acts[key],
+                key,
+                max_dims_act=max_dims_act,
+            )
+            act_special_cache[key] = special_dims
+            continue
+
+        if key in projs:
+            prev_key = proj_prev.get(key, None)
+            if prev_key in act_special_cache:
+                dims = [int(d) for d in act_special_cache.get(prev_key, [])]
+            elif prev_key in acts:
+                dims = _focus_input_dims_from_act(acts[prev_key], max_keep=int(max(1, max_keep)))
+            else:
+                dims = []
+
+            input_tok0_vec = None
+            input_special_scalars = None
+            if prev_key in acts:
+                A_prev = np.asarray(acts[prev_key], dtype=np.float32)
+                if A_prev.ndim == 2 and A_prev.shape[0] >= 1:
+                    input_tok0_vec = A_prev[0, :]
+                    input_special_scalars = {
+                        int(d): float(input_tok0_vec[int(d)])
+                        for d in dims
+                        if 0 <= int(d) < int(input_tok0_vec.shape[0])
+                    }
+            M_show, z_label = _proj_display_matrix(
+                projs[key],
+                input_tok0_vec=input_tok0_vec,
+                proj_view=proj_view,
+            )
+
+            in_label = f"{prev_key} dim (input)" if prev_key is not None else "input dim"
+            out_label = f"{key.replace('_proj', '_out')} dim (output)"
+            panel_name = key if z_label == "weight" else f"{key}_contrib"
+            _plot_proj3d_lines(
+                ax,
+                M_show,
+                panel_name,
+                input_special_dims=dims,
+                input_special_scalars=(input_special_scalars if z_label == "weight" else None),
+                input_label=in_label,
+                output_label=out_label,
+                max_dims_proj=max_dims_proj,
+                max_keep=int(max(1, max_keep)),
+                z_label=z_label,
+            )
+            continue
+
+        ax.set_axis_off()
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.02, 0.99, 0.97])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
 
 def _plot_projection_histogram_before_after_stacked(
     p_before_list,
@@ -1443,6 +1911,63 @@ def _plot_projection_histogram_before_after_stacked(
     axes[-1].set_xlabel("projection value at coordinate")
     fig.suptitle(title, fontsize=12, y=0.995)
     fig.tight_layout(rect=[0, 0.0, 1, 0.985])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+def _plot_activations_3d(
+    mean_act,
+    out_path,
+    title,
+    max_dims=4096,
+):
+    A = np.asarray(mean_act, dtype=np.float32)
+    S, D = int(A.shape[0]), int(A.shape[1])
+    norms = np.linalg.norm(A, axis=1)
+    t_star = int(np.argmax(norms))
+
+    step = max(1, int(math.ceil(D / float(max_dims))))
+    y_idx = np.arange(0, D, step, dtype=np.int32)
+    spike_mult = 50.0
+    spike_dims = []
+
+    fig = plt.figure(figsize=(12.5, 4.6))
+    ax = fig.add_subplot(111, projection="3d")
+    for t in range(S):
+        xs = np.full_like(y_idx, t, dtype=np.int32)
+        ys = y_idx
+        zs = A[t, y_idx]
+
+        color = "magenta" if t == t_star else "royalblue"
+        lw = 2.0 if t == t_star else 0.9
+        ax.plot(xs, ys, zs, color=color, linewidth=lw, alpha=0.95)
+
+        if t == t_star:
+            mu = float(np.mean(np.abs(A[t, :])))
+            thr = spike_mult * max(1e-12, mu)
+            sp = np.where(np.abs(A[t, :]) >= thr)[0]
+            if sp.size:
+                sp = sp[(sp % step) == 0]
+                spike_dims.extend(sp.tolist())
+
+    ax.set_xlabel("token index")
+    ax.set_ylabel("hidden dim")
+    ax.set_zlabel("activation value")
+    ax.set_title(title)
+    ax.set_box_aspect((1, 1, 1))
+    ax.view_init(elev=22, azim=-60)
+
+    if spike_dims:
+        spike_dims = sorted(set(spike_dims))
+        spike_dims = [d for i, d in enumerate(spike_dims) if i == 0 or (d - spike_dims[i-1]) >= 256]
+        print(f"[plot_activations] Spike dims: {spike_dims}")
+        ax.set_yticks(spike_dims)
+        ax.set_yticklabels([str(d) for d in spike_dims], fontsize=9)
+        ax.yaxis.set_tick_params(pad=-5)
+    else:
+        ax.set_yticks([])
+        ax.yaxis.set_major_locator(ticker.NullLocator())
+    
+    fig.tight_layout()
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
 
@@ -2060,155 +2585,135 @@ def _plot_progression_multi_interleaved_block_norms(
     if not layers_all:
         return
 
-    plt.figure(figsize=(12, 6))
-    ax = plt.gca()
+    fig, (ax_a, ax_m) = plt.subplots(
+        2, 1,
+        figsize=(12, 7.6),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.0, 1.15]}
+    )
+
+    all_y = []
+
+    def _yerr_from_var(stats_by_layer, L, key):
+        v = stats_by_layer[L].get(key + "_var", None)
+        if v is None:
+            return None
+
+        vv = float(v)
+        if vv < 0 or not math.isfinite(vv):
+            return None
+        return math.sqrt(vv)
 
     for lbl, stats in series:
         if not stats:
             continue
 
         by = {s["layer"]: s for s in stats}
-        xs, ys = [], []
+        x, ya, ym = [], [], []
+        ya_err, ym_err = [], []
+
         for L in layers_all:
             if L not in by:
                 continue
-            xs.extend([2 * L, 2 * L + 1])
-            ys.extend([by[L][key_attn], by[L][key_mlp]])
+            x.append(int(L))
+            ya.append(float(by[L][key_attn]))
+            ym.append(float(by[L][key_mlp]))
 
-        ax.plot(xs, ys, marker="o", label=lbl)
+            e_a = _yerr_from_var(by, L, key_attn)
+            e_m = _yerr_from_var(by, L, key_mlp)
+            ya_err.append(e_a)
+            ym_err.append(e_m)
 
-    for _i, (lbl, stats) in enumerate(series):
+        assert len(ya_err) > 0 and all(e is not None for e in ya_err)
+        assert len(ym_err) > 0 and all(e is not None for e in ym_err)
+
+        for v in ya + ym:
+            if math.isfinite(float(v)):
+                all_y.append(float(v))
+
+        ya_e = [0.0 if e is None else float(e) for e in ya_err]
+        l = ax_a.errorbar(
+            x, ya, yerr=ya_e,
+            marker="o",
+            linewidth=1.2, 
+            markersize=4,
+            elinewidth=0.8,
+            capsize=2,
+            label=str(lbl),
+        )
+        color = l.lines[0].get_color()
+
+        ym_e = [0.0 if e is None else float(e) for e in ym_err]
+        ax_m.errorbar(
+            x, ym, yerr=ym_e,
+            marker="o",
+            linewidth=1.2,
+            markersize=4,
+            elinewidth=0.8,
+            capsize=2,
+            color=color,
+            label=str(lbl),
+        )
+
+    for _i, (_lbl, stats) in enumerate(series):
         if not stats:
             continue
         by = {s["layer"]: s for s in stats}
-        xs_h, ys_h = [], []
+        xh, yh, yh_err = [], [], []
+
         for L in layers_all:
             if L not in by:
                 continue
             v = by[L].get(key_hidden, float("nan"))
             if math.isnan(float(v)):
                 continue
-            xs_h.append(2 * L + 1)
-            ys_h.append(v)
+            xh.append(int(L))
+            yh.append(v)
+            e_h = _yerr_from_var(by, L, key_hidden)
+            yh_err.append(e_h)
 
-        if xs_h:
-            ax.plot(
-                xs_h,
-                ys_h,
-                color="black",
-                linestyle="--",
-                linewidth=2.0,
-                marker="s",
-                markersize=4,
-                alpha=0.95,
-                label="hidden (block out)",
+        if xh:
+            assert len(yh_err) > 0 and all(e is not None for e in yh_err)
+
+        for v in yh:
+            if math.isfinite(float(v)):
+                all_y.append(float(v))
+
+        if xh:
+            style = dict(color="black", linestyle="--", linewidth=2.0, marker="s", markersize=4, alpha=0.95)
+            yh_e = [0.0 if e is None else float(e) for e in yh_err]
+            ax_m.errorbar(
+                xh,
+                yh,
+                yerr=yh_e,
+                elinewidth=0.9,
+                capsize=2,
+                label="hidden",
+                **style,
             )
         break
 
-    ax.set_xlabel("Layer (attn + mlp)")
-    ax.set_ylabel("Log L2 Norm")
-    ax.set_title(title)
-    ax.legend(loc="best", frameon=False, fontsize=8)
-    ax.grid(True, which="major", axis="both", linewidth=0.5, alpha=0.35)
+    ax_a.set_ylabel("Log ||attn_out||")
+    ax_m.set_ylabel("Log ||mlp_out|| / hidden")
+    ax_a.set_title(title)
+    ax_m.set_xlabel("Layer")
 
-    xt = [2 * L for L in layers_all]
-    ax.set_xticks(xt)
-    ax.set_xticklabels([str(L) for L in layers_all], rotation=0)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, fname), dpi=300)
-    plt.close()
-
-def _plot_progression_multi_with_overlay(
-    main_series,
-    overlay_series,
-    outdir,
-    key_main,
-    key_overlay,
-    ylabel,
-    title,
-    fname,
-    mode=None,
-):
-    """
-    Plot multiple series for key_main, and overlay additional series for key_overlay
-    on the same axes.  Intended for MLP_out norm + block hidden-state norm overlay.
-    """
-    if not main_series and not overlay_series:
-        return
-
-    layers_all = sorted({
-        s["layer"]
-        for _lbl, stats in (main_series or []) + (overlay_series or [])
-        for s in (stats or [])
-    })
-    if not layers_all:
-        return
-
-    plt.figure(figsize=(12, 6))
-    ax = plt.gca()
-
-    # Main series (default style)
-    for lbl, stats in (main_series or []):
-        if not stats:
-            continue
-        by = {s["layer"]: s for s in stats}
-        x = [L for L in layers_all if L in by]
-        y = [by[L][key_main] for L in x]
-        yerr = None
-        if len(stats) > 0 and (key_main + "_var") in stats[0]:
-            yerr = [math.sqrt(max(0.0, float(by[L].get(key_main + "_var", 0.0)))) for L in x]
-        if yerr is not None:
-            ax.errorbar(x, y, yerr=yerr, marker="o", linewidth=1.0, elinewidth=0.8, capsize=2, label=lbl)
-        else:
-            ax.plot(x, y, marker="o", label=lbl)
-
-    # Overlay series (distinct style: black dashed)
-    for _i, (lbl, stats) in enumerate(overlay_series or []):
-        if not stats:
-            continue
-        by = {s["layer"]: s for s in stats}
-        x = [L for L in layers_all if L in by]
-        y = [by[L][key_overlay] for L in x]
-        yerr = None
-        if len(stats) > 0 and (key_overlay + "_var") in stats[0]:
-            yerr = [math.sqrt(max(0.0, float(by[L].get(key_overlay + "_var", 0.0)))) for L in x]
-        style = dict(color="black", linestyle="--", linewidth=2.0, marker="s", markersize=4, alpha=0.95)
-        if yerr is not None:
-            ax.errorbar(x, y, yerr=yerr, elinewidth=0.9, capsize=2, label=lbl, **style)
-        else:
-            ax.plot(x, y, label=lbl, **style)
-
-    ax.set_xlabel("Layer")
-    ax.set_ylabel(ylabel)
-
-    if mode == "cos":
-        ax.set_ylim(-1, 1)
-    elif mode == "prob":
-        ax.set_ylim(0, 1)
-    elif mode == "res":
-        vals = []
-        for _lbl, stats in (main_series or []):
-            for s in (stats or []):
-                vals.append(float(s.get(key_main, 0.0)))
-        for _lbl, stats in (overlay_series or []):
-            for s in (stats or []):
-                vals.append(float(s.get(key_overlay, 0.0)))
-        vmax = max(vals) if vals else 10.0
-        ax.set_ylim(0.0, max(10.0, vmax * 1.15))
-
-    ax.set_title(title)
-    ax.legend(loc="best", frameon=False, fontsize=8)
-    ax.grid(True, which="major", axis="both", linewidth=0.5, alpha=0.35)
-
-    if len(layers_all) > 0:
-        ax.set_xlim(min(layers_all), max(layers_all))
+    for ax in (ax_a, ax_m):
+        ax.grid(True, which="major", axis="both", linewidth=0.5, alpha=0.35)
         ax.set_xticks(layers_all)
-        ax.set_xticklabels([str(L) for L in layers_all], rotation=0)
+        ax.set_xlim(min(layers_all), max(layers_all))
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, fname), dpi=300)
-    plt.close()
+    if all_y:
+        y_max = float(np.max(np.asarray(all_y, dtype=np.float32)))
+        ax_a.set_ylim(0.0, y_max + 1.0)
+        ax_m.set_ylim(0.0, y_max + 1.0)
+
+    ax_a.legend(loc="best", frameon=False, fontsize=8)
+    ax_m.legend(loc="best", frameon=False, fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, fname), dpi=300)
+    plt.close(fig)
 
 def _plot_bias_energy_3d(bias_sets, out_path, x_label):
     Ys = [Y for (Y, _t) in bias_sets if Y is not None]
@@ -2361,7 +2866,7 @@ def main():
     p.add_argument("--model", default="Qwen/Qwen3-8B")
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32"])
-    p.add_argument("--prompt-file", default="prompt_sets_v512_t32/natural_mixed.txt")
+    p.add_argument("--prompt-file", default="prompt_sets_v512_t32/natural_mixed_shuffled.txt")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--head", type=int, default=0)
     # scanning mode
@@ -2387,6 +2892,31 @@ def main():
     p.add_argument("--find-mlp-subspace", action="store_true", help="Collect MLP internals at token 0 and non-sink positions")
     p.add_argument("--mlp", nargs="+", choices=["z", "g", "g-row", "g-sign", "u", "residual"], default=None, help="When --find-mlp-subspace, choose which sections to print")
     p.add_argument("--pca-topk", type=int, default=6, help="Top-k PCA for groups of vectors")
+    p.add_argument("--plot-activations", default=None, help="Plot 3D activations for mlp.L or attn.L")
+    p.add_argument(
+        "--mlp-proj-view",
+        choices=["weight", "contrib"],
+        default="weight",
+        help="For --plot-activations mlp.L, show projection panels as raw weight or tok0 contribution.",
+    )
+    p.add_argument(
+        "--max-keep",
+        type=int,
+        default=8,
+        help="Max selected input dims per projection (used by both MLP plotting and overlap stats).",
+    )
+    p.add_argument(
+        "--mlp-act-mult-global",
+        type=float,
+        default=50.0,
+        help="Activation outlier rule: global multiplier (tok0 vs all values).",
+    )
+    p.add_argument(
+        "--mlp-act-mult-dim",
+        type=float,
+        default=5.0,
+        help="Activation outlier rule: per-dim multiplier (tok0 vs other tokens on same dim).",
+    )
     # decomposition of input
     p.add_argument("--decompose-ln", action="store_true", help="For --layer L, decompose the norm input LN(residual + attn + mlp) at L")
     p.add_argument("--decompose-output", action="store_true", help="For --layer L, decompose the output (residual + attn + mlp) at L")
@@ -2412,6 +2942,42 @@ def main():
     print(f"[Tokenized] Tokens[0, 0] text is {tok.decode(tokenized[0][0][0, 0])}")
 
     os.makedirs(args.outdir, exist_ok=True)
+
+    if args.plot_activations:
+        kind, Lp = _parse_plot_activations_spec(args.plot_activations)
+        if kind is None:
+            raise ValueError
+        if not (0 <= Lp < model.config.num_hidden_layers):
+            raise ValueError
+        
+        if kind == "attn":
+            mean_act = _collect_component_mean_activations(model, tokenized, Lp, kind)
+            if mean_act is None:
+                raise RuntimeError
+            
+            out_path = os.path.join(args.outdir, f"activations_{kind}.L{Lp}.png")
+            _plot_activations_3d(mean_act, out_path, f"Mean {kind} activations at layer {Lp}")
+            print(f"[plot_activations] Saved to {out_path}")
+            return
+
+        if kind == "mlp":
+            pack = _collect_mlp_grid_mean_tensors(model, tokenized, Lp, max_tok=9)
+            if pack is None:
+                raise RuntimeError
+
+            acts = pack["acts"]
+            projs = pack["projs"]
+            out_path = os.path.join(args.outdir, f"activations_mlp_grid_L{Lp}.png")
+            _plot_mlp_grid_3d(
+                acts=acts,
+                projs=projs,
+                out_path=out_path,
+                title=f"MLP grid means @ L={Lp} (N={pack['n']}, proj={args.mlp_proj_view})",
+                max_keep=args.max_keep,
+                proj_view=args.mlp_proj_view,
+            )
+            print(f"[plot_activation] Saved grid to {out_path}")
+            return
 
     min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
     last_q = min_len - 1
