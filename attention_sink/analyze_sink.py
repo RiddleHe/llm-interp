@@ -1376,6 +1376,25 @@ def _rank_act_outlier_dims(A, mult_global=50.0, mult_dim=5.0):
     return ranked
 
 
+def _filter_ranked_act_outliers_by_top1(A, ranked_dims, min_rel_to_top1=0.2):
+    A = np.asarray(A, dtype=np.float32)
+    if A.ndim != 2 or A.shape[0] < 1:
+        return []
+
+    D = int(A.shape[1])
+    ranked = [int(d) for d in (ranked_dims or []) if 0 <= int(d) < D]
+    if not ranked:
+        return []
+
+    tok0_abs = np.abs(A[0, :])
+    top1 = float(tok0_abs[int(ranked[0])])
+    rel = float(min_rel_to_top1)
+    if top1 > 0.0 and rel > 0.0:
+        thr = rel * top1
+        ranked = [int(d) for d in ranked if float(tok0_abs[int(d)]) > thr]
+    return ranked
+
+
 def _rank_proj_dims_from_focus_vectors(
     M,
     focus_input_dims,
@@ -1415,7 +1434,41 @@ def _rank_proj_dims_from_focus_vectors(
     rel = float(min_rel_to_top1)
     if top1 > 0.0 and rel > 0.0:
         thr = rel * top1
-        ranked = [int(r) for r in ranked if float(scores[int(r)]) >= thr]
+        ranked = [int(r) for r in ranked if float(scores[int(r)]) > thr]
+    return ranked
+
+
+def _rank_proj_dims_from_full_input(M, input_vec=None, min_rel_to_top1=0.1):
+    M = np.asarray(M, dtype=np.float32)
+    if M.ndim != 2:
+        return []
+    R, D = int(M.shape[0]), int(M.shape[1])
+
+    scores = None
+    if input_vec is not None:
+        x = np.asarray(input_vec, dtype=np.float32).reshape(-1)
+        if int(x.shape[0]) == D:
+            scores = np.abs(M @ x)
+
+    if scores is None:
+        # In contribution view, row-sum equals the per-output contribution total.
+        scores = np.abs(np.sum(M, axis=1))
+
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    if int(scores.shape[0]) != R:
+        return []
+    scores = np.where(np.isfinite(scores), scores, 0.0)
+
+    ranked = np.argsort(-scores).astype(np.int32).tolist()
+    ranked = [int(r) for r in ranked if 0 <= int(r) < R]
+    if not ranked:
+        return []
+
+    top1 = float(scores[int(ranked[0])])
+    rel = float(min_rel_to_top1)
+    if top1 > 0.0 and rel > 0.0:
+        thr = rel * top1
+        ranked = [int(r) for r in ranked if float(scores[int(r)]) > thr]
     return ranked
 
 
@@ -1610,33 +1663,24 @@ def _pick_proj_background_input_dims(M, focus_dims, total_bins=8, total_target=8
 
     return bg
 
-
-def _proj_display_matrix(W, input_tok0_vec=None, proj_view="weight"):
-    W = np.asarray(W, dtype=np.float32)
-    if str(proj_view).lower() != "contrib":
-        return W, "weight"
-
-    x = np.asarray(input_tok0_vec, dtype=np.float32) if input_tok0_vec is not None else None
-    if x is None or x.ndim != 1 or W.ndim != 2 or int(W.shape[1]) != int(x.shape[0]):
-        return W, "weight"
-
-    C = W * x[np.newaxis, :]
-    return C.astype(np.float32), "contribution"
-
-
 def _plot_act3d_lines(ax, A, name, max_dims_act=4096):
     A = np.asarray(A, dtype=np.float32)
     T, D = int(A.shape[0]), int(A.shape[1])
-    step = max(1, int(math.ceil(D / float(max_dims_act))))
     ranked_special = _rank_act_outlier_dims(A, mult_global=50.0, mult_dim=5.0)
+    ranked_special = _filter_ranked_act_outliers_by_top1(
+        A,
+        ranked_special,
+        min_rel_to_top1=0.20,
+    )
     y_ticks = _select_spaced_outlier_dims(
         ranked_special,
         axis_size=D,
         max_keep=4,
         min_dist=max(1, int(math.ceil(D / 8.0))),
     )
-    y_base = np.arange(0, D, step, dtype=np.int32).tolist()
-    y_idx = np.array(sorted(set(y_base + [int(d) for d in y_ticks])), dtype=np.int32)
+    title_topk = 4
+    title_dims = [int(d) for d in ranked_special[:title_topk]]
+    y_idx = np.arange(0, D, dtype=np.int32)
     if y_idx.size == 0:
         y_idx = np.arange(0, D, dtype=np.int32)
 
@@ -1655,7 +1699,7 @@ def _plot_act3d_lines(ax, A, name, max_dims_act=4096):
         zs = A[t, y_idx]
         ax.plot(xs, ys, zs, color="royalblue", linewidth=0.9, alpha=0.95)
 
-    _set_panel_title(ax, name, _dims_title_line(ranked_special, topk=4, label="outliers"), fontsize=10)
+    _set_panel_title(ax, name, _dims_title_line(ranked_special, topk=title_topk, label="outliers"), fontsize=10)
     ax.set_xlabel("token idx")
     ax.set_ylabel("dim")
     ax.set_zlabel("activation value")
@@ -1675,7 +1719,7 @@ def _plot_act3d_lines(ax, A, name, max_dims_act=4096):
 
     ax.set_xticks(list(range(T)))
     ax.set_xticklabels([str(i) for i in range(T)], fontsize=8)
-    return [int(d) for d in y_ticks]
+    return title_dims
 
 
 def _plot_proj3d_lines(
@@ -1699,18 +1743,18 @@ def _plot_proj3d_lines(
 
     focus_dims = [int(d) for d in dims[:keep]]
 
-    ranked_special_y = _rank_proj_dims_from_focus_vectors(
-        M,
-        focus_dims,
-        focus_scalars=input_special_scalars,
-        min_rel_to_top1=0.1,
-    )
-    ranked_title_y = _rank_proj_dims_from_focus_vectors(
-        M,
-        focus_dims,
-        focus_scalars=input_special_scalars,
-        min_rel_to_top1=0.20,
-    )
+    if focus_dims:
+        ranked_special_y = _rank_proj_dims_from_focus_vectors(
+            M,
+            focus_dims,
+            focus_scalars=input_special_scalars,
+            min_rel_to_top1=0.20,
+        )
+        ranked_title_y = ranked_special_y
+    else:
+        ranked_special_y = []
+        ranked_title_y = []
+
     min_dist = max(1, int(math.ceil(R / 8.0)))
     max_y = 4
     y_ticks = []
@@ -1723,9 +1767,7 @@ def _plot_proj3d_lines(
         if len(y_ticks) >= max_y:
             break
 
-    step_y = max(1, int(math.ceil(R / 128.0)))
-    y_base = np.arange(0, R, step_y, dtype=np.int32).tolist()
-    y_idx = np.array(sorted(set(y_base + [int(y) for y in y_ticks])), dtype=np.int32)
+    y_idx = np.arange(0, R, dtype=np.int32)
     if y_idx.size == 0:
         y_idx = np.arange(0, R, dtype=np.int32)
 
@@ -1787,7 +1829,6 @@ def _plot_mlp_grid_3d(
     max_dims_proj=4096,
     *,
     max_keep,
-    proj_view="weight",
 ):
     order = [
         "rms_in",
@@ -1833,37 +1874,32 @@ def _plot_mlp_grid_3d(
             else:
                 dims = []
 
-            input_tok0_vec = None
             input_special_scalars = None
             if prev_key in acts:
                 A_prev = np.asarray(acts[prev_key], dtype=np.float32)
                 if A_prev.ndim == 2 and A_prev.shape[0] >= 1:
-                    input_tok0_vec = A_prev[0, :]
+                    tok0_prev = A_prev[0, :]
                     input_special_scalars = {
-                        int(d): float(input_tok0_vec[int(d)])
+                        int(d): float(tok0_prev[int(d)])
                         for d in dims
-                        if 0 <= int(d) < int(input_tok0_vec.shape[0])
+                        if 0 <= int(d) < int(tok0_prev.shape[0])
                     }
-            M_show, z_label = _proj_display_matrix(
-                projs[key],
-                input_tok0_vec=input_tok0_vec,
-                proj_view=proj_view,
-            )
+            M_show = np.asarray(projs[key], dtype=np.float32)
 
             in_label = f"{prev_key} dim (input)" if prev_key is not None else "input dim"
             out_label = f"{key.replace('_proj', '_out')} dim (output)"
-            panel_name = key if z_label == "weight" else f"{key}_contrib"
+            panel_name = key
             _plot_proj3d_lines(
                 ax,
                 M_show,
                 panel_name,
                 input_special_dims=dims,
-                input_special_scalars=(input_special_scalars if z_label == "weight" else None),
+                input_special_scalars=input_special_scalars,
                 input_label=in_label,
                 output_label=out_label,
                 max_dims_proj=max_dims_proj,
                 max_keep=int(max(1, max_keep)),
-                z_label=z_label,
+                z_label="weight",
             )
             continue
 
@@ -1873,6 +1909,78 @@ def _plot_mlp_grid_3d(
     fig.tight_layout(rect=[0.01, 0.02, 0.99, 0.97])
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
+
+
+def _print_mlp_downproj_trace_table(acts, projs, layer_idx, fixed_out_dim=2276):
+    if "down_in" not in acts or "down_out" not in acts or "down_proj" not in projs:
+        return
+
+    Z = np.asarray(acts["down_in"], dtype=np.float32)
+    Y = np.asarray(acts["down_out"], dtype=np.float32)
+    W = np.asarray(projs["down_proj"], dtype=np.float32)  # [d_model, d_ffn]
+    if Z.ndim != 2 or Y.ndim != 2 or W.ndim != 2:
+        return
+
+    if int(W.shape[1]) != int(Z.shape[1]) or int(W.shape[0]) != int(Y.shape[1]):
+        print(
+            f"[plot_activation][down_proj_trace] shape mismatch: "
+            f"down_in={tuple(Z.shape)} down_out={tuple(Y.shape)} down_proj={tuple(W.shape)}"
+        )
+        return
+
+    z0 = Z[0, :]
+    y0 = Y[0, :]
+
+    down_in_ranked = _filter_ranked_act_outliers_by_top1(
+        Z,
+        _rank_act_outlier_dims(Z, mult_global=50.0, mult_dim=5.0),
+        min_rel_to_top1=0.20,
+    )
+    focus_in_dims = [int(d) for d in down_in_ranked]
+
+    proj_ranked = []
+    if focus_in_dims:
+        focus_scalars = {int(d): float(z0[int(d)]) for d in focus_in_dims}
+        proj_ranked = _rank_proj_dims_from_focus_vectors(
+            W,
+            focus_in_dims,
+            focus_scalars=focus_scalars,
+            min_rel_to_top1=0.20,
+        )
+
+    cols = []
+    seen = set()
+    fixed = int(fixed_out_dim)
+    if 0 <= fixed < int(y0.shape[0]):
+        cols.append(fixed)
+        seen.add(fixed)
+    max_proj_cols = 4
+    for r in proj_ranked[:max_proj_cols]:
+        ri = int(r)
+        if ri < 0 or ri >= int(y0.shape[0]) or ri in seen:
+            continue
+        cols.append(ri)
+        seen.add(ri)
+
+    if not cols:
+        return
+
+    header = f"{'row_name':>18}"
+    for c in cols:
+        header += f" {str(int(c)):>12}"
+    print(header)
+
+    line = f"{'down_out[t0]':>18}"
+    for c in cols:
+        line += f" {float(y0[int(c)]):12.6f}"
+    print(line)
+
+    for d in focus_in_dims:
+        line = f"{f'W[:,{int(d)}]':>18}"
+        for c in cols:
+            line += f" {float(W[int(c), int(d)]):12.6f}"
+        print(line)
+
 
 def _plot_projection_histogram_before_after_stacked(
     p_before_list,
@@ -2894,28 +3002,10 @@ def main():
     p.add_argument("--pca-topk", type=int, default=6, help="Top-k PCA for groups of vectors")
     p.add_argument("--plot-activations", default=None, help="Plot 3D activations for mlp.L or attn.L")
     p.add_argument(
-        "--mlp-proj-view",
-        choices=["weight", "contrib"],
-        default="weight",
-        help="For --plot-activations mlp.L, show projection panels as raw weight or tok0 contribution.",
-    )
-    p.add_argument(
         "--max-keep",
         type=int,
         default=8,
-        help="Max selected input dims per projection (used by both MLP plotting and overlap stats).",
-    )
-    p.add_argument(
-        "--mlp-act-mult-global",
-        type=float,
-        default=50.0,
-        help="Activation outlier rule: global multiplier (tok0 vs all values).",
-    )
-    p.add_argument(
-        "--mlp-act-mult-dim",
-        type=float,
-        default=5.0,
-        help="Activation outlier rule: per-dim multiplier (tok0 vs other tokens on same dim).",
+        help="Max selected input dims per projection (used by MLP plotting).",
     )
     # decomposition of input
     p.add_argument("--decompose-ln", action="store_true", help="For --layer L, decompose the norm input LN(residual + attn + mlp) at L")
@@ -2972,10 +3062,10 @@ def main():
                 acts=acts,
                 projs=projs,
                 out_path=out_path,
-                title=f"MLP grid means @ L={Lp} (N={pack['n']}, proj={args.mlp_proj_view})",
+                title=f"MLP grid means @ L={Lp} (N={pack['n']})",
                 max_keep=args.max_keep,
-                proj_view=args.mlp_proj_view,
             )
+            _print_mlp_downproj_trace_table(acts, projs, layer_idx=Lp)
             print(f"[plot_activation] Saved grid to {out_path}")
             return
 
