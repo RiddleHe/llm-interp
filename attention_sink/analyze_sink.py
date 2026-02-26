@@ -1376,7 +1376,7 @@ def _rank_act_outlier_dims(A, mult_global=50.0, mult_dim=5.0):
     return ranked
 
 
-def _filter_ranked_act_outliers_by_top1(A, ranked_dims, min_rel_to_top1=0.2):
+def _filter_ranked_act_outliers_by_top1(A, ranked_dims, min_rel_to_top1):
     A = np.asarray(A, dtype=np.float32)
     if A.ndim != 2 or A.shape[0] < 1:
         return []
@@ -1398,8 +1398,8 @@ def _filter_ranked_act_outliers_by_top1(A, ranked_dims, min_rel_to_top1=0.2):
 def _rank_proj_dims_from_focus_vectors(
     M,
     focus_input_dims,
-    focus_scalars=None,
-    min_rel_to_top1=0.1,
+    focus_scalars,
+    min_rel_to_top1,
 ):
     M = np.asarray(M, dtype=np.float32)
     if M.ndim != 2:
@@ -1409,55 +1409,19 @@ def _rank_proj_dims_from_focus_vectors(
     if not focus:
         return []
 
-    absM = np.abs(M)
     if isinstance(focus_scalars, dict):
-        w = np.asarray([abs(float(focus_scalars.get(int(d), 0.0))) for d in focus], dtype=np.float32)
+        x_focus = np.asarray([float(focus_scalars.get(int(d), 0.0)) for d in focus], dtype=np.float32)
     elif focus_scalars is None:
-        w = np.ones((len(focus),), dtype=np.float32)
+        x_focus = np.ones((len(focus),), dtype=np.float32)
     else:
         ws = np.asarray(focus_scalars, dtype=np.float32).reshape(-1)
         if ws.size == len(focus):
-            w = np.abs(ws)
+            x_focus = ws.astype(np.float32)
         else:
-            w = np.ones((len(focus),), dtype=np.float32)
-    if float(np.max(w)) <= 0.0:
-        w = np.ones((len(focus),), dtype=np.float32)
+            x_focus = np.ones((len(focus),), dtype=np.float32)
 
-    weighted = absM[:, focus] * w[np.newaxis, :]
-    scores = np.max(weighted, axis=1)  # rank by strongest |outlier_scalar * dim_value|
-    ranked = np.argsort(-scores).astype(np.int32).tolist()
-    ranked = [int(r) for r in ranked if 0 <= int(r) < R]
-    if not ranked:
-        return []
-
-    top1 = float(scores[int(ranked[0])])
-    rel = float(min_rel_to_top1)
-    if top1 > 0.0 and rel > 0.0:
-        thr = rel * top1
-        ranked = [int(r) for r in ranked if float(scores[int(r)]) > thr]
-    return ranked
-
-
-def _rank_proj_dims_from_full_input(M, input_vec=None, min_rel_to_top1=0.1):
-    M = np.asarray(M, dtype=np.float32)
-    if M.ndim != 2:
-        return []
-    R, D = int(M.shape[0]), int(M.shape[1])
-
-    scores = None
-    if input_vec is not None:
-        x = np.asarray(input_vec, dtype=np.float32).reshape(-1)
-        if int(x.shape[0]) == D:
-            scores = np.abs(M @ x)
-
-    if scores is None:
-        # In contribution view, row-sum equals the per-output contribution total.
-        scores = np.abs(np.sum(M, axis=1))
-
-    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
-    if int(scores.shape[0]) != R:
-        return []
-    scores = np.where(np.isfinite(scores), scores, 0.0)
+    contrib = M[:, focus] * x_focus[np.newaxis, :]
+    scores = np.abs(np.sum(contrib, axis=1))
 
     ranked = np.argsort(-scores).astype(np.int32).tolist()
     ranked = [int(r) for r in ranked if 0 <= int(r) < R]
@@ -1470,7 +1434,6 @@ def _rank_proj_dims_from_full_input(M, input_vec=None, min_rel_to_top1=0.1):
         thr = rel * top1
         ranked = [int(r) for r in ranked if float(scores[int(r)]) > thr]
     return ranked
-
 
 def _select_spaced_outlier_dims(ranked_dims, axis_size, max_keep=4, min_dist=None):
     axis_size = int(axis_size)
@@ -1670,7 +1633,7 @@ def _plot_act3d_lines(ax, A, name, max_dims_act=4096):
     ranked_special = _filter_ranked_act_outliers_by_top1(
         A,
         ranked_special,
-        min_rel_to_top1=0.20,
+        0.10,
     )
     y_ticks = _select_spaced_outlier_dims(
         ranked_special,
@@ -1747,8 +1710,8 @@ def _plot_proj3d_lines(
         ranked_special_y = _rank_proj_dims_from_focus_vectors(
             M,
             focus_dims,
-            focus_scalars=input_special_scalars,
-            min_rel_to_top1=0.20,
+            input_special_scalars,
+            0.10,
         )
         ranked_title_y = ranked_special_y
     else:
@@ -1934,7 +1897,7 @@ def _print_mlp_downproj_trace_table(acts, projs, layer_idx, fixed_out_dim=2276):
     down_in_ranked = _filter_ranked_act_outliers_by_top1(
         Z,
         _rank_act_outlier_dims(Z, mult_global=50.0, mult_dim=5.0),
-        min_rel_to_top1=0.20,
+        0.10,
     )
     focus_in_dims = [int(d) for d in down_in_ranked]
 
@@ -1944,8 +1907,8 @@ def _print_mlp_downproj_trace_table(acts, projs, layer_idx, fixed_out_dim=2276):
         proj_ranked = _rank_proj_dims_from_focus_vectors(
             W,
             focus_in_dims,
-            focus_scalars=focus_scalars,
-            min_rel_to_top1=0.20,
+            focus_scalars,
+            0.10,
         )
 
     cols = []
