@@ -1874,76 +1874,219 @@ def _plot_mlp_grid_3d(
     plt.close(fig)
 
 
-def _print_mlp_downproj_trace_table(acts, projs, layer_idx, fixed_out_dim=2276):
-    if "down_in" not in acts or "down_out" not in acts or "down_proj" not in projs:
-        return
-
+def _print_mlp_downproj_outlier_contrib_stacked(
+    acts,
+    projs,
+    out_path,
+    title,
+):
     Z = np.asarray(acts["down_in"], dtype=np.float32)
     Y = np.asarray(acts["down_out"], dtype=np.float32)
-    W = np.asarray(projs["down_proj"], dtype=np.float32)  # [d_model, d_ffn]
+    W = np.asarray(projs["down_proj"], dtype=np.float32)
+
     if Z.ndim != 2 or Y.ndim != 2 or W.ndim != 2:
-        return
-
+        return False
+    
     if int(W.shape[1]) != int(Z.shape[1]) or int(W.shape[0]) != int(Y.shape[1]):
-        print(
-            f"[plot_activation][down_proj_trace] shape mismatch: "
-            f"down_in={tuple(Z.shape)} down_out={tuple(Y.shape)} down_proj={tuple(W.shape)}"
-        )
-        return
+        print("[print_mlp_downproj_outlier_contrib_stacked] Shape mismatch.")
+        return False
 
-    z0 = Z[0, :]
-    y0 = Y[0, :]
+    tok_ref = 0
+    tok_cmp = 8
+    if int(Z.shape[0]) <= tok_cmp or int(Y.shape[0]) <= tok_cmp:
+        print("[print_mlp_downproj_outlier_contrib_stacked] Too few tokens.")
+        return False
 
-    down_in_ranked = _filter_ranked_act_outliers_by_top1(
-        Z,
-        _rank_act_outlier_dims(Z, mult_global=50.0, mult_dim=5.0),
+    z0 = Z[tok_ref, :]
+    y0 = Y[tok_ref, :]
+    z8 = Z[tok_cmp, :]
+    y8 = Y[tok_cmp, :]
+
+    outlier_dims = _filter_ranked_act_outliers_by_top1(
+        Y,
+        _rank_act_outlier_dims(Y, mult_global=50.0, mult_dim=5.0),
         0.10,
     )
-    focus_in_dims = [int(d) for d in down_in_ranked]
+    outlier_dims = [int(d) for d in outlier_dims]
+    outlier_dims = sorted(outlier_dims, key=lambda d: -float(np.abs(y0[int(d)])))
+    if not outlier_dims:
+        print("[print_mlp_downproj_outlier_contrib_stacked] No outlier dimensions found.")
+        return False
 
-    proj_ranked = []
-    if focus_in_dims:
-        focus_scalars = {int(d): float(z0[int(d)]) for d in focus_in_dims}
-        proj_ranked = _rank_proj_dims_from_focus_vectors(
-            W,
-            focus_in_dims,
-            focus_scalars,
-            0.10,
+    ranked_top_dims = np.argsort(-np.abs(y0)).astype(np.int32).tolist()
+    ranked_top_dims = [int(d) for d in ranked_top_dims if 0 <= int(d) < int(W.shape[0])]
+
+    row_top_k = 4
+    contrib_top_k = 8
+    outlier_dims = [int(d) for d in outlier_dims[:row_top_k]]
+    ranked_top_dims = [int(d) for d in ranked_top_dims[:row_top_k]]
+
+    k = int(min(len(outlier_dims), len(ranked_top_dims)))
+    if k < 1:
+        print("[print_mlp_downproj_outlier_contrib_stacked] No top k dimensions found.")
+        return False
+
+    outlier_dims = outlier_dims[:k]
+    ranked_top_dims = ranked_top_dims[:k]
+
+    def _top_contrib_payload(target_dim, contrib_top_k):
+        contrib_0 = W[int(target_dim), :] * z0
+        contrib_8 = W[int(target_dim), :] * z8
+        abs_contrib_0 = np.abs(contrib_0)
+        abs_contrib_8 = np.abs(contrib_8)
+
+        top_k_eff = int(min(int(contrib_top_k), int(abs_contrib_0.size), int(abs_contrib_8.size)))
+        top_idx_0 = np.argsort(-abs_contrib_0).astype(np.int32).tolist()[:top_k_eff]
+        top_idx_8 = np.argsort(-abs_contrib_8).astype(np.int32).tolist()[:top_k_eff]
+
+        mean_val_0 = float(np.mean(abs_contrib_0))
+        mean_val_8 = float(np.mean(abs_contrib_8))
+
+        bar_vals_0 = np.asarray(
+            [float(abs_contrib_0[int(j)]) for j in top_idx_0] + [mean_val_0],
+            dtype=np.float32,
+        )
+        bar_vals_8 = np.asarray(
+            [float(abs_contrib_8[int(j)]) for j in top_idx_8] + [mean_val_8],
+            dtype=np.float32,
+        )
+        bar_lbls = [str(i + 1) for i in range(top_k_eff)] + ["mean"]
+        return bar_vals_0, top_idx_0, bar_vals_8, top_idx_8, bar_lbls
+
+    def _draw_contrib_bar(
+        ax, 
+        bar_vals_0, 
+        top_dims_0,
+        bar_vals_8,
+        top_dims_8,
+        rank_lbls, 
+        main_color_0,
+        main_color_8,
+        *,
+        show_legend=False,
+    ):
+        xpos = np.arange(bar_vals_0.size, dtype=np.int32)
+        width = 0.24
+        colors_0 = [main_color_0] * (bar_vals_0.size - 1) + ["#c0392b"]
+        colors_8 = [main_color_8] * (bar_vals_8.size - 1) + ["#e67e22"]
+
+        bars_0 = ax.bar(
+            xpos - (width / 2.0), 
+            bar_vals_0, 
+            width=width, 
+            color=colors_0, 
+            alpha=0.95, 
+            edgecolor="none",
+            label="token 0",
+        )
+        bars_8 = ax.bar(
+            xpos + (width / 2.0), 
+            bar_vals_8, 
+            width=width, 
+            color=colors_8, 
+            alpha=0.90, 
+            edgecolor="none",
+            label="token 8",
+        )
+        ax.axhline(0.0, color="black", linewidth=0.8, zorder=3)
+        y_lo = 0.0
+        y_hi = float(max(np.max(bar_vals_0), np.max(bar_vals_8)))
+        y_span = max(EPS, y_hi - y_lo)
+        y_pad = 0.16 * y_span
+
+        ax.set_ylim(0.0, y_hi + y_pad)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels(rank_lbls, fontsize=8)
+        ax.set_ylabel("|Contribution|", fontsize=9)
+        if show_legend:
+            ax.legend(loc="best", frameon=False, fontsize=8)
+
+        txt_off = max(EPS, 0.02 * y_span)
+        for rect, di, vv in zip(bars_0, top_dims_0, bar_vals_0):
+            xc = float(rect.get_x() + rect.get_width() / 2.0)
+            yc = float(vv + txt_off)
+            va = "bottom"
+            ax.text(
+                xc,
+                yc,
+                str(int(di)),
+                ha="center",
+                va=va,
+                fontsize=6,
+                rotation=90,
+                color=main_color_0,
+                clip_on=True,
+            )
+        for rect, di, vv in zip(bars_8, top_dims_8, bar_vals_8):
+            xc = float(rect.get_x() + rect.get_width() / 2.0)
+            yc = float(vv + txt_off)
+            va = "bottom"
+            ax.text(
+                xc,
+                yc,
+                str(int(di)),
+                ha="center",
+                va=va,
+                fontsize=6,
+                rotation=90,
+                color=main_color_8,
+                clip_on=True,
+            )
+
+    fig_w = 16.0
+    fig_h = max(3.8, 2.9 * k)
+    fig, axes = plt.subplots(k, 2, figsize=(fig_w, fig_h), sharex=False, squeeze=False)
+
+    for i, (out_dim, top_dim) in enumerate(zip(outlier_dims, ranked_top_dims)):
+        ax_l = axes[i, 0]
+        bar_vals_l_0, top_dims_l_0, bar_vals_l_8, top_dims_l_8, bar_lbls_l = _top_contrib_payload(out_dim, contrib_top_k)
+        _draw_contrib_bar(
+            ax_l, 
+            bar_vals_l_0, 
+            top_dims_l_0,
+            bar_vals_l_8, 
+            top_dims_l_8,
+            bar_lbls_l, 
+            "#1f4e79", 
+            "#117a65", 
+            show_legend=(i==0)
+        )
+        y_val_0 = float(y0[int(out_dim)])
+        y_val_8 = float(y8[int(out_dim)])
+        
+        ax_l.set_title(
+            f"outlier_rank={i + 1} dim={int(out_dim)} down_out_value_0={y_val_0:.6f} down_out_value_8={y_val_8:.6f}",
+            fontsize=10,
         )
 
-    cols = []
-    seen = set()
-    fixed = int(fixed_out_dim)
-    if 0 <= fixed < int(y0.shape[0]):
-        cols.append(fixed)
-        seen.add(fixed)
-    max_proj_cols = 4
-    for r in proj_ranked[:max_proj_cols]:
-        ri = int(r)
-        if ri < 0 or ri >= int(y0.shape[0]) or ri in seen:
-            continue
-        cols.append(ri)
-        seen.add(ri)
+        ax_r = axes[i, 1]
+        bar_vals_r_0, top_dims_r_0, bar_vals_r_8, top_dims_r_8, bar_lbls_r = _top_contrib_payload(top_dim, contrib_top_k)
+        _draw_contrib_bar(
+            ax_r, 
+            bar_vals_r_0, 
+            top_dims_r_0,
+            bar_vals_r_8, 
+            top_dims_r_8,
+            bar_lbls_r, 
+            "#117a65", 
+            "#48c9b0", 
+            show_legend=(i==0)
+        )
+        y_top_val_0 = float(y0[int(top_dim)])
+        y_top_val_8 = float(y8[int(top_dim)])
+        ax_r.set_title(
+            f"top_rank={i + 1} dim={int(top_dim)} down_out_value_0={y_top_val_0:.6f} down_out_value_8={y_top_val_8:.6f}",
+            fontsize=10,
+        )
 
-    if not cols:
-        return
+    axes[-1, 0].set_xlabel("down_in index (d_ffn)")
+    axes[-1, 1].set_xlabel("down_in index (d_ffn)")
 
-    header = f"{'row_name':>18}"
-    for c in cols:
-        header += f" {str(int(c)):>12}"
-    print(header)
-
-    line = f"{'down_out[t0]':>18}"
-    for c in cols:
-        line += f" {float(y0[int(c)]):12.6f}"
-    print(line)
-
-    for d in focus_in_dims:
-        line = f"{f'W[:,{int(d)}]':>18}"
-        for c in cols:
-            line += f" {float(W[int(c), int(d)]):12.6f}"
-        print(line)
-
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0.0, 1, 0.985])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
 
 def _plot_projection_histogram_before_after_stacked(
     p_before_list,
@@ -3028,8 +3171,21 @@ def main():
                 title=f"MLP grid means @ L={Lp} (N={pack['n']})",
                 max_keep=args.max_keep,
             )
-            _print_mlp_downproj_trace_table(acts, projs, layer_idx=Lp)
             print(f"[plot_activation] Saved grid to {out_path}")
+
+            out_path_bar_plot_outlier = os.path.join(
+                args.outdir,
+                f"activations_mlp_downproj_outlier_contrib_stacked_L{Lp}.png"
+            )
+            saved_outlier = _print_mlp_downproj_outlier_contrib_stacked(
+                acts=acts,
+                projs=projs,
+                out_path=out_path_bar_plot_outlier,
+                title=f"MLP downproj outlier contrib stacked @ L={Lp} (N={pack['n']})",
+            )
+            if saved_outlier:
+                print(f"[plot_activation] Saved bar plot outlier contrib stacked to {out_path_bar_plot_outlier}")
+
             return
 
     min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
