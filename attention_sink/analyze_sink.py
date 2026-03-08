@@ -1026,6 +1026,11 @@ def _collect_mlp_grid_mean_tensors(
 
     keys = ["rms_in", "rms_out", "up_out", "gate_out", "act_out", "down_in", "down_out"]
     acc = {k: None for k in keys}
+    # Accumulate per-sample indicators for mean-of-frac.
+    gate_pos_acc = None
+    nogamma_acc = None       # mean gate without gamma
+    nogamma_pos_acc = None   # per-sample (gate_nogamma > 0)
+    W_gate_t = mlp.gate_proj.weight.detach().float()  # (d_ffn, d_model), on device
     n = 0
 
     try:
@@ -1047,6 +1052,22 @@ def _collect_mlp_grid_mean_tensors(
                 if acc[k] is None:
                     acc[k] = torch.zeros_like(X, device=X.device, dtype=torch.float32)
                 acc[k] += X
+
+            gate_pos = (cache["gate_out"][B, :T, :].float() > 0).float()
+            if gate_pos_acc is None:
+                gate_pos_acc = torch.zeros_like(gate_pos)
+            gate_pos_acc += gate_pos
+
+            # Gate without gamma: W_gate @ (x / RMS(x))
+            x = cache["rms_in"][B, :T, :].float()
+            rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + 1e-6)
+            x_normed = x / rms
+            gate_ng = x_normed @ W_gate_t.T  # (T, d_ffn)
+            if nogamma_acc is None:
+                nogamma_acc = torch.zeros_like(gate_ng)
+                nogamma_pos_acc = torch.zeros_like(gate_ng)
+            nogamma_acc += gate_ng
+            nogamma_pos_acc += (gate_ng > 0).float()
             n += 1
 
         if n == 0:
@@ -1055,6 +1076,9 @@ def _collect_mlp_grid_mean_tensors(
         acts = {}
         for k in keys:
             acts[k] = (acc[k] / float(n)).detach().cpu().numpy().astype(np.float32)
+        acts["gate_pos_frac"] = (gate_pos_acc / float(n)).detach().cpu().numpy().astype(np.float32)
+        acts["gate_nogamma"] = (nogamma_acc / float(n)).detach().cpu().numpy().astype(np.float32)
+        acts["nogamma_pos_frac"] = (nogamma_pos_acc / float(n)).detach().cpu().numpy().astype(np.float32)
  
         W_up = mlp.up_proj.weight.detach().float().cpu().numpy().astype(np.float32)
         W_gate = mlp.gate_proj.weight.detach().float().cpu().numpy().astype(np.float32)
@@ -2441,79 +2465,114 @@ def _plot_gate_selectivity(
     out_dims,
     out_path,
     title,
-    top_k_bar=50,
+    top_k_bar=20,
 ):
-    """Per output dim: gate_out at important dims, and frac(gate>0) vs top-k importance.
+    """4-panel plot per output dim: gate without/with gamma (bars + frac>0).
 
-    Importance ranked by |W[dim, d]| (token-independent).
+    Importance ranked by |up_out[tok0, d] * W_down[odim, d]|.
+    Top row: gate values at top-k dims (left=no gamma, right=with gamma).
+    Bottom row: frac(gate>0) vs top-k (left=no gamma, right=with gamma),
+    with shared y-axis limits.
     """
     gate_out = np.asarray(acts["gate_out"], dtype=np.float32)
+    up_out = np.asarray(acts["up_out"], dtype=np.float32)
     W = np.asarray(projs["down_proj"], dtype=np.float32)
+
+    has_nogamma = "gate_nogamma" in acts
+    gate_nogamma = np.asarray(acts["gate_nogamma"], dtype=np.float32) if has_nogamma else None
+    gate_pos = np.asarray(acts["gate_pos_frac"], dtype=np.float32) if "gate_pos_frac" in acts else None
+    nogamma_pos = np.asarray(acts["nogamma_pos_frac"], dtype=np.float32) if "nogamma_pos_frac" in acts else None
 
     T = gate_out.shape[0]
     n_dims = len(out_dims)
-    if n_dims < 1 or T < 2:
+    if n_dims < 1 or T < 2 or not has_nogamma:
         return False
 
     toks = [0, 1, 4, 8]
     toks = [t for t in toks if t < T]
-    tok0_color = "#e74c3c"
     tok_colors = {0: "#e74c3c", 1: "#666666", 4: "#999999", 8: "#bbbbbb"}
+    d_ffn = gate_out.shape[1]
+    ks = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, d_ffn]
+    ks = [k for k in ks if k <= d_ffn]
 
-    fig, axes = plt.subplots(n_dims, 2, figsize=(14.0, max(4.0, 3.5 * n_dims)),
+    fig, axes = plt.subplots(n_dims * 2, 2,
+                             figsize=(14.0, max(8.0, 7.0 * n_dims)),
                              squeeze=False)
 
     for di, odim in enumerate(out_dims):
         odim = int(odim)
         w_row = W[odim, :]
-        importance = np.abs(w_row)
-        top_dims = np.argsort(-importance).tolist()
-
-        # Panel 1: gate_out at top-k important dims
-        ax1 = axes[di, 0]
+        ungated_contrib = np.abs(up_out[0, :] * w_row)
+        top_dims = np.argsort(-ungated_contrib).tolist()
         top_d = top_dims[:top_k_bar]
         xpos = np.arange(top_k_bar)
         n_toks = len(toks)
         width = 0.8 / n_toks
-        for ti, t in enumerate(toks):
-            vals = gate_out[t, top_d]
-            color = tok_colors.get(t, "#aaaaaa")
-            offset = (ti - (n_toks - 1) / 2.0) * width
-            ax1.bar(xpos + offset, vals, width=width, color=color,
-                    alpha=0.8, edgecolor="none",
-                    label=f"tok{t}" if di == 0 else None)
-        ax1.axhline(0, color="black", linewidth=0.8)
-        ax1.set_title(f"dim {odim}: gate_out at top-{top_k_bar} dims by |W[{odim},d]|", fontsize=9)
-        ax1.set_xlabel("rank (by |W| importance)")
-        ax1.set_ylabel("gate_out value", fontsize=8)
-        ax1.set_xticks(xpos[::5])
-        ax1.set_xticklabels([str(i + 1) for i in xpos[::5]], fontsize=7)
-        ax1.grid(True, axis="y", linewidth=0.3, alpha=0.25)
-        if di == 0:
-            ax1.legend(fontsize=7, loc="best", frameon=False)
+        rank_label = f"|up0*W[{odim},d]|"
 
-        # Panel 2: frac(gate>0) among top-k important dims
-        ax2 = axes[di, 1]
-        d_ffn = gate_out.shape[1]
-        ks = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, d_ffn]
-        ks = [k for k in ks if k <= d_ffn]
-        for t in toks:
-            fracs = []
-            for k in ks:
-                td = top_dims[:k]
-                fracs.append(float(np.mean(gate_out[t, td] > 0)))
-            ax2.plot(range(len(ks)), fracs, marker="o", markersize=4,
-                     color=tok_colors.get(t, "#aaaaaa"),
-                     label=f"tok{t}" if di == 0 else None, alpha=0.85)
-        ax2.set_xticks(range(len(ks)))
-        ax2.set_xticklabels(
-            [str(k) if k < d_ffn else "all" for k in ks], fontsize=7, rotation=45)
-        ax2.set_title(f"dim {odim}: frac(gate>0) among top-k by |W[{odim},d]|", fontsize=9)
-        ax2.set_xlabel("top-k important dims")
-        ax2.set_ylabel("fraction gate > 0", fontsize=8)
-        ax2.grid(True, linewidth=0.3, alpha=0.3)
-        if di == 0:
-            ax2.legend(fontsize=7, loc="best", frameon=False)
+        # --- Top row: bar plots ---
+        for ci, (gate_arr, label) in enumerate([
+            (gate_nogamma, "WITHOUT gamma"),
+            (gate_out, "WITH gamma (actual)"),
+        ]):
+            ax = axes[di * 2, ci]
+            for ti, t in enumerate(toks):
+                vals = gate_arr[t, top_d]
+                offset = (ti - (n_toks - 1) / 2.0) * width
+                ax.bar(xpos + offset, vals, width=width,
+                       color=tok_colors.get(t, "#aaaaaa"),
+                       alpha=0.8, edgecolor="none",
+                       label=f"tok{t}" if di == 0 else None)
+            ax.axhline(0, color="black", linewidth=0.8)
+            ax.set_title(f"dim {odim}: gate {label} at top-{top_k_bar}", fontsize=9)
+            ax.set_xlabel(f"rank (by {rank_label})")
+            ax.set_ylabel("gate value", fontsize=8)
+            ax.set_xticks(xpos)
+            ax.set_xticklabels([str(i + 1) for i in xpos], fontsize=7)
+            ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+            if di == 0:
+                ax.legend(fontsize=7, loc="best", frameon=False)
+
+        # --- Bottom row: frac(gate>0) ---
+        # Collect all frac values first to compute shared y-limits.
+        all_fracs = []
+        frac_data = {}
+        for ci, (pos_arr, label) in enumerate([
+            (nogamma_pos, "WITHOUT gamma"),
+            (gate_pos, "WITH gamma (actual)"),
+        ]):
+            frac_data[ci] = {}
+            for t in toks:
+                fracs = []
+                for k in ks:
+                    td = top_dims[:k]
+                    if pos_arr is not None:
+                        fracs.append(float(np.mean(pos_arr[t, td])))
+                    else:
+                        fracs.append(float(np.mean(gate_out[t, td] > 0)))
+                frac_data[ci][t] = fracs
+                all_fracs.extend(fracs)
+
+        y_lo = min(all_fracs) - 0.02
+        y_hi = max(all_fracs) + 0.02
+
+        for ci, label in enumerate(["WITHOUT gamma", "WITH gamma (actual)"]):
+            ax = axes[di * 2 + 1, ci]
+            for t in toks:
+                ax.plot(range(len(ks)), frac_data[ci][t], marker="o",
+                        markersize=4, color=tok_colors.get(t, "#aaaaaa"),
+                        alpha=0.85, label=f"tok{t}" if di == 0 else None)
+            ax.set_xticks(range(len(ks)))
+            ax.set_xticklabels(
+                [str(k) if k < d_ffn else "all" for k in ks],
+                fontsize=7, rotation=45)
+            ax.set_title(f"dim {odim}: frac(gate>0) {label}", fontsize=9)
+            ax.set_xlabel(f"top-k by {rank_label}")
+            ax.set_ylabel("fraction > 0", fontsize=8)
+            ax.set_ylim(y_lo, y_hi)
+            ax.grid(True, linewidth=0.3, alpha=0.3)
+            if di == 0:
+                ax.legend(fontsize=7, loc="best", frameon=False)
 
     fig.suptitle(title, fontsize=12, y=0.995)
     fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.98])
