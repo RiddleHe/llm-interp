@@ -1322,23 +1322,45 @@ def _pick_all_heads_with_caches(model, attns, layer_idx):
     return a[0].detach().float().cpu()
 
 # plots
-def _tok0_special_dims_from_act(A, mult_global=50.0, mult_dim=5.0):
+def _tok0_special_dims_from_act(A, mult_global=50.0, mult_dim=5.0, positive_only=False):
     A = np.asarray(A, dtype=np.float32)
     if A.ndim != 2 or A.shape[0] < 2:
         return []
 
-    absA = np.abs(A)
-    tok0 = absA[0, :]
+    if positive_only:
+        tok0 = A[0, :]
+        # Only consider dims where tok0 is positive
+        pos_mask_tok0 = tok0 > 0.0
 
-    global_mean = float(np.mean(absA))
-    thr_global = float(mult_global) * max(1e-12, global_mean)
-    c_global = tok0 >= thr_global
+        # Global mean over all positive entries
+        pos_all = A[A > 0.0]
+        global_mean = float(np.mean(pos_all)) if pos_all.size > 0 else 1e-12
+        thr_global = float(mult_global) * max(1e-12, global_mean)
+        c_global = tok0 >= thr_global
 
-    dim_mean_non0 = np.mean(absA[1:, :], axis=0)
-    thr_dim = float(mult_dim) * np.maximum(1e-12, dim_mean_non0)
-    c_dim = tok0 >= thr_dim
+        # Per-dim mean over positive values of other tokens
+        others = A[1:, :]
+        others_pos = np.where(others > 0.0, others, 0.0)
+        others_pos_count = np.sum(others > 0.0, axis=0).astype(np.float32)
+        others_pos_count = np.maximum(others_pos_count, 1.0)
+        dim_mean_non0 = np.sum(others_pos, axis=0) / others_pos_count
+        thr_dim = float(mult_dim) * np.maximum(1e-12, dim_mean_non0)
+        c_dim = tok0 >= thr_dim
 
-    idx = np.where(c_global & c_dim)[0]
+        idx = np.where(pos_mask_tok0 & c_global & c_dim)[0]
+    else:
+        absA = np.abs(A)
+        tok0 = absA[0, :]
+
+        global_mean = float(np.mean(absA))
+        thr_global = float(mult_global) * max(1e-12, global_mean)
+        c_global = tok0 >= thr_global
+
+        dim_mean_non0 = np.mean(absA[1:, :], axis=0)
+        thr_dim = float(mult_dim) * np.maximum(1e-12, dim_mean_non0)
+        c_dim = tok0 >= thr_dim
+
+        idx = np.where(c_global & c_dim)[0]
     return idx.astype(np.int32).tolist()
 
 
@@ -1362,13 +1384,13 @@ def _special_dims_binned_ticks(special_dims, D, n_bins):
     return ticks
 
 
-def _rank_act_outlier_dims(A, mult_global=50.0, mult_dim=5.0):
+def _rank_act_outlier_dims(A, mult_global=50.0, mult_dim=5.0, positive_only=False):
     A = np.asarray(A, dtype=np.float32)
     if A.ndim != 2 or A.shape[0] < 1:
         return []
 
     tok0_abs = np.abs(A[0, :])
-    special = _tok0_special_dims_from_act(A, mult_global=float(mult_global), mult_dim=float(mult_dim))
+    special = _tok0_special_dims_from_act(A, mult_global=float(mult_global), mult_dim=float(mult_dim), positive_only=bool(positive_only))
     ranked = sorted(
         set(int(d) for d in special if 0 <= int(d) < int(A.shape[1])),
         key=lambda d: -float(tok0_abs[int(d)]),
@@ -1467,13 +1489,6 @@ def _select_spaced_outlier_dims(ranked_dims, axis_size, max_keep=4, min_dist=Non
     return chosen
 
 
-def _dims_title_line(ranked_dims, topk=4, label="top dims"):
-    top = [int(d) for d in (ranked_dims or [])[: int(max(0, topk))]]
-    if top:
-        return f"{label}: {' > '.join(str(int(d)) for d in top)}"
-    return f"{label}: none"
-
-
 def _dims_title_block(ranked_dims, label="top dims", max_show=12, per_line=4):
     dims = [int(d) for d in (ranked_dims or [])]
     if not dims:
@@ -1483,7 +1498,8 @@ def _dims_title_block(ranked_dims, label="top dims", max_show=12, per_line=4):
     chunk = int(max(1, per_line))
     shown = [str(int(d)) for d in dims[:keep]]
     if len(dims) > keep:
-        shown.append("...")
+        remaining = len(dims) - keep
+        shown.append(f"[+{remaining}]")
 
     lines = []
     for i in range(0, len(shown), chunk):
@@ -1626,10 +1642,10 @@ def _pick_proj_background_input_dims(M, focus_dims, total_bins=8, total_target=8
 
     return bg
 
-def _plot_act3d_lines(ax, A, name, max_dims_act=4096):
+def _plot_act3d_lines(ax, A, name, max_dims_act=4096, mult_global=50.0, mult_dim=5.0, positive_only=False):
     A = np.asarray(A, dtype=np.float32)
     T, D = int(A.shape[0]), int(A.shape[1])
-    ranked_special = _rank_act_outlier_dims(A, mult_global=50.0, mult_dim=5.0)
+    ranked_special = _rank_act_outlier_dims(A, mult_global=float(mult_global), mult_dim=float(mult_dim), positive_only=bool(positive_only))
     ranked_special = _filter_ranked_act_outliers_by_top1(
         A,
         ranked_special,
@@ -1662,7 +1678,7 @@ def _plot_act3d_lines(ax, A, name, max_dims_act=4096):
         zs = A[t, y_idx]
         ax.plot(xs, ys, zs, color="royalblue", linewidth=0.9, alpha=0.95)
 
-    _set_panel_title(ax, name, _dims_title_line(ranked_special, topk=title_topk, label="outliers"), fontsize=10)
+    _set_panel_title(ax, name, _dims_title_block(ranked_special, label="outliers", max_show=title_topk, per_line=4), fontsize=10)
     ax.set_xlabel("token idx")
     ax.set_ylabel("dim")
     ax.set_zlabel("activation value")
@@ -1697,6 +1713,7 @@ def _plot_proj3d_lines(
     *,
     max_keep,
     z_label="weight",
+    output_candidate_dims=None,
 ):
     M = np.asarray(M, dtype=np.float32)
     R, D = int(M.shape[0]), int(M.shape[1])  # [out_dim, in_dim]
@@ -1705,7 +1722,10 @@ def _plot_proj3d_lines(
     dims = [int(d) for d in (input_special_dims or []) if 0 <= int(d) < D]
 
     focus_dims = [int(d) for d in dims[:keep]]
+    focus_set = set(focus_dims)
 
+    # --- y-tick selection (always use default absolute-contribution ranking) ---
+    out_cands = [int(d) for d in (output_candidate_dims or []) if 0 <= int(d) < R]
     if focus_dims:
         ranked_special_y = _rank_proj_dims_from_focus_vectors(
             M,
@@ -1734,12 +1754,41 @@ def _plot_proj3d_lines(
     if y_idx.size == 0:
         y_idx = np.arange(0, R, dtype=np.int32)
 
-    bg_dims = _pick_proj_background_input_dims(
-        M,
-        focus_dims,
-        total_bins=8,
-        total_target=8,
-    )
+    # --- background column selection ---
+    if out_cands and focus_dims:
+        # Pick non-focus input dims that have the highest energy at the top
+        # output dims from the default (absolute) ranking.  These are the
+        # "competing paths" — columns that also drive the big output dims,
+        # making them non-selective to the focus inputs.
+        default_ranked_y = _rank_proj_dims_from_focus_vectors(
+            M, focus_dims, input_special_scalars, 0.10,
+        )
+        # Top output dims by absolute contribution (e.g. 1838)
+        top_abs_y = [int(d) for d in default_ranked_y[:4] if 0 <= int(d) < R]
+        if top_abs_y:
+            # For these output dims, find the non-focus input dims with largest weight
+            sub = np.abs(M[top_abs_y, :])  # [len(top_abs_y), D]
+            col_scores = np.max(sub, axis=0)  # [D]
+            col_ranked = np.argsort(-col_scores).tolist()
+            bg_dims = []
+            n_bg = 8
+            for ci in col_ranked:
+                ci = int(ci)
+                if ci in focus_set:
+                    continue
+                if not bg_dims or min(abs(ci - b) for b in bg_dims) >= max(1, D // 16):
+                    bg_dims.append(ci)
+                if len(bg_dims) >= n_bg:
+                    break
+        else:
+            bg_dims = _pick_proj_background_input_dims(M, focus_dims, total_bins=8, total_target=8)
+    else:
+        bg_dims = _pick_proj_background_input_dims(
+            M,
+            focus_dims,
+            total_bins=8,
+            total_target=8,
+        )
 
     for cc in bg_dims:
         ys = y_idx
@@ -1756,7 +1805,7 @@ def _plot_proj3d_lines(
     _set_panel_title(
         ax,
         name,
-        _dims_title_block(ranked_title_y, label="top dims", max_show=8, per_line=4),
+        _dims_title_block(ranked_title_y, label="top dims", max_show=4, per_line=4),
         fontsize=10,
     )
     ax.set_xlabel(input_label)
@@ -1810,22 +1859,45 @@ def _plot_mlp_grid_3d(
         "gate_proj": "rms_out",
         "down_proj": "down_in",
     }
+    # Proj panels that use output-side candidates for competing-path background
+    proj_next = {
+        "up_proj": "up_out",
+        "gate_proj": "gate_out",
+        "down_proj": "down_out",
+    }
+
+    _default_mult = (50.0, 5.0)
 
     fig = plt.figure(figsize=(22.0, 9.8))
     act_special_cache = {}
+
+    # gate_out: only positive values matter (SiLU kills negatives)
+    _positive_only_stages = {"gate_out"}
+
+    # Pre-compute activation outliers so proj panels can use next-stage info
+    mg, md = _default_mult
+    for key in order:
+        if key in acts:
+            A = np.asarray(acts[key], dtype=np.float32)
+            po = key in _positive_only_stages
+            ranked = _rank_act_outlier_dims(A, mult_global=mg, mult_dim=md, positive_only=po)
+            ranked = _filter_ranked_act_outliers_by_top1(A, ranked, 0.10)
+            act_special_cache[key] = [int(d) for d in ranked[:4]]
 
     for i, key in enumerate(order):
         r, c = divmod(i, 5)
         ax = fig.add_subplot(2, 5, r * 5 + c + 1, projection="3d")
 
         if key in acts:
-            special_dims = _plot_act3d_lines(
+            _plot_act3d_lines(
                 ax,
                 acts[key],
                 key,
                 max_dims_act=max_dims_act,
+                mult_global=mg,
+                mult_dim=md,
+                positive_only=(key in _positive_only_stages),
             )
-            act_special_cache[key] = special_dims
             continue
 
         if key in projs:
@@ -1847,8 +1919,14 @@ def _plot_mlp_grid_3d(
                         for d in dims
                         if 0 <= int(d) < int(tok0_prev.shape[0])
                     }
-            M_show = np.asarray(projs[key], dtype=np.float32)
 
+            # Get output-side candidate dims for y-tick selection if available
+            next_key = proj_next.get(key, None)
+            out_cands = None
+            if next_key is not None and next_key in act_special_cache:
+                out_cands = act_special_cache[next_key]
+
+            M_show = np.asarray(projs[key], dtype=np.float32)
             in_label = f"{prev_key} dim (input)" if prev_key is not None else "input dim"
             out_label = f"{key.replace('_proj', '_out')} dim (output)"
             panel_name = key
@@ -1863,6 +1941,7 @@ def _plot_mlp_grid_3d(
                 max_dims_proj=max_dims_proj,
                 max_keep=int(max(1, max_keep)),
                 z_label="weight",
+                output_candidate_dims=out_cands,
             )
             continue
 
@@ -2087,6 +2166,1037 @@ def _print_mlp_downproj_outlier_contrib_stacked(
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
     return True
+
+
+def _plot_down_out_contrib_for_dims(
+    acts,
+    projs,
+    out_dims,
+    out_path,
+    title,
+    contrib_top_k=8,
+):
+    """Bar plot: top down_in contributors to specific output dims of down_proj.
+
+    For each output dim, shows |W[dim,:] * down_in[tok,:]| ranked independently
+    for tok0 (red) vs tok1/4/8 (gray, decreasing alpha).
+    """
+    Z = np.asarray(acts["down_in"], dtype=np.float32)
+    Y = np.asarray(acts["down_out"], dtype=np.float32)
+    W = np.asarray(projs["down_proj"], dtype=np.float32)
+
+    if Z.ndim != 2 or Y.ndim != 2 or W.ndim != 2:
+        return False
+
+    toks = [0, 1, 4, 8]
+    toks = [t for t in toks if t < Z.shape[0]]
+    if len(toks) < 2:
+        return False
+
+    tok0_color = "#e74c3c"
+    other_color = "#888888"
+    alphas = {0: 0.95}
+    for i, t in enumerate(toks[1:]):
+        alphas[t] = max(0.3, 0.8 - 0.15 * i)
+
+    n_rows = len(out_dims)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(14.0, max(3.8, 3.2 * n_rows)),
+                             squeeze=False)
+
+    for ri, odim in enumerate(out_dims):
+        odim = int(odim)
+        ax = axes[ri, 0]
+
+        # Compute contributions for each token
+        contribs = {}
+        for t in toks:
+            c = W[odim, :] * Z[t, :]
+            contribs[t] = c
+
+        # For each token, rank by |contrib| independently
+        top_k_eff = min(contrib_top_k, Z.shape[1])
+        n_bars = top_k_eff + 1  # +1 for mean
+        xpos = np.arange(n_bars, dtype=np.float64)
+        n_toks = len(toks)
+        width = 0.8 / n_toks
+
+        for ti, t in enumerate(toks):
+            c = contribs[t]
+            abs_c = np.abs(c)
+            top_idx = np.argsort(-abs_c).astype(np.int32).tolist()[:top_k_eff]
+            signed_vals = [float(c[j]) for j in top_idx]
+            mean_abs = float(np.mean(abs_c))
+            bar_vals = np.array(signed_vals + [mean_abs], dtype=np.float32)
+
+            color = tok0_color if t == 0 else other_color
+            alpha = alphas[t]
+            offset = (ti - (n_toks - 1) / 2.0) * width
+
+            bars = ax.bar(xpos + offset, bar_vals, width=width,
+                         color=color, alpha=alpha, edgecolor="none",
+                         label=f"tok{t}" if ri == 0 else None)
+
+            # Dim annotations
+            txt_off_frac = 0.02
+            all_abs = np.abs(bar_vals)
+            y_range = max(float(np.max(all_abs)), 1e-9)
+            txt_off = txt_off_frac * y_range
+
+            for bi, (rect, bv) in enumerate(zip(bars, bar_vals)):
+                if bi >= top_k_eff:
+                    continue
+                di = top_idx[bi]
+                xc = float(rect.get_x() + rect.get_width() / 2.0)
+                if bv >= 0:
+                    yc = float(bv + txt_off)
+                    va = "bottom"
+                else:
+                    yc = float(bv - txt_off)
+                    va = "top"
+                ax.text(xc, yc, str(di), ha="center", va=va,
+                       fontsize=5, rotation=90, color=color, alpha=min(1.0, alpha + 0.1),
+                       clip_on=True)
+
+        ax.axhline(0.0, color="black", linewidth=0.8, zorder=3)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels([str(i + 1) for i in range(top_k_eff)] + ["mean"], fontsize=8)
+        ax.set_xlabel("rank by |contribution|", fontsize=9)
+        ax.set_ylabel("signed contribution", fontsize=9)
+
+        # Set ylim with headroom for dim annotations
+        all_bar_vals = []
+        for t in toks:
+            c = contribs[t]
+            abs_c = np.abs(c)
+            top_idx = np.argsort(-abs_c).astype(np.int32).tolist()[:top_k_eff]
+            all_bar_vals.extend([float(c[j]) for j in top_idx])
+            all_bar_vals.append(float(np.mean(abs_c)))
+        y_lo = min(0.0, min(all_bar_vals))
+        y_hi = max(0.0, max(all_bar_vals))
+        y_span = max(EPS, y_hi - y_lo)
+        ax.set_ylim(y_lo - 0.15 * y_span, y_hi + 0.25 * y_span)
+
+        y_val_0 = float(Y[0, odim])
+        ax.set_title(f"output dim {odim}  (down_out[tok0]={y_val_0:.4f})", fontsize=10)
+        ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+    axes[0, 0].legend(loc="best", frameon=False, fontsize=8)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.98])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _plot_down_out_magnitude_alignment(
+    acts,
+    projs,
+    out_dims,
+    out_path,
+    title,
+):
+    """1-row grid per output dim: ||down_in||, cos(down_in, W[dim,:]), dot product."""
+    Z = np.asarray(acts["down_in"], dtype=np.float32)
+    W = np.asarray(projs["down_proj"], dtype=np.float32)
+
+    T = Z.shape[0]
+    n_dims = len(out_dims)
+    if n_dims < 1 or T < 2:
+        return False
+
+    tok0_color = "#e74c3c"
+    other_color = "#888888"
+
+    fig, axes = plt.subplots(n_dims, 3, figsize=(14.0, max(3.5, 3.0 * n_dims)),
+                             squeeze=False)
+
+    xpos = np.arange(T, dtype=np.float64)
+
+    def _draw_bar(ax, vals, ylabel, panel_title):
+        colors = [tok0_color if t == 0 else other_color for t in range(T)]
+        alphas = [0.95 if t == 0 else max(0.4, 0.8 - 0.05 * t) for t in range(T)]
+        for t in range(T):
+            ax.bar(xpos[t], vals[t], width=0.7, color=colors[t],
+                   alpha=alphas[t], edgecolor="none")
+        ax.axhline(0.0, color="black", linewidth=0.8, zorder=3)
+        y_lo = min(0.0, float(np.min(vals)))
+        y_hi = float(np.max(vals))
+        y_span = max(EPS, y_hi - y_lo)
+        ax.set_ylim(y_lo - 0.05 * y_span, y_hi + 0.15 * y_span)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels([str(t) for t in range(T)], fontsize=8)
+        ax.set_xlabel("token idx", fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.set_title(panel_title, fontsize=9)
+        ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+    for di, odim in enumerate(out_dims):
+        odim = int(odim)
+        w_row = W[odim, :]
+        w_norm = float(np.linalg.norm(w_row))
+
+        magnitudes = np.array([float(np.linalg.norm(Z[t, :])) for t in range(T)])
+        cosines = np.array([
+            float(np.dot(Z[t, :], w_row) / (np.linalg.norm(Z[t, :]) * w_norm + 1e-12))
+            for t in range(T)
+        ])
+        dots = np.array([float(np.dot(Z[t, :], w_row)) for t in range(T)])
+
+        _draw_bar(axes[di, 0], magnitudes, "||down_in||", f"dim {odim}: magnitude")
+        _draw_bar(axes[di, 1], cosines, "cosine sim", f"dim {odim}: cos(down_in, W[{odim},:])")
+        _draw_bar(axes[di, 2], dots, "dot product", f"dim {odim}: down_out[tok,{odim}]")
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.98])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _plot_down_out_gate_analysis(
+    acts,
+    projs,
+    out_dims,
+    out_path,
+    title,
+):
+    """Per output dim: ungated vs gated projection onto W[dim,:], and gating ratio."""
+    up_out = np.asarray(acts["up_out"], dtype=np.float32)
+    down_in = np.asarray(acts["down_in"], dtype=np.float32)
+    W = np.asarray(projs["down_proj"], dtype=np.float32)
+
+    T = up_out.shape[0]
+    n_dims = len(out_dims)
+    if n_dims < 1 or T < 2:
+        return False
+
+    tok0_color = "#e74c3c"
+    other_color = "#888888"
+
+    fig, axes = plt.subplots(n_dims, 2, figsize=(12.0, max(3.5, 3.5 * n_dims)),
+                             squeeze=False)
+
+    xpos = np.arange(T, dtype=np.float64)
+
+    for di, odim in enumerate(out_dims):
+        odim = int(odim)
+        w_row = W[odim, :]
+
+        ungated = np.array([float(np.dot(up_out[t, :], w_row)) for t in range(T)])
+        gated = np.array([float(np.dot(down_in[t, :], w_row)) for t in range(T)])
+        ratio = gated / (np.abs(ungated) + 1e-12)
+
+        colors = [tok0_color if t == 0 else other_color for t in range(T)]
+        alphas = [0.95 if t == 0 else max(0.4, 0.8 - 0.05 * t) for t in range(T)]
+
+        # Panel 1: ungated vs gated
+        ax1 = axes[di, 0]
+        width = 0.35
+        ax1.bar(xpos - width / 2, ungated, width=width, color="#3498db",
+                alpha=0.85, edgecolor="none", label="ungated (up_out · W)")
+        ax1.bar(xpos + width / 2, gated, width=width, color=tok0_color,
+                alpha=0.85, edgecolor="none", label="gated (down_in · W)")
+        ax1.axhline(0.0, color="black", linewidth=0.8, zorder=3)
+        all_v = np.concatenate([ungated, gated])
+        y_lo = min(0.0, float(np.min(all_v)))
+        y_hi = float(np.max(all_v))
+        y_span = max(EPS, y_hi - y_lo)
+        ax1.set_ylim(y_lo - 0.05 * y_span, y_hi + 0.15 * y_span)
+        ax1.set_xticks(xpos)
+        ax1.set_xticklabels([str(t) for t in range(T)], fontsize=8)
+        ax1.set_xlabel("token idx", fontsize=8)
+        ax1.set_ylabel("dot product", fontsize=8)
+        ax1.set_title(f"dim {odim}: ungated vs gated projection", fontsize=9)
+        ax1.legend(fontsize=7, loc="best", frameon=False)
+        ax1.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+        # Panel 2: ratio
+        ax2 = axes[di, 1]
+        for t in range(T):
+            ax2.bar(xpos[t], ratio[t], width=0.7, color=colors[t],
+                    alpha=alphas[t], edgecolor="none")
+        ax2.axhline(0.0, color="black", linewidth=0.8, zorder=3)
+        y_lo_r = min(0.0, float(np.min(ratio)))
+        y_hi_r = float(np.max(ratio))
+        y_span_r = max(EPS, y_hi_r - y_lo_r)
+        ax2.set_ylim(y_lo_r - 0.05 * y_span_r, y_hi_r + 0.15 * y_span_r)
+        ax2.set_xticks(xpos)
+        ax2.set_xticklabels([str(t) for t in range(T)], fontsize=8)
+        ax2.set_xlabel("token idx", fontsize=8)
+        ax2.set_ylabel("ratio", fontsize=8)
+        ax2.set_title(f"dim {odim}: gating ratio (gated / |ungated|)", fontsize=9)
+        ax2.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.98])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _plot_gate_selectivity(
+    acts,
+    projs,
+    out_dims,
+    out_path,
+    title,
+    top_k_bar=50,
+):
+    """Per output dim: gate_out at important dims, and frac(gate>0) vs top-k importance.
+
+    Importance ranked by |W[dim, d]| (token-independent).
+    """
+    gate_out = np.asarray(acts["gate_out"], dtype=np.float32)
+    W = np.asarray(projs["down_proj"], dtype=np.float32)
+
+    T = gate_out.shape[0]
+    n_dims = len(out_dims)
+    if n_dims < 1 or T < 2:
+        return False
+
+    toks = [0, 1, 4, 8]
+    toks = [t for t in toks if t < T]
+    tok0_color = "#e74c3c"
+    tok_colors = {0: "#e74c3c", 1: "#666666", 4: "#999999", 8: "#bbbbbb"}
+
+    fig, axes = plt.subplots(n_dims, 2, figsize=(14.0, max(4.0, 3.5 * n_dims)),
+                             squeeze=False)
+
+    for di, odim in enumerate(out_dims):
+        odim = int(odim)
+        w_row = W[odim, :]
+        importance = np.abs(w_row)
+        top_dims = np.argsort(-importance).tolist()
+
+        # Panel 1: gate_out at top-k important dims
+        ax1 = axes[di, 0]
+        top_d = top_dims[:top_k_bar]
+        xpos = np.arange(top_k_bar)
+        n_toks = len(toks)
+        width = 0.8 / n_toks
+        for ti, t in enumerate(toks):
+            vals = gate_out[t, top_d]
+            color = tok_colors.get(t, "#aaaaaa")
+            offset = (ti - (n_toks - 1) / 2.0) * width
+            ax1.bar(xpos + offset, vals, width=width, color=color,
+                    alpha=0.8, edgecolor="none",
+                    label=f"tok{t}" if di == 0 else None)
+        ax1.axhline(0, color="black", linewidth=0.8)
+        ax1.set_title(f"dim {odim}: gate_out at top-{top_k_bar} dims by |W[{odim},d]|", fontsize=9)
+        ax1.set_xlabel("rank (by |W| importance)")
+        ax1.set_ylabel("gate_out value", fontsize=8)
+        ax1.set_xticks(xpos[::5])
+        ax1.set_xticklabels([str(i + 1) for i in xpos[::5]], fontsize=7)
+        ax1.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+        if di == 0:
+            ax1.legend(fontsize=7, loc="best", frameon=False)
+
+        # Panel 2: frac(gate>0) among top-k important dims
+        ax2 = axes[di, 1]
+        d_ffn = gate_out.shape[1]
+        ks = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, d_ffn]
+        ks = [k for k in ks if k <= d_ffn]
+        for t in toks:
+            fracs = []
+            for k in ks:
+                td = top_dims[:k]
+                fracs.append(float(np.mean(gate_out[t, td] > 0)))
+            ax2.plot(range(len(ks)), fracs, marker="o", markersize=4,
+                     color=tok_colors.get(t, "#aaaaaa"),
+                     label=f"tok{t}" if di == 0 else None, alpha=0.85)
+        ax2.set_xticks(range(len(ks)))
+        ax2.set_xticklabels(
+            [str(k) if k < d_ffn else "all" for k in ks], fontsize=7, rotation=45)
+        ax2.set_title(f"dim {odim}: frac(gate>0) among top-k by |W[{odim},d]|", fontsize=9)
+        ax2.set_xlabel("top-k important dims")
+        ax2.set_ylabel("fraction gate > 0", fontsize=8)
+        ax2.grid(True, linewidth=0.3, alpha=0.3)
+        if di == 0:
+            ax2.legend(fontsize=7, loc="best", frameon=False)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.98])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _plot_attn_cos(pack, out_path, title):
+    """Plot cosine similarity of each component vs tok0, per token.
+
+    One panel per component (excluding 'sum'). Shows cos(comp[tok0], comp[tok_i]).
+    """
+    comp_names = pack["component_names"]
+    # Exclude 'sum' — we want individual components
+    plot_names = [n for n in comp_names if n != "sum"]
+    n_panels = len(plot_names)
+    if n_panels < 1:
+        return False
+
+    T = int(pack[plot_names[0]].shape[0])
+    if T < 2:
+        return False
+
+    tok0_color = "#e74c3c"
+    other_color = "#888888"
+    xpos = np.arange(T, dtype=np.float64)
+
+    fig, axes = plt.subplots(1, n_panels, figsize=(4.5 * n_panels, 4.0), squeeze=False)
+
+    for ci, name in enumerate(plot_names):
+        arr = np.asarray(pack[name], dtype=np.float32)  # (T, D)
+        ref = arr[0, :]
+        ref_norm = float(np.linalg.norm(ref))
+
+        cos_vals = np.array([
+            float(np.dot(ref, arr[t, :]) / (ref_norm * np.linalg.norm(arr[t, :]) + 1e-12))
+            for t in range(T)
+        ])
+
+        ax = axes[0, ci]
+        colors = [tok0_color if t == 0 else other_color for t in range(T)]
+        alphas = [0.95 if t == 0 else max(0.4, 0.8 - 0.05 * t) for t in range(T)]
+        for t in range(T):
+            ax.bar(xpos[t], cos_vals[t], width=0.7, color=colors[t],
+                   alpha=alphas[t], edgecolor="none")
+
+        ax.axhline(0.0, color="black", linewidth=0.8, zorder=3)
+        y_lo = min(0.0, float(np.min(cos_vals)))
+        y_hi = max(1.0, float(np.max(cos_vals)))
+        ax.set_ylim(y_lo - 0.05, y_hi + 0.05)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels([str(t) for t in range(T)], fontsize=8)
+        ax.set_xlabel("token idx", fontsize=8)
+        ax.set_ylabel("cosine sim vs tok0", fontsize=8)
+        ax.set_title(f"cos({name}[tok0], {name}[tok_i])", fontsize=9)
+        ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.98])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _plot_mlp_down_in_decomposition(
+    acts,
+    out_path,
+    title,
+):
+    """Bar plot showing how down_in outlier dims are created from gate_out * act_out * up_out.
+
+    For each down_in outlier dim, shows 4 grouped bars per token:
+    gate_out, act_out, up_out, down_in (= act_out * up_out).
+    """
+    for k in ("gate_out", "act_out", "up_out", "down_in"):
+        if k not in acts:
+            return False
+
+    gate = np.asarray(acts["gate_out"], dtype=np.float32)
+    act = np.asarray(acts["act_out"], dtype=np.float32)
+    up = np.asarray(acts["up_out"], dtype=np.float32)
+    down_in = np.asarray(acts["down_in"], dtype=np.float32)
+
+    if gate.ndim != 2 or gate.shape[0] < 2:
+        return False
+
+    T, D = int(down_in.shape[0]), int(down_in.shape[1])
+
+    outlier_dims = _filter_ranked_act_outliers_by_top1(
+        down_in,
+        _rank_act_outlier_dims(down_in, mult_global=50.0, mult_dim=5.0),
+        0.10,
+    )
+    outlier_dims = [int(d) for d in outlier_dims]
+    if not outlier_dims:
+        return False
+
+    max_panels = 4
+    outlier_dims = outlier_dims[:max_panels]
+    n_panels = len(outlier_dims)
+
+    fig, axes = plt.subplots(1, n_panels, figsize=(5.0 * n_panels, 4.5), squeeze=False)
+
+    labels = ["gate_out", "act_out", "up_out", "down_in"]
+    colors = ["#9b59b6", "#e74c3c", "#3498db", "#2c3e50"]
+    n_bars = len(labels)
+    width = 0.18
+
+    for pi, dim_idx in enumerate(outlier_dims):
+        ax = axes[0, pi]
+        dim_idx = int(dim_idx)
+
+        vals = {
+            "gate_out": gate[:, dim_idx],
+            "act_out": act[:, dim_idx],
+            "up_out": up[:, dim_idx],
+            "down_in": down_in[:, dim_idx],
+        }
+
+        xpos = np.arange(T, dtype=np.float64)
+        for bi, label in enumerate(labels):
+            offset = (bi - (n_bars - 1) / 2.0) * width
+            bar_vals = vals[label]
+            ax.bar(
+                xpos + offset,
+                bar_vals,
+                width=width,
+                color=colors[bi],
+                alpha=0.90,
+                edgecolor="none",
+                label=label if pi == 0 else None,
+            )
+
+        ax.axhline(0.0, color="black", linewidth=0.6, zorder=3)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels([str(int(t)) for t in range(T)], fontsize=8)
+        ax.set_xlabel("token idx", fontsize=9)
+        ax.set_ylabel("activation value", fontsize=9)
+        ax.set_title(f"dim {dim_idx}", fontsize=10)
+        ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+    if n_panels > 0:
+        axes[0, 0].legend(loc="best", frameon=False, fontsize=8)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0.0, 1, 0.975])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _plot_mlp_upgate_proj_contrib_for_down_in(
+    acts,
+    projs,
+    out_path,
+    title,
+):
+    """Bar plot: per-dim contributions from up_proj and gate_proj into up_out/gate_out
+    at down_in outlier dims.  Layout is k rows (one per down_in outlier) x 2 cols
+    (up_proj→up_out, gate_proj→gate_out).  Each subplot shows top-k ranked input dims
+    by |contrib| for tok0, with tok8 as control."""
+
+    needed_acts = ("rms_out", "up_out", "gate_out", "down_in")
+    needed_projs = ("up_proj", "gate_proj")
+    for k in needed_acts:
+        if k not in acts:
+            return False
+    for k in needed_projs:
+        if k not in projs:
+            return False
+
+    rms_out = np.asarray(acts["rms_out"], dtype=np.float32)
+    up_out = np.asarray(acts["up_out"], dtype=np.float32)
+    gate_out = np.asarray(acts["gate_out"], dtype=np.float32)
+    down_in = np.asarray(acts["down_in"], dtype=np.float32)
+    W_up = np.asarray(projs["up_proj"], dtype=np.float32)    # (d_ffn, d_model)
+    W_gate = np.asarray(projs["gate_proj"], dtype=np.float32)  # (d_ffn, d_model)
+
+    if rms_out.ndim != 2 or down_in.ndim != 2:
+        return False
+
+    toks = [0, 1, 4, 8]
+    T = int(rms_out.shape[0])
+    if T <= max(toks):
+        return False
+
+    outlier_dims = _filter_ranked_act_outliers_by_top1(
+        down_in,
+        _rank_act_outlier_dims(down_in, mult_global=50.0, mult_dim=5.0),
+        0.10,
+    )
+    outlier_dims = [int(d) for d in outlier_dims]
+    if not outlier_dims:
+        return False
+
+    max_panels = 4
+    outlier_dims = outlier_dims[:max_panels]
+    k = len(outlier_dims)
+    contrib_top_k = 8
+
+    n_toks = len(toks)
+    tok0_color = "#e74c3c"
+    other_color = "#888888"
+    tok_colors = [tok0_color] + [other_color] * (n_toks - 1)
+    tok_alphas = [0.95] + [0.85 - 0.15 * i for i in range(n_toks - 1)]
+    proj_info = [
+        ("up_proj", W_up, up_out),
+        ("gate_proj", W_gate, gate_out),
+    ]
+
+    fig, axes = plt.subplots(k, 2, figsize=(16.0, max(3.8, 2.9 * k)), squeeze=False)
+
+    for row_i, dim_idx in enumerate(outlier_dims):
+        dim_idx = int(dim_idx)
+        xs = [rms_out[t, :] for t in toks]
+
+        for col_j, (proj_name, W, act_out) in enumerate(proj_info):
+            ax = axes[row_i, col_j]
+
+            contribs = [W[dim_idx, :] * x for x in xs]
+            abs_cs = [np.abs(c) for c in contribs]
+
+            top_k_eff = int(min(contrib_top_k, abs_cs[0].size))
+            top_idxs = [
+                np.argsort(-ac).astype(np.int32).tolist()[:top_k_eff] for ac in abs_cs
+            ]
+
+            means = [float(np.mean(ac)) for ac in abs_cs]
+            bar_vals_list = [
+                np.array([float(c[j]) for j in ti] + [m], dtype=np.float32)
+                for c, ti, m in zip(contribs, top_idxs, means)
+            ]
+            bar_lbls = [str(i + 1) for i in range(top_k_eff)] + ["mean"]
+
+            xpos = np.arange(top_k_eff + 1, dtype=np.float64)
+            width = 0.80 / n_toks
+
+            for ti, (bv, tok_i, clr, alph) in enumerate(zip(bar_vals_list, toks, tok_colors, tok_alphas)):
+                offset = (ti - (n_toks - 1) / 2.0) * width
+                ax.bar(xpos + offset, bv, width=width, color=clr,
+                       alpha=alph, edgecolor="none",
+                       label=f"tok {tok_i}" if row_i == 0 and col_j == 0 else None)
+
+            ax.axhline(0.0, color="black", linewidth=0.8, zorder=3)
+
+            all_vals = np.concatenate(bar_vals_list)
+            y_lo = float(np.min(all_vals))
+            y_hi = float(np.max(all_vals))
+            y_span = max(EPS, y_hi - y_lo)
+            y_pad = 0.18 * y_span
+            ax.set_ylim(y_lo - y_pad, y_hi + y_pad)
+            ax.set_xticks(xpos)
+            ax.set_xticklabels(bar_lbls, fontsize=8)
+            ax.set_ylabel("Contribution (signed)", fontsize=9)
+            ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+            # dim annotations on bars (skip the mean bar)
+            n_bars_per = top_k_eff + 1
+            txt_off = max(EPS, 0.02 * y_span)
+            for rect_i, (idx_list, bv, clr) in enumerate(
+                zip(top_idxs, bar_vals_list, tok_colors)
+            ):
+                bars = ax.patches[rect_i * n_bars_per:(rect_i + 1) * n_bars_per]
+                for bi, (bar, di) in enumerate(zip(bars[:top_k_eff], idx_list)):
+                    xc = float(bar.get_x() + bar.get_width() / 2.0)
+                    v = float(bv[bi])
+                    if v >= 0:
+                        yc = v + txt_off
+                        va = "bottom"
+                    else:
+                        yc = v - txt_off
+                        va = "top"
+                    ax.text(xc, yc, str(int(di)), ha="center", va=va,
+                            fontsize=6, rotation=90, color=clr, clip_on=True)
+
+            out_name = proj_name.replace("_proj", "_out")
+            out_vals = "  ".join(
+                f"[{t}]={float(act_out[t, dim_idx]):.3f}" for t in toks
+            )
+            ax.set_title(
+                f"{proj_name}→{out_name}  dim={dim_idx}  {out_vals}",
+                fontsize=9,
+            )
+
+    axes[-1, 0].set_xlabel("rms_out dim (ranked by |tok0 contrib|)", fontsize=9)
+    axes[-1, 1].set_xlabel("rms_out dim (ranked by |tok0 contrib|)", fontsize=9)
+
+    if k > 0:
+        axes[0, 0].legend(loc="best", frameon=False, fontsize=8)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0, 0.0, 1, 0.985])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+    # Detect rms_out dims that are special for non-0 tokens:
+    # top-1 contributor for >=2 non-0 tokens across all panels,
+    # and never top-1 for tok0 in any panel.
+    from collections import Counter
+    tok0_top1s = set()
+    nontok0_top1s = Counter()
+    for row_i, dim_idx in enumerate(outlier_dims):
+        dim_idx = int(dim_idx)
+        for col_j, (proj_name, W, act_out) in enumerate(proj_info):
+            contribs_all = [W[dim_idx, :] * rms_out[t, :] for t in toks]
+            abs_all = [np.abs(c) for c in contribs_all]
+            for ti, (ac, tok_i) in enumerate(zip(abs_all, toks)):
+                top1 = int(np.argmax(ac))
+                if tok_i == 0:
+                    tok0_top1s.add(top1)
+                else:
+                    nontok0_top1s[top1] += 1
+    special_rms_dims = sorted(
+        [d for d, cnt in nontok0_top1s.items() if cnt >= 2 and d not in tok0_top1s],
+        key=lambda d: -nontok0_top1s[d],
+    )
+    return special_rms_dims
+
+
+def _plot_mlp_rms_dim_across_tokens(
+    acts,
+    dims,
+    out_path,
+    title,
+):
+    """Bar plot: rms_in and rms_out values at specific dims across all tokens.
+    Multiple dims are arranged vertically (one row per dim)."""
+    if "rms_in" not in acts or "rms_out" not in acts:
+        return False
+
+    rms_in = np.asarray(acts["rms_in"], dtype=np.float32)
+    rms_out = np.asarray(acts["rms_out"], dtype=np.float32)
+
+    if rms_in.ndim != 2 or rms_out.ndim != 2:
+        return False
+
+    T = int(rms_in.shape[0])
+    n_dims = len(dims)
+    if n_dims < 1:
+        return False
+
+    fig, axes = plt.subplots(n_dims, 1, figsize=(7.0, max(4.0, 3.5 * n_dims)), squeeze=False)
+
+    xpos = np.arange(T, dtype=np.float64)
+    width = 0.35
+
+    for pi, dim_idx in enumerate(dims):
+        dim_idx = int(dim_idx)
+        ax = axes[pi, 0]
+
+        vals_in = rms_in[:, dim_idx]
+        vals_out = rms_out[:, dim_idx]
+
+        ax.bar(xpos - width / 2, vals_in, width=width, color="#3498db",
+               alpha=0.90, edgecolor="none", label="rms_in" if pi == 0 else None)
+        ax.bar(xpos + width / 2, vals_out, width=width, color="#e74c3c",
+               alpha=0.90, edgecolor="none", label="rms_out" if pi == 0 else None)
+        ax.axhline(0.0, color="black", linewidth=0.8, zorder=3)
+
+        all_vals = np.concatenate([vals_in, vals_out])
+        y_lo = float(np.min(all_vals))
+        y_hi = float(np.max(all_vals))
+        y_span = max(EPS, y_hi - y_lo)
+        y_pad = 0.20 * y_span
+        ax.set_ylim(y_lo - y_pad, y_hi + y_pad)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels([str(int(t)) for t in range(T)], fontsize=8)
+        ax.set_xlabel("token idx", fontsize=9)
+        ax.set_ylabel("value", fontsize=9)
+        ax.set_title(f"dim {dim_idx}", fontsize=10)
+        ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+    axes[0, 0].legend(loc="best", frameon=False, fontsize=8)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.975])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _plot_mlp_rms_in_l2_norm(
+    acts,
+    out_path,
+    title,
+):
+    """Bar plot: per-token L2 norm of rms_in."""
+    if "rms_in" not in acts:
+        return False
+
+    rms_in = np.asarray(acts["rms_in"], dtype=np.float32)
+    if rms_in.ndim != 2:
+        return False
+
+    T = int(rms_in.shape[0])
+    xpos = np.arange(T, dtype=np.float64)
+    l2_norms = np.linalg.norm(rms_in, axis=1)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7.0, 4.0))
+    bar_colors = ["#e74c3c"] + ["#888888"] * (T - 1)
+    ax.bar(xpos, l2_norms, width=0.6, color=bar_colors, alpha=0.90, edgecolor="none")
+
+    y_hi = float(np.max(l2_norms))
+    y_pad = 0.15 * max(EPS, y_hi)
+    ax.set_ylim(0.0, y_hi + y_pad)
+    ax.set_xticks(xpos)
+    ax.set_xticklabels([str(int(t)) for t in range(T)], fontsize=8)
+    ax.set_xlabel("token idx", fontsize=9)
+    ax.set_ylabel("L2 norm", fontsize=9)
+    ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.975])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _collect_residual_stream_components(model, tokenized, target, max_tok=9):
+    """Collect mean of each residual-stream component up to a target point.
+
+    target: str like "mlp.1" or "attn.2".
+      "mlp.L"  -> components are embed, attn0, mlp0, ..., attnL, sum  (sum = rms_in of mlp.L)
+      "attn.L" -> components are embed, attn0, mlp0, ..., mlp{L-1}, sum  (sum = input to attn.L's layernorm)
+
+    Returns dict with "component_names" (ordered list), each name -> (T, D) array, and "n".
+    """
+    kind, L = target.split(".")
+    L = int(L)
+    cache = {}
+    handles = []
+
+    if kind == "mlp":
+        # Need attn0..attnL and mlp0..mlp{L-1}
+        max_attn = L
+        max_mlp = L - 1
+    elif kind == "attn":
+        # Need attn0..attn{L-1} and mlp0..mlp{L-1}
+        max_attn = L - 1
+        max_mlp = L - 1
+    else:
+        raise ValueError(f"target must be 'mlp.L' or 'attn.L', got {target!r}")
+
+    for li in range(max(max_attn, max_mlp) + 1):
+        blk = model.model.layers[li]
+
+        if li <= max_attn:
+            def _attn_hook(_module, inputs, output, _li=li, _cache=cache):
+                _cache[f"attn{_li}_out"] = output[0].detach()
+            h_a = blk.self_attn.register_forward_hook(_attn_hook)
+            handles.append(h_a)
+
+        if li <= max_mlp:
+            def _mlp_hook(_module, inputs, output, _li=li, _cache=cache):
+                _cache[f"mlp{_li}_out"] = output.detach()
+            h_m = blk.mlp.register_forward_hook(_mlp_hook)
+            handles.append(h_m)
+
+    # Build ordered component names
+    comp_names = ["embed"]
+    for li in range(max(max_attn, max_mlp) + 1):
+        if li <= max_attn:
+            comp_names.append(f"attn{li}_out")
+        if li <= max_mlp:
+            comp_names.append(f"mlp{li}_out")
+    comp_names.append("sum")
+
+    accs = {name: None for name in comp_names}
+    n = 0
+
+    try:
+        for input_ids, base_pos in tqdm(
+            tokenized, desc=f"Collecting residual stream components up to {target}",
+        ):
+            cache.clear()
+            T = min(max_tok, input_ids.shape[1])
+            input_ids_t = input_ids[:, :T]
+            base_pos_t = base_pos[:, :T]
+
+            with torch.no_grad():
+                emb = model.model.embed_tokens(input_ids_t)
+                emb = emb[0, :, :].to(dtype=torch.float32)
+
+            _ = prefill(model, input_ids_t, base_pos_t)
+
+            # Check all expected keys present
+            expected_keys = [k for k in comp_names if k not in ("embed", "sum")]
+            if not all(k in cache for k in expected_keys):
+                continue
+
+            vals = {"embed": emb.cpu()}
+            residual = emb.cpu().clone()
+            for k in expected_keys:
+                v = cache[k][0, :, :].to(dtype=torch.float32).cpu()
+                vals[k] = v
+                residual = residual + v
+            vals["sum"] = residual
+
+            for name in comp_names:
+                v = vals[name]
+                if accs[name] is None:
+                    accs[name] = torch.zeros_like(v)
+                accs[name] += v
+            n += 1
+
+        if n == 0:
+            return None
+
+        result = {"n": n, "component_names": comp_names}
+        for name in comp_names:
+            result[name] = (accs[name] / float(n)).detach().cpu().numpy().astype(np.float32)
+        return result
+    finally:
+        for h in handles:
+            h.remove()
+
+
+def _collect_embed_and_post_attn(model, tokenized, layer_idx, max_tok=9):
+    """Collect mean embedding and post-attention residual (embed + attn_out) per token."""
+    L = int(layer_idx)
+    blk = model.model.layers[L]
+
+    cache = {}
+    handles = []
+
+    def _attn_hook(_module, inputs, output, _cache=cache):
+        # input to the attention block's layernorm is the residual
+        attn_out = output[0].detach()  # attention output (before residual add)
+        _cache["attn_out"] = attn_out
+
+    def _ln_prehook(_module, args, _cache=cache):
+        # pre-hook on post_attention_layernorm sees residual + attn_out
+        _cache["post_attn_residual"] = args[0].detach()
+
+    h1 = blk.self_attn.register_forward_hook(_attn_hook)
+    h2 = blk.post_attention_layernorm.register_forward_pre_hook(_ln_prehook)
+    handles.extend([h1, h2])
+
+    embed_acc = None
+    attn_out_acc = None
+    post_attn_acc = None
+    n = 0
+
+    try:
+        for input_ids, base_pos in tqdm(
+            tokenized, desc=f"Collecting embed+post_attn at L={L}",
+        ):
+            cache.clear()
+            T = min(max_tok, input_ids.shape[1])
+            input_ids_t = input_ids[:, :T]
+            base_pos_t = base_pos[:, :T]
+
+            with torch.no_grad():
+                emb = model.model.embed_tokens(input_ids_t)  # (1, T, D)
+                emb = emb[0, :, :].to(dtype=torch.float32)  # (T, D)
+
+            _ = prefill(model, input_ids_t, base_pos_t)
+
+            if "post_attn_residual" not in cache or "attn_out" not in cache:
+                continue
+
+            attn_out = cache["attn_out"][0, :, :].to(dtype=torch.float32)  # (T, D)
+            post_attn = cache["post_attn_residual"][0, :, :].to(dtype=torch.float32)  # (T, D)
+
+            if embed_acc is None:
+                embed_acc = torch.zeros_like(emb)
+                attn_out_acc = torch.zeros_like(attn_out)
+                post_attn_acc = torch.zeros_like(post_attn)
+            embed_acc += emb
+            attn_out_acc += attn_out
+            post_attn_acc += post_attn
+            n += 1
+
+        if n == 0:
+            return None
+
+        return {
+            "embed": (embed_acc / float(n)).detach().cpu().numpy().astype(np.float32),
+            "attn_out": (attn_out_acc / float(n)).detach().cpu().numpy().astype(np.float32),
+            "post_attn": (post_attn_acc / float(n)).detach().cpu().numpy().astype(np.float32),
+            "n": n,
+        }
+    finally:
+        for h in handles:
+            h.remove()
+
+
+def _find_tok0_small_dims(post_attn, ratio=0.25):
+    """Find dims where |tok0| < ratio * mean(|tok1..T|)."""
+    pa = np.asarray(post_attn, dtype=np.float32)
+    T = int(pa.shape[0])
+    if T < 2:
+        return []
+    abs_tok0 = np.abs(pa[0, :])
+    abs_others_mean = np.mean(np.abs(pa[1:, :]), axis=0)
+    mask = abs_tok0 < ratio * abs_others_mean
+    # rank by how large the others are (most interesting first)
+    candidates = np.where(mask)[0].tolist()
+    candidates.sort(key=lambda d: -float(abs_others_mean[d]))
+    return candidates
+
+
+def _plot_dim_after_attn(pack, dims, out_path, title):
+    """Bar plot: each residual stream component at given dims, stacked vertically.
+
+    pack: dict from _collect_residual_stream_components.
+    """
+    comp_names = pack["component_names"]
+    n_comps = len(comp_names)
+    n_dims = len(dims)
+    if n_dims < 1:
+        return False
+
+    T = int(pack["embed"].shape[0])
+
+    # Color palette
+    base_colors = [
+        "#3498db",  # blue - embed
+        "#2ecc71",  # green - attn
+        "#e67e22",  # orange - mlp
+        "#9b59b6",  # purple - attn
+        "#1abc9c",  # teal - mlp
+        "#e74c3c",  # red - attn
+        "#f39c12",  # yellow - mlp
+        "#34495e",  # dark gray - attn
+        "#d35400",  # dark orange - mlp
+        "#8e44ad",  # dark purple - attn
+        "#16a085",  # dark teal - mlp
+    ]
+    colors = []
+    ci = 0
+    for name in comp_names:
+        if name == "sum":
+            colors.append("#2c3e50")
+        else:
+            colors.append(base_colors[ci % len(base_colors)])
+            ci += 1
+
+    fig, axes = plt.subplots(n_dims, 1,
+                             figsize=(max(8.0, 1.2 * T), max(4.0, 3.5 * n_dims)),
+                             squeeze=False)
+
+    xpos = np.arange(T, dtype=np.float64)
+    width = 0.8 / n_comps
+
+    for pi, dim_idx in enumerate(dims):
+        dim_idx = int(dim_idx)
+        ax = axes[pi, 0]
+
+        all_vals = []
+        for bi, name in enumerate(comp_names):
+            vals = np.asarray(pack[name][:, dim_idx], dtype=np.float32)
+            all_vals.append(vals)
+            offset = (bi - (n_comps - 1) / 2.0) * width
+            ax.bar(xpos + offset, vals, width=width, color=colors[bi],
+                   alpha=0.90, edgecolor="none",
+                   label=name if pi == 0 else None)
+
+        ax.axhline(0.0, color="black", linewidth=0.8, zorder=3)
+
+        concat = np.concatenate(all_vals)
+        y_lo = float(np.min(concat))
+        y_hi = float(np.max(concat))
+        y_span = max(EPS, y_hi - y_lo)
+        y_pad = 0.20 * y_span
+        ax.set_ylim(y_lo - y_pad, y_hi + y_pad)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels([str(int(t)) for t in range(T)], fontsize=8)
+        ax.set_xlabel("token idx", fontsize=9)
+        ax.set_ylabel("value", fontsize=9)
+        ax.set_title(f"dim {dim_idx}", fontsize=10)
+        ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
+
+    axes[0, 0].legend(loc="best", frameon=False, fontsize=7, ncol=min(n_comps, 4))
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.02, 0.99, 0.975])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
 
 def _plot_projection_histogram_before_after_stacked(
     p_before_list,
@@ -3080,7 +4190,7 @@ def main():
     p.add_argument("--model", default="Qwen/Qwen3-8B")
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="bf16", choices=["auto", "bf16", "fp16", "fp32"])
-    p.add_argument("--prompt-file", default="prompt_sets_v512_t32/natural_mixed_shuffled.txt")
+    p.add_argument("--prompt-file", default="prompt_sets_v512_t32/natural_mixed.txt")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--head", type=int, default=0)
     # scanning mode
@@ -3107,6 +4217,12 @@ def main():
     p.add_argument("--mlp", nargs="+", choices=["z", "g", "g-row", "g-sign", "u", "residual"], default=None, help="When --find-mlp-subspace, choose which sections to print")
     p.add_argument("--pca-topk", type=int, default=6, help="Top-k PCA for groups of vectors")
     p.add_argument("--plot-activations", default=None, help="Plot 3D activations for mlp.L or attn.L")
+    p.add_argument("--plot-dim-after-attn", type=str, nargs="+", default=None,
+                   help="Residual stream decomposition. First arg is target like 'mlp.1' or 'attn.2', rest are dim indices.")
+    p.add_argument("--plot-down-out-contrib", type=int, nargs="+", default=None,
+                   help="For --layer L, show top down_in contributors to given output dims of down_proj.")
+    p.add_argument("--plot-attn-cos", action="store_true",
+                   help="For --layer L, plot cosine similarity of attn_out and embed vectors vs tok0.")
     p.add_argument(
         "--max-keep",
         type=int,
@@ -3132,8 +4248,12 @@ def main():
     tokenized = []
     for text in prompts:
         input_ids = tokenize(tok, text)
+        # Shuffle tokens to remove positional bias from sentence structure
+        perm = torch.randperm(input_ids.shape[1])
+        input_ids = input_ids[:, perm]
         base_pos = make_position_ids(input_ids.shape[1])
         tokenized.append((input_ids, base_pos))
+    print(f"[Tokenized] Shuffled tokens within each prompt")
     print(f"[Tokenized] Tokens[0, 0] is {tokenized[0][0][0, 0]}")
     print(f"[Tokenized] Tokens[0, 0] text is {tok.decode(tokenized[0][0][0, 0])}")
 
@@ -3173,6 +4293,29 @@ def main():
             )
             print(f"[plot_activation] Saved grid to {out_path}")
 
+            # rms_out outlier dims (tok0 special) — trace back to rms_in
+            rms_out_arr = np.asarray(acts["rms_out"], dtype=np.float32)
+            rms_out_outliers = _filter_ranked_act_outliers_by_top1(
+                rms_out_arr,
+                _rank_act_outlier_dims(rms_out_arr, mult_global=50.0, mult_dim=5.0),
+                0.10,
+            )
+            rms_out_outliers = [int(d) for d in rms_out_outliers[:4]]
+            if rms_out_outliers:
+                out_path_rms_tok0 = os.path.join(
+                    args.outdir,
+                    f"activations_mlp_rms_tok0_outlier_dims_L{Lp}.png"
+                )
+                saved_rms_tok0 = _plot_mlp_rms_dim_across_tokens(
+                    acts=acts,
+                    dims=rms_out_outliers,
+                    out_path=out_path_rms_tok0,
+                    title=f"rms_in vs rms_out at tok0 outlier dims @ L={Lp} (N={pack['n']})",
+                )
+                if saved_rms_tok0:
+                    print(f"[plot_activation] rms_out tok0 outlier dims: {rms_out_outliers}")
+                    print(f"[plot_activation] Saved rms tok0 outlier dims to {out_path_rms_tok0}")
+
             out_path_bar_plot_outlier = os.path.join(
                 args.outdir,
                 f"activations_mlp_downproj_outlier_contrib_stacked_L{Lp}.png"
@@ -3186,7 +4329,181 @@ def main():
             if saved_outlier:
                 print(f"[plot_activation] Saved bar plot outlier contrib stacked to {out_path_bar_plot_outlier}")
 
+            out_path_down_in_decomp = os.path.join(
+                args.outdir,
+                f"activations_mlp_down_in_decomp_L{Lp}.png"
+            )
+            saved_decomp = _plot_mlp_down_in_decomposition(
+                acts=acts,
+                out_path=out_path_down_in_decomp,
+                title=f"MLP down_in outlier decomposition @ L={Lp} (N={pack['n']})",
+            )
+            if saved_decomp:
+                print(f"[plot_activation] Saved down_in decomposition to {out_path_down_in_decomp}")
+
+            out_path_upgate = os.path.join(
+                args.outdir,
+                f"activations_mlp_upgate_proj_contrib_L{Lp}.png"
+            )
+            special_rms_dims = _plot_mlp_upgate_proj_contrib_for_down_in(
+                acts=acts,
+                projs=projs,
+                out_path=out_path_upgate,
+                title=f"MLP up/gate_proj contrib at down_in outlier dims @ L={Lp} (N={pack['n']})",
+            )
+            if special_rms_dims:
+                print(f"[plot_activation] Saved up/gate proj contrib to {out_path_upgate}")
+                print(f"[plot_activation] Special rms_out dims for non-tok0: {special_rms_dims}")
+                dim_str = " ".join(str(d) for d in special_rms_dims)
+                print(f"[plot_activation] Tip: try --plot-dim-after-attn mlp.{Lp} {dim_str} to trace further")
+
+                out_path_rms = os.path.join(
+                    args.outdir,
+                    f"activations_mlp_rms_special_dims_L{Lp}.png"
+                )
+                saved_rms = _plot_mlp_rms_dim_across_tokens(
+                    acts=acts,
+                    dims=special_rms_dims,
+                    out_path=out_path_rms,
+                    title=f"rms_in vs rms_out at non-tok0 special dims @ L={Lp} (N={pack['n']})",
+                )
+                if saved_rms:
+                    print(f"[plot_activation] Saved rms special dims to {out_path_rms}")
+            else:
+                print(f"[plot_activation] No special rms_out dims found for non-tok0, skipped rms plot")
+
+            out_path_l2 = os.path.join(
+                args.outdir,
+                f"activations_mlp_rms_in_l2_norm_L{Lp}.png"
+            )
+            saved_l2 = _plot_mlp_rms_in_l2_norm(
+                acts=acts,
+                out_path=out_path_l2,
+                title=f"rms_in L2 norm per token @ L={Lp} (N={pack['n']})",
+            )
+            if saved_l2:
+                print(f"[plot_activation] Saved rms_in L2 norm to {out_path_l2}")
+
             return
+
+    if args.plot_dim_after_attn:
+        # First arg is target like "mlp.1" or "attn.2", rest are dim indices
+        target = args.plot_dim_after_attn[0]
+        if "." not in target:
+            raise ValueError("First arg to --plot-dim-after-attn must be target like 'mlp.1' or 'attn.2'")
+        dims = [int(d) for d in args.plot_dim_after_attn[1:]]
+        if not dims:
+            print("[plot_dim_after_attn] No dims specified, skipped")
+            return
+
+        pack = _collect_residual_stream_components(model, tokenized, target, max_tok=9)
+        if pack is None:
+            raise RuntimeError("Failed to collect residual stream components")
+
+        dim_str = "_".join(str(d) for d in dims)
+        out_path = os.path.join(
+            args.outdir,
+            f"residual_decomp_{target}_{dim_str}.png"
+        )
+        saved = _plot_dim_after_attn(
+            pack=pack,
+            dims=dims,
+            out_path=out_path,
+            title=f"residual stream decomposition up to {target} (N={pack['n']})",
+        )
+        if saved:
+            print(f"[plot_dim_after_attn] Saved to {out_path}")
+        return
+
+    if args.plot_attn_cos:
+        Lp = args.layer
+        if Lp is None:
+            raise ValueError("--plot-attn-cos requires --layer L")
+        target = f"mlp.{Lp}"
+        pack = _collect_residual_stream_components(model, tokenized, target, max_tok=9)
+        if pack is None:
+            raise RuntimeError("Failed to collect residual stream components")
+
+        out_path = os.path.join(
+            args.outdir,
+            f"attn_cos_L{Lp}.png"
+        )
+        saved = _plot_attn_cos(
+            pack=pack,
+            out_path=out_path,
+            title=f"cosine similarity vs tok0 @ components up to mlp.{Lp} (N={pack['n']})",
+        )
+        if saved:
+            print(f"[plot_attn_cos] Saved to {out_path}")
+        return
+
+    if args.plot_down_out_contrib:
+        Lp = args.layer
+        if Lp is None:
+            raise ValueError("--plot-down-out-contrib requires --layer L")
+        out_dims = [int(d) for d in args.plot_down_out_contrib]
+
+        pack = _collect_mlp_grid_mean_tensors(model, tokenized, Lp, max_tok=9)
+        if pack is None:
+            raise RuntimeError("Failed to collect MLP data")
+
+        dim_str = "_".join(str(d) for d in out_dims)
+        out_path = os.path.join(
+            args.outdir,
+            f"down_out_contrib_L{Lp}_{dim_str}.png"
+        )
+        saved = _plot_down_out_contrib_for_dims(
+            acts=pack["acts"],
+            projs=pack["projs"],
+            out_dims=out_dims,
+            out_path=out_path,
+            title=f"down_proj contribution to output dims {out_dims} @ mlp.{Lp} (N={pack['n']})",
+        )
+        if saved:
+            print(f"[plot_down_out_contrib] Saved to {out_path}")
+
+        out_path_ma = os.path.join(
+            args.outdir,
+            f"down_out_mag_align_L{Lp}_{dim_str}.png"
+        )
+        saved_ma = _plot_down_out_magnitude_alignment(
+            acts=pack["acts"],
+            projs=pack["projs"],
+            out_dims=out_dims,
+            out_path=out_path_ma,
+            title=f"down_out magnitude vs alignment @ mlp.{Lp} (N={pack['n']})",
+        )
+        if saved_ma:
+            print(f"[plot_down_out_contrib] Saved mag/align to {out_path_ma}")
+
+        out_path_gate = os.path.join(
+            args.outdir,
+            f"down_out_gate_analysis_L{Lp}_{dim_str}.png"
+        )
+        saved_gate = _plot_down_out_gate_analysis(
+            acts=pack["acts"],
+            projs=pack["projs"],
+            out_dims=out_dims,
+            out_path=out_path_gate,
+            title=f"gate analysis for down_out dims {out_dims} @ mlp.{Lp} (N={pack['n']})",
+        )
+        if saved_gate:
+            print(f"[plot_down_out_contrib] Saved gate analysis to {out_path_gate}")
+
+        out_path_sel = os.path.join(
+            args.outdir,
+            f"down_out_gate_selectivity_L{Lp}_{dim_str}.png"
+        )
+        saved_sel = _plot_gate_selectivity(
+            acts=pack["acts"],
+            projs=pack["projs"],
+            out_dims=out_dims,
+            out_path=out_path_sel,
+            title=f"gate selectivity for down_out dims {out_dims} @ mlp.{Lp} (N={pack['n']})",
+        )
+        if saved_sel:
+            print(f"[plot_down_out_contrib] Saved gate selectivity to {out_path_sel}")
+        return
 
     min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
     last_q = min_len - 1
