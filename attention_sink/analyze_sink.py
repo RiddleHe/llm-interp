@@ -2507,12 +2507,21 @@ def _collect_gate_with_ablation(
     model,
     tokenized,
     layer_idx,
-    attn_ablate_idxs,
+    attn_ablate_idxs=None,
+    projs=None,
+    out_dims=None,
     max_tok=9,
 ):
-    """Collect gate_out with self-attend-only ablation on specified attn layers.
+    """Collect gate_out, optionally with self-attend-only ablation.
 
-    Returns dict with 'gate_pos_frac' (T, d_ffn) — per-sample frac(gate>0).
+    If attn_ablate_idxs is None or empty, collects under normal causal attention.
+
+    Returns dict with:
+      'gate_pos_frac' (T, d_ffn) — per-dim frac(gate>0)
+      'n' — sample count
+    If projs and out_dims provided, also returns per-sample energy fractions:
+      'up_efrac'   — {odim: {k: (T,) array}} mean-of-per-sample up^2 energy frac
+      'gate_efrac' — {odim: {k: (T,) array}} mean-of-per-sample SiLU(gate)^2 energy frac
     """
     L = int(layer_idx)
     blk = model.model.layers[L]
@@ -2525,15 +2534,37 @@ def _collect_gate_with_ablation(
             _c["up_out"] = _mod.up_proj(x).detach()
 
     h_mlp = blk.mlp.register_forward_hook(_mlp_hook)
-    ablate_handles = _install_self_attend_only_hooks(model, attn_ablate_idxs)
+    ablate_handles = []
+    if attn_ablate_idxs:
+        ablate_handles = _install_self_attend_only_hooks(model, attn_ablate_idxs)
+    desc = f"Collecting gate (ablated attn {attn_ablate_idxs})" if attn_ablate_idxs else f"Collecting gate (original)"
 
     gate_pos_acc = None
-    up_out_acc = None
     n = 0
+
+    # Precompute W_down top-k rankings if needed
+    ks = [10, 20, 50, 100, 200, 500]
+    w_tops = {}  # odim -> np array of sorted indices
+    if projs is not None and out_dims is not None:
+        W_down = np.asarray(projs["down_proj"], dtype=np.float32)
+        for odim in out_dims:
+            w_row = W_down[int(odim), :]
+            w_tops[int(odim)] = np.argsort(-np.abs(w_row))
+
+    # Accumulators for per-sample energy fractions
+    up_efrac_acc = {}    # {odim: {k: np array (max_tok,)}}
+    gate_efrac_acc = {}  # same
+    for odim in (out_dims or []):
+        odim = int(odim)
+        up_efrac_acc[odim] = {k: np.zeros(max_tok) for k in ks}
+        gate_efrac_acc[odim] = {k: np.zeros(max_tok) for k in ks}
+
+    def _silu_np(x):
+        return x / (1.0 + np.exp(-np.clip(x, -50, 50)))
 
     try:
         for input_ids, base_pos in tqdm(
-            tokenized, desc=f"Collecting gate (ablated attn {attn_ablate_idxs})",
+            tokenized, desc=desc,
         ):
             cache.clear()
             T = min(max_tok, input_ids.shape[1])
@@ -2541,19 +2572,50 @@ def _collect_gate_with_ablation(
             if "gate_out" not in cache:
                 continue
 
-            go = cache["gate_out"][0, :T, :].float()
+            go = cache["gate_out"][0, :T, :].float().cpu().numpy()
             uo = cache["up_out"][0, :T, :].float().cpu().numpy()
-            pos = (go > 0).float().cpu().numpy()
+            pos = (go > 0).astype(np.float32)
             if gate_pos_acc is None:
                 gate_pos_acc = np.zeros_like(pos)
-                up_out_acc = np.zeros_like(uo)
             gate_pos_acc += pos
-            up_out_acc += uo
+
+            # Accumulate per-sample energy fractions
+            for odim in (out_dims or []):
+                odim = int(odim)
+                w_top = w_tops[odim]
+                for t in range(T):
+                    # up_out energy fraction
+                    up_energy = uo[t] ** 2
+                    up_total = np.sum(up_energy)
+                    if up_total > 1e-20:
+                        for k in ks:
+                            up_efrac_acc[odim][k][t] += np.sum(up_energy[w_top[:k]]) / up_total
+
+                    # SiLU(gate) energy fraction
+                    sg = _silu_np(go[t])
+                    gate_energy = sg ** 2
+                    gate_total = np.sum(gate_energy)
+                    if gate_total > 1e-20:
+                        for k in ks:
+                            gate_efrac_acc[odim][k][t] += np.sum(gate_energy[w_top[:k]]) / gate_total
+
             n += 1
 
         if n == 0:
             return None
-        return {"gate_pos_frac": gate_pos_acc / n, "up_out": up_out_acc / n, "n": n}
+
+        result = {"gate_pos_frac": gate_pos_acc / n, "n": n}
+        if out_dims is not None:
+            result["up_efrac"] = {
+                odim: {k: up_efrac_acc[int(odim)][k] / n for k in ks}
+                for odim in out_dims
+            }
+            result["gate_efrac"] = {
+                odim: {k: gate_efrac_acc[int(odim)][k] / n for k in ks}
+                for odim in out_dims
+            }
+            result["ks"] = ks
+        return result
 
     finally:
         h_mlp.remove()
@@ -2561,106 +2623,103 @@ def _collect_gate_with_ablation(
             h.remove()
 
 
-def _plot_gate_ablation_comparison(
-    orig_gate_pos_frac,
-    ablated_gate_pos_frac,
-    orig_up_out_mean,
-    ablated_up_out_mean,
+def _plot_contribution_analysis(
+    orig_data,
+    ablated_data,
     projs,
     out_dims,
     attn_ablate_idxs,
     out_path,
     title,
-    n_orig,
-    n_ablated,
+    max_tok=9,
 ):
-    """Compare frac(gate>0) before and after self-attend-only ablation.
+    """Activation-only energy fractions and frac(gate>0) at W_down top-k.
 
-    Two panels per output dim:
-      Left:  frac(gate>0) at W_down top-k dims (shared ranking for all tokens)
-      Right: up_out energy fraction at W_down top-k dims
-    Original = solid, ablated = dashed.
+    Three panels per output dim (all use mean-of-per-sample):
+      Left:   up_out energy fraction at W_down top-k dims
+      Middle: SiLU(gate) energy fraction at W_down top-k dims
+      Right:  frac(gate > 0) at W_down top-k dims
+    Baseline: k/d_ffn (left, middle) or 0.5 (right).
     """
     W_down = np.asarray(projs["down_proj"], dtype=np.float32)
-    T, d_ffn = orig_gate_pos_frac.shape
+    d_model, d_ffn = W_down.shape
+    T = orig_data["gate_pos_frac"].shape[0]
     toks = [0, 1, 4, 8]
     toks = [t for t in toks if t < T]
     tok_colors = {0: "#e74c3c", 1: "#666666", 4: "#999999", 8: "#bbbbbb"}
 
-    n_dims = len(out_dims)
-    fig, axes = plt.subplots(n_dims, 2, figsize=(14.0, 5.5 * n_dims), squeeze=False)
+    ks = orig_data.get("ks", [10, 20, 50, 100, 200, 500])
 
-    ks = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, d_ffn]
-    ks = [k for k in ks if k <= d_ffn]
+    n_dims = len(out_dims)
+    fig, axes = plt.subplots(n_dims, 3, figsize=(21.0, 6.0 * n_dims), squeeze=False)
 
     for di, odim in enumerate(out_dims):
         odim = int(odim)
         w_row = W_down[odim, :]
+        w_top = np.argsort(-np.abs(w_row))
 
-        # Shared ranking by |W_down[odim, d]| only
-        w_top = np.argsort(-np.abs(w_row)).tolist()
+        # Baseline: uniform → k/d_ffn
+        baseline = [k / d_ffn for k in ks]
 
-        # ---- Left panel: W_down-only ranking (shared) ----
+        # ---- Left: up_out energy fraction ----
         ax = axes[di, 0]
         for t in toks:
-            fracs_orig = [float(np.mean(orig_gate_pos_frac[t, w_top[:k]])) for k in ks]
-            fracs_abl = [float(np.mean(ablated_gate_pos_frac[t, w_top[:k]])) for k in ks]
-
-            color = tok_colors.get(t, "#aaaaaa")
-            ax.plot(range(len(ks)), fracs_orig, marker="o", markersize=4,
-                    linestyle="-", color=color, alpha=0.85,
-                    label=f"tok{t} original")
-            ax.plot(range(len(ks)), fracs_abl, marker="s", markersize=4,
-                    linestyle="--", color=color, alpha=0.6,
-                    label=f"tok{t} self-attn only")
-
+            for data, ls, suffix in [(orig_data, "-", "original"), (ablated_data, "--", "self-attn")]:
+                vals = [float(data["up_efrac"][odim][k][t]) for k in ks]
+                color = tok_colors.get(t, "#aaaaaa")
+                ax.plot(range(len(ks)), vals, marker="o" if ls == "-" else "s",
+                        markersize=4, linestyle=ls, color=color,
+                        alpha=0.85 if ls == "-" else 0.6,
+                        label=f"tok{t} {suffix}")
+        ax.plot(range(len(ks)), baseline, marker="x", markersize=5,
+                linestyle=":", color="#2ecc71", linewidth=2, alpha=0.8,
+                label="uniform (k/d_ffn)")
         ax.set_xticks(range(len(ks)))
-        ax.set_xticklabels(
-            [str(k) if k < d_ffn else "all" for k in ks],
-            fontsize=7, rotation=45)
-        ax.set_title(f"dim {odim}: W_down-only ranking (shared)", fontsize=10)
-        ax.set_xlabel(f"top-k by |W_down[{odim},d]| only")
-        ax.set_ylabel("frac(gate > 0)", fontsize=8)
+        ax.set_xticklabels([str(k) for k in ks], fontsize=8, rotation=45)
+        ax.set_title(f"dim {odim}: up_out energy frac at W_down top-k", fontsize=10)
+        ax.set_xlabel(f"top-k by |W_down[{odim},d]|")
+        ax.set_ylabel("energy fraction", fontsize=8)
         ax.grid(True, linewidth=0.3, alpha=0.3)
         ax.legend(fontsize=6, ncol=2, loc="best", frameon=False)
 
-        # ---- Right panel: up_out energy fraction at W_down top-k ----
+        # ---- Middle: SiLU(gate) energy fraction ----
         ax = axes[di, 1]
         for t in toks:
-            contrib_orig = (orig_up_out_mean[t, :] * w_row) ** 2
-            total_orig = np.sum(contrib_orig)
-            efrac_orig = [float(np.sum(contrib_orig[w_top[:k]]) / total_orig)
-                          if total_orig > 0 else 0.0 for k in ks]
-
-            contrib_abl = (ablated_up_out_mean[t, :] * w_row) ** 2
-            total_abl = np.sum(contrib_abl)
-            efrac_abl = [float(np.sum(contrib_abl[w_top[:k]]) / total_abl)
-                         if total_abl > 0 else 0.0 for k in ks]
-
-            color = tok_colors.get(t, "#aaaaaa")
-            ax.plot(range(len(ks)), efrac_orig, marker="o", markersize=4,
-                    linestyle="-", color=color, alpha=0.85,
-                    label=f"tok{t} original")
-            ax.plot(range(len(ks)), efrac_abl, marker="s", markersize=4,
-                    linestyle="--", color=color, alpha=0.6,
-                    label=f"tok{t} self-attn only")
-
-        # W_down-only energy baseline (no up_out)
-        w_energy = w_row ** 2
-        w_total = np.sum(w_energy)
-        efrac_w = [float(np.sum(w_energy[w_top[:k]]) / w_total) for k in ks]
-        ax.plot(range(len(ks)), efrac_w, marker="x", markersize=4,
-                linestyle=":", color="#2ecc71", alpha=0.7,
-                label="W_down only")
-
+            for data, ls, suffix in [(orig_data, "-", "original"), (ablated_data, "--", "self-attn")]:
+                vals = [float(data["gate_efrac"][odim][k][t]) for k in ks]
+                color = tok_colors.get(t, "#aaaaaa")
+                ax.plot(range(len(ks)), vals, marker="o" if ls == "-" else "s",
+                        markersize=4, linestyle=ls, color=color,
+                        alpha=0.85 if ls == "-" else 0.6,
+                        label=f"tok{t} {suffix}")
+        ax.plot(range(len(ks)), baseline, marker="x", markersize=5,
+                linestyle=":", color="#2ecc71", linewidth=2, alpha=0.8,
+                label="uniform (k/d_ffn)")
         ax.set_xticks(range(len(ks)))
-        ax.set_xticklabels(
-            [str(k) if k < d_ffn else "all" for k in ks],
-            fontsize=7, rotation=45)
-        ax.set_title(f"dim {odim}: up_out energy at W_down top-k", fontsize=10)
-        ax.set_xlabel(f"top-k by |W_down[{odim},d]| only")
-        ax.set_ylabel("energy fraction: Σ(up*W)² / total", fontsize=8)
-        ax.set_ylim(-0.05, 1.05)
+        ax.set_xticklabels([str(k) for k in ks], fontsize=8, rotation=45)
+        ax.set_title(f"dim {odim}: SiLU(gate) energy frac at W_down top-k", fontsize=10)
+        ax.set_xlabel(f"top-k by |W_down[{odim},d]|")
+        ax.set_ylabel("energy fraction", fontsize=8)
+        ax.grid(True, linewidth=0.3, alpha=0.3)
+        ax.legend(fontsize=6, ncol=2, loc="best", frameon=False)
+
+        # ---- Right: frac(gate > 0) ----
+        ax = axes[di, 2]
+        for t in toks:
+            for data, ls, suffix in [(orig_data, "-", "original"), (ablated_data, "--", "self-attn")]:
+                fracs = [float(np.mean(data["gate_pos_frac"][t, w_top[:k]])) for k in ks]
+                color = tok_colors.get(t, "#aaaaaa")
+                ax.plot(range(len(ks)), fracs, marker="o" if ls == "-" else "s",
+                        markersize=4, linestyle=ls, color=color,
+                        alpha=0.85 if ls == "-" else 0.6,
+                        label=f"tok{t} {suffix}")
+        ax.axhline(0.5, color="#2ecc71", linestyle=":", linewidth=2, alpha=0.8,
+                    label="chance (0.5)")
+        ax.set_xticks(range(len(ks)))
+        ax.set_xticklabels([str(k) for k in ks], fontsize=8, rotation=45)
+        ax.set_title(f"dim {odim}: frac(gate > 0) at W_down top-k", fontsize=10)
+        ax.set_xlabel(f"top-k by |W_down[{odim},d]|")
+        ax.set_ylabel("frac(gate > 0)", fontsize=8)
         ax.grid(True, linewidth=0.3, alpha=0.3)
         ax.legend(fontsize=6, ncol=2, loc="best", frameon=False)
 
@@ -4894,33 +4953,34 @@ def main():
         print(f"[plot_down_out_contrib] Saved weight distribution to {out_path_wd}")
 
         if args.recalculate_attn:
+            print(f"[plot_down_out_contrib] Collecting original gate/up energy fractions...")
+            orig_contrib = _collect_gate_with_ablation(
+                model, tokenized, Lp,
+                attn_ablate_idxs=None,
+                projs=pack["projs"], out_dims=out_dims,
+            )
             print(f"[plot_down_out_contrib] Running self-attend-only ablation on attn layers {args.recalculate_attn}...")
             ablated = _collect_gate_with_ablation(
                 model, tokenized, Lp, args.recalculate_attn,
+                projs=pack["projs"], out_dims=out_dims,
             )
-            if ablated:
-                ablate_str = "_".join(str(i) for i in args.recalculate_attn)
-                out_path_abl = os.path.join(
+            if orig_contrib and ablated:
+                out_path_contrib = os.path.join(
                     args.outdir,
-                    f"gate_ablation_selfattn_L{Lp}_{dim_str}.png",
+                    f"contribution_analysis_L{Lp}_{dim_str}.png",
                 )
-                _plot_gate_ablation_comparison(
-                    orig_gate_pos_frac=pack["acts"]["gate_pos_frac"],
-                    ablated_gate_pos_frac=ablated["gate_pos_frac"],
-                    orig_up_out_mean=pack["acts"]["up_out"],
-                    ablated_up_out_mean=ablated["up_out"],
+                _plot_contribution_analysis(
+                    orig_data=orig_contrib,
+                    ablated_data=ablated,
                     projs=pack["projs"],
                     out_dims=out_dims,
                     attn_ablate_idxs=args.recalculate_attn,
-                    out_path=out_path_abl,
-                    title=f"gate ablation: self-attn only at attn {args.recalculate_attn} for dims {out_dims} @ mlp.{Lp}",
-                    n_orig=pack["n"],
-                    n_ablated=ablated["n"],
+                    out_path=out_path_contrib,
+                    title=f"Contribution analysis for dims {out_dims} @ mlp.{Lp}",
                 )
-                print(f"[plot_down_out_contrib] Saved ablation comparison to {out_path_abl}")
-
+                print(f"[plot_down_out_contrib] Saved contribution analysis to {out_path_contrib}")
             else:
-                print("[plot_down_out_contrib] Ablation collection returned no data.")
+                print("[plot_down_out_contrib] Collection returned no data.")
 
         return
 
