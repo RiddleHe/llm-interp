@@ -2459,120 +2459,432 @@ def _plot_down_out_gate_analysis(
     return True
 
 
-def _plot_gate_selectivity(
-    acts,
+
+
+def _install_self_attend_only_hooks(model, attn_layer_idxs):
+    """Install hooks that force specified attention layers to self-attend only.
+
+    Modifies the attention mask so each token can only attend to itself.
+    Returns list of hook handles (caller must remove them).
+    """
+    handles = []
+    for L in attn_layer_idxs:
+        attn_mod = model.model.layers[L].self_attn
+
+        def _mask_hook(_mod, args, kwargs):
+            # attention_mask may be positional arg[2] or keyword
+            args = list(args)
+            mask = None
+            mask_in_kwargs = "attention_mask" in kwargs
+            if len(args) > 2:
+                mask = args[2]
+            elif mask_in_kwargs:
+                mask = kwargs["attention_mask"]
+
+            if mask is not None:
+                T_q = mask.shape[-2]
+                T_k = mask.shape[-1]
+                # Create diagonal-only mask: large negative on off-diagonal
+                diag_mask = torch.full(
+                    (T_q, T_k), torch.finfo(mask.dtype).min,
+                    device=mask.device, dtype=mask.dtype,
+                )
+                for i in range(min(T_q, T_k)):
+                    diag_mask[i, i] = 0.0
+                new_mask = diag_mask.unsqueeze(0).unsqueeze(0).expand_as(mask)
+                if len(args) > 2:
+                    args[2] = new_mask
+                else:
+                    kwargs["attention_mask"] = new_mask
+            return args, kwargs
+
+        h = attn_mod.register_forward_pre_hook(_mask_hook, with_kwargs=True)
+        handles.append(h)
+    return handles
+
+
+def _collect_gate_with_ablation(
+    model,
+    tokenized,
+    layer_idx,
+    attn_ablate_idxs,
+    max_tok=9,
+):
+    """Collect gate_out with self-attend-only ablation on specified attn layers.
+
+    Returns dict with 'gate_pos_frac' (T, d_ffn) — per-sample frac(gate>0).
+    """
+    L = int(layer_idx)
+    blk = model.model.layers[L]
+    cache = {}
+
+    def _mlp_hook(_mod, inputs, output, _c=cache):
+        x = inputs[0]
+        with torch.no_grad():
+            _c["gate_out"] = _mod.gate_proj(x).detach()
+            _c["up_out"] = _mod.up_proj(x).detach()
+
+    h_mlp = blk.mlp.register_forward_hook(_mlp_hook)
+    ablate_handles = _install_self_attend_only_hooks(model, attn_ablate_idxs)
+
+    gate_pos_acc = None
+    up_out_acc = None
+    n = 0
+
+    try:
+        for input_ids, base_pos in tqdm(
+            tokenized, desc=f"Collecting gate (ablated attn {attn_ablate_idxs})",
+        ):
+            cache.clear()
+            T = min(max_tok, input_ids.shape[1])
+            _ = prefill(model, input_ids[:, :T], base_pos[:, :T])
+            if "gate_out" not in cache:
+                continue
+
+            go = cache["gate_out"][0, :T, :].float()
+            uo = cache["up_out"][0, :T, :].float().cpu().numpy()
+            pos = (go > 0).float().cpu().numpy()
+            if gate_pos_acc is None:
+                gate_pos_acc = np.zeros_like(pos)
+                up_out_acc = np.zeros_like(uo)
+            gate_pos_acc += pos
+            up_out_acc += uo
+            n += 1
+
+        if n == 0:
+            return None
+        return {"gate_pos_frac": gate_pos_acc / n, "up_out": up_out_acc / n, "n": n}
+
+    finally:
+        h_mlp.remove()
+        for h in ablate_handles:
+            h.remove()
+
+
+def _plot_gate_ablation_comparison(
+    orig_gate_pos_frac,
+    ablated_gate_pos_frac,
+    orig_up_out_mean,
+    ablated_up_out_mean,
+    projs,
+    out_dims,
+    attn_ablate_idxs,
+    out_path,
+    title,
+    n_orig,
+    n_ablated,
+):
+    """Compare frac(gate>0) before and after self-attend-only ablation.
+
+    Two panels per output dim:
+      Left:  frac(gate>0) at W_down top-k dims (shared ranking for all tokens)
+      Right: up_out energy fraction at W_down top-k dims
+    Original = solid, ablated = dashed.
+    """
+    W_down = np.asarray(projs["down_proj"], dtype=np.float32)
+    T, d_ffn = orig_gate_pos_frac.shape
+    toks = [0, 1, 4, 8]
+    toks = [t for t in toks if t < T]
+    tok_colors = {0: "#e74c3c", 1: "#666666", 4: "#999999", 8: "#bbbbbb"}
+
+    n_dims = len(out_dims)
+    fig, axes = plt.subplots(n_dims, 2, figsize=(14.0, 5.5 * n_dims), squeeze=False)
+
+    ks = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, d_ffn]
+    ks = [k for k in ks if k <= d_ffn]
+
+    for di, odim in enumerate(out_dims):
+        odim = int(odim)
+        w_row = W_down[odim, :]
+
+        # Shared ranking by |W_down[odim, d]| only
+        w_top = np.argsort(-np.abs(w_row)).tolist()
+
+        # ---- Left panel: W_down-only ranking (shared) ----
+        ax = axes[di, 0]
+        for t in toks:
+            fracs_orig = [float(np.mean(orig_gate_pos_frac[t, w_top[:k]])) for k in ks]
+            fracs_abl = [float(np.mean(ablated_gate_pos_frac[t, w_top[:k]])) for k in ks]
+
+            color = tok_colors.get(t, "#aaaaaa")
+            ax.plot(range(len(ks)), fracs_orig, marker="o", markersize=4,
+                    linestyle="-", color=color, alpha=0.85,
+                    label=f"tok{t} original")
+            ax.plot(range(len(ks)), fracs_abl, marker="s", markersize=4,
+                    linestyle="--", color=color, alpha=0.6,
+                    label=f"tok{t} self-attn only")
+
+        ax.set_xticks(range(len(ks)))
+        ax.set_xticklabels(
+            [str(k) if k < d_ffn else "all" for k in ks],
+            fontsize=7, rotation=45)
+        ax.set_title(f"dim {odim}: W_down-only ranking (shared)", fontsize=10)
+        ax.set_xlabel(f"top-k by |W_down[{odim},d]| only")
+        ax.set_ylabel("frac(gate > 0)", fontsize=8)
+        ax.grid(True, linewidth=0.3, alpha=0.3)
+        ax.legend(fontsize=6, ncol=2, loc="best", frameon=False)
+
+        # ---- Right panel: up_out energy fraction at W_down top-k ----
+        ax = axes[di, 1]
+        for t in toks:
+            contrib_orig = (orig_up_out_mean[t, :] * w_row) ** 2
+            total_orig = np.sum(contrib_orig)
+            efrac_orig = [float(np.sum(contrib_orig[w_top[:k]]) / total_orig)
+                          if total_orig > 0 else 0.0 for k in ks]
+
+            contrib_abl = (ablated_up_out_mean[t, :] * w_row) ** 2
+            total_abl = np.sum(contrib_abl)
+            efrac_abl = [float(np.sum(contrib_abl[w_top[:k]]) / total_abl)
+                         if total_abl > 0 else 0.0 for k in ks]
+
+            color = tok_colors.get(t, "#aaaaaa")
+            ax.plot(range(len(ks)), efrac_orig, marker="o", markersize=4,
+                    linestyle="-", color=color, alpha=0.85,
+                    label=f"tok{t} original")
+            ax.plot(range(len(ks)), efrac_abl, marker="s", markersize=4,
+                    linestyle="--", color=color, alpha=0.6,
+                    label=f"tok{t} self-attn only")
+
+        # W_down-only energy baseline (no up_out)
+        w_energy = w_row ** 2
+        w_total = np.sum(w_energy)
+        efrac_w = [float(np.sum(w_energy[w_top[:k]]) / w_total) for k in ks]
+        ax.plot(range(len(ks)), efrac_w, marker="x", markersize=4,
+                linestyle=":", color="#2ecc71", alpha=0.7,
+                label="W_down only")
+
+        ax.set_xticks(range(len(ks)))
+        ax.set_xticklabels(
+            [str(k) if k < d_ffn else "all" for k in ks],
+            fontsize=7, rotation=45)
+        ax.set_title(f"dim {odim}: up_out energy at W_down top-k", fontsize=10)
+        ax.set_xlabel(f"top-k by |W_down[{odim},d]| only")
+        ax.set_ylabel("energy fraction: Σ(up*W)² / total", fontsize=8)
+        ax.set_ylim(-0.05, 1.05)
+        ax.grid(True, linewidth=0.3, alpha=0.3)
+        ax.legend(fontsize=6, ncol=2, loc="best", frameon=False)
+
+    ablate_str = ",".join(str(i) for i in attn_ablate_idxs)
+    fig.suptitle(f"{title}\n(ablate attn [{ablate_str}])",
+                 fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.97])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+def _plot_weight_distribution(
     projs,
     out_dims,
     out_path,
     title,
+    gamma=None,
+):
+    """Plot W_down row distribution for each output dim.
+
+    Layout: one row per output dim, single panel:
+      sorted |W_down[odim, :]| with cumulative energy overlay
+    """
+    W_down = np.asarray(projs["down_proj"], dtype=np.float32)
+    d_model, d_ffn = W_down.shape[0], W_down.shape[1]
+
+    n_dims = len(out_dims)
+    fig, axes = plt.subplots(n_dims, 1, figsize=(8.0, 5.0 * n_dims), squeeze=False)
+
+    for di, odim in enumerate(out_dims):
+        odim = int(odim)
+        w_row = W_down[odim, :]
+
+        ax = axes[di, 0]
+        sorted_abs = np.sort(np.abs(w_row))[::-1]
+        ax.plot(sorted_abs, color="#e74c3c", linewidth=1.0)
+        ax.set_xlabel("rank")
+        ax.set_ylabel(f"|W_down[{odim}, d]|")
+        ax.set_title(f"dim {odim}: sorted |W_down| (d_ffn={d_ffn})", fontsize=10)
+        ax.grid(True, alpha=0.2)
+
+        cum_energy = np.cumsum(sorted_abs ** 2) / np.sum(w_row ** 2)
+        ax2 = ax.twinx()
+        ax2.plot(cum_energy, color="gray", alpha=0.5, linestyle="--")
+        ax2.set_ylabel("cumulative energy", color="gray", fontsize=8)
+
+        # Annotate energy milestones
+        max_abs = np.max(np.abs(w_row))
+        mean_abs = np.mean(np.abs(w_row))
+        for frac in [0.5, 0.9]:
+            n_d = int(np.searchsorted(cum_energy, frac)) + 1
+            ax.axvline(n_d, color="gray", alpha=0.3, linestyle=":")
+            ax.text(n_d + 50, sorted_abs[0] * 0.9,
+                    f"{frac*100:.0f}%@{n_d}", fontsize=7, color="gray")
+
+        ax.text(0.98, 0.55,
+                f"max/mean={max_abs/mean_abs:.1f}x",
+                transform=ax.transAxes, fontsize=8, va="top", ha="right",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.97])
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return True
+
+
+
+
+def _plot_gate_decompose_embed_attn(
+    model,
+    tokenized,
+    layer_idx,
+    projs,
+    out_dims,
+    out_path,
+    title,
+    max_tok=9,
     top_k_bar=20,
 ):
-    """4-panel plot per output dim: gate without/with gamma (bars + frac>0).
+    """Decompose gate selectivity into embed vs attn_out contributions."""
+    import torch
+    L = int(layer_idx)
+    blk = model.model.layers[L]
 
-    Importance ranked by |up_out[tok0, d] * W_down[odim, d]|.
-    Top row: gate values at top-k dims (left=no gamma, right=with gamma).
-    Bottom row: frac(gate>0) vs top-k (left=no gamma, right=with gamma),
-    with shared y-axis limits.
-    """
-    gate_out = np.asarray(acts["gate_out"], dtype=np.float32)
-    up_out = np.asarray(acts["up_out"], dtype=np.float32)
-    W = np.asarray(projs["down_proj"], dtype=np.float32)
+    cache = {}
 
-    has_nogamma = "gate_nogamma" in acts
-    gate_nogamma = np.asarray(acts["gate_nogamma"], dtype=np.float32) if has_nogamma else None
-    gate_pos = np.asarray(acts["gate_pos_frac"], dtype=np.float32) if "gate_pos_frac" in acts else None
-    nogamma_pos = np.asarray(acts["nogamma_pos_frac"], dtype=np.float32) if "nogamma_pos_frac" in acts else None
+    def _embed_hook(_mod, _inp, output, _c=cache):
+        _c["embed"] = output.detach()
 
-    T = gate_out.shape[0]
-    n_dims = len(out_dims)
-    if n_dims < 1 or T < 2 or not has_nogamma:
-        return False
+    def _attn_hook(_mod, _inp, output, _c=cache):
+        _c["attn_out"] = (output[0] if isinstance(output, tuple) else output).detach()
 
+    def _mlp_hook(_mod, inputs, output, _c=cache):
+        x = inputs[0]
+        with torch.no_grad():
+            _c["gate_out"] = _mod.gate_proj(x).detach()
+            _c["up_out"] = _mod.up_proj(x).detach()
+
+    h_embed = model.model.embed_tokens.register_forward_hook(_embed_hook)
+    h_attn = blk.self_attn.register_forward_hook(_attn_hook)
+    h_mlp = blk.mlp.register_forward_hook(_mlp_hook)
+    handles = [h_embed, h_attn, h_mlp]
+
+    W_gate = blk.mlp.gate_proj.weight.detach().float()
+    gamma = blk.post_attention_layernorm.weight.detach().float()
+    W_down = np.asarray(projs["down_proj"], dtype=np.float32)
+
+    def _rms_norm(x, g):
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + 1e-6)
+        return (x / rms) * g[None, :]
+
+    # Accumulators
+    acc_keys = ["gate_embed", "gate_attn", "gate_actual", "up_out"]
+    pos_keys = ["gate_embed_pos", "gate_attn_pos", "gate_actual_pos"]
+    acc = {k: None for k in acc_keys}
+    pos_acc = {k: None for k in pos_keys}
+    n = 0
+
+    try:
+        for input_ids, base_pos in tqdm(
+            tokenized, desc=f"Gate decompose at L={L}",
+        ):
+            cache.clear()
+            T = min(max_tok, input_ids.shape[1])
+            _ = prefill(model, input_ids[:, :T], base_pos[:, :T])
+            if not all(k in cache for k in ["embed", "attn_out", "gate_out", "up_out"]):
+                continue
+
+            dev = cache["gate_out"].device
+            embed = cache["embed"][0, :T, :].to(device=dev, dtype=torch.float32)
+            attn_out = cache["attn_out"][0, :T, :].to(device=dev, dtype=torch.float32)
+            go = cache["gate_out"][0, :T, :].float()
+            uo = cache["up_out"][0, :T, :].float()
+
+            _g = gamma.to(dev)
+            _W = W_gate.to(dev)
+            g_embed = (_rms_norm(embed, _g) @ _W.T).cpu().numpy()
+            g_attn = (_rms_norm(attn_out, _g) @ _W.T).cpu().numpy()
+            go_cpu = go.cpu().numpy()
+            uo_cpu = uo.cpu().numpy()
+
+            vals = {"gate_embed": g_embed, "gate_attn": g_attn,
+                    "gate_actual": go_cpu, "up_out": uo_cpu}
+            for k in acc_keys:
+                if acc[k] is None:
+                    acc[k] = np.zeros_like(vals[k])
+                acc[k] += vals[k]
+
+            pos_vals = {"gate_embed_pos": g_embed, "gate_attn_pos": g_attn,
+                        "gate_actual_pos": go_cpu}
+            for k in pos_keys:
+                if pos_acc[k] is None:
+                    pos_acc[k] = np.zeros_like(pos_vals[k])
+                pos_acc[k] += (pos_vals[k] > 0).astype(np.float32)
+            n += 1
+
+        if n == 0:
+            return False
+
+        means = {k: acc[k] / n for k in acc_keys}
+        pos_fracs = {k: pos_acc[k] / n for k in pos_keys}
+
+    finally:
+        for h in handles:
+            h.remove()
+
+    # --- Plotting ---
+    T, d_ffn = means["gate_actual"].shape
     toks = [0, 1, 4, 8]
     toks = [t for t in toks if t < T]
     tok_colors = {0: "#e74c3c", 1: "#666666", 4: "#999999", 8: "#bbbbbb"}
-    d_ffn = gate_out.shape[1]
-    ks = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, d_ffn]
-    ks = [k for k in ks if k <= d_ffn]
 
-    fig, axes = plt.subplots(n_dims * 2, 2,
-                             figsize=(14.0, max(8.0, 7.0 * n_dims)),
+    n_odims = len(out_dims)
+    fig, axes = plt.subplots(n_odims, 3,
+                             figsize=(18.0, max(5.0, 5.0 * n_odims)),
                              squeeze=False)
 
     for di, odim in enumerate(out_dims):
         odim = int(odim)
-        w_row = W[odim, :]
-        ungated_contrib = np.abs(up_out[0, :] * w_row)
-        top_dims = np.argsort(-ungated_contrib).tolist()
-        top_d = top_dims[:top_k_bar]
-        xpos = np.arange(top_k_bar)
-        n_toks = len(toks)
-        width = 0.8 / n_toks
-        rank_label = f"|up0*W[{odim},d]|"
+        w_row = W_down[odim, :]
 
-        # --- Top row: bar plots ---
-        for ci, (gate_arr, label) in enumerate([
-            (gate_nogamma, "WITHOUT gamma"),
-            (gate_out, "WITH gamma (actual)"),
-        ]):
-            ax = axes[di * 2, ci]
-            for ti, t in enumerate(toks):
-                vals = gate_arr[t, top_d]
-                offset = (ti - (n_toks - 1) / 2.0) * width
-                ax.bar(xpos + offset, vals, width=width,
-                       color=tok_colors.get(t, "#aaaaaa"),
-                       alpha=0.8, edgecolor="none",
-                       label=f"tok{t}" if di == 0 else None)
-            ax.axhline(0, color="black", linewidth=0.8)
-            ax.set_title(f"dim {odim}: gate {label} at top-{top_k_bar}", fontsize=9)
-            ax.set_xlabel(f"rank (by {rank_label})")
-            ax.set_ylabel("gate value", fontsize=8)
-            ax.set_xticks(xpos)
-            ax.set_xticklabels([str(i + 1) for i in xpos], fontsize=7)
-            ax.grid(True, axis="y", linewidth=0.3, alpha=0.25)
-            if di == 0:
-                ax.legend(fontsize=7, loc="best", frameon=False)
+        # Rank by |W_down[odim, d]| only
+        w_top = np.argsort(-np.abs(w_row)).tolist()
 
-        # --- Bottom row: frac(gate>0) ---
-        # Collect all frac values first to compute shared y-limits.
+        components = [
+            ("gate_embed_pos", "embed only"),
+            ("gate_attn_pos", "attn_out only"),
+            ("gate_actual_pos", "embed + attn_out (actual)"),
+        ]
+
+        ks = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, d_ffn]
+        ks = [k for k in ks if k <= d_ffn]
+
+        # Shared y-limits
         all_fracs = []
         frac_data = {}
-        for ci, (pos_arr, label) in enumerate([
-            (nogamma_pos, "WITHOUT gamma"),
-            (gate_pos, "WITH gamma (actual)"),
-        ]):
+        for ci, (pos_key, _) in enumerate(components):
             frac_data[ci] = {}
             for t in toks:
-                fracs = []
-                for k in ks:
-                    td = top_dims[:k]
-                    if pos_arr is not None:
-                        fracs.append(float(np.mean(pos_arr[t, td])))
-                    else:
-                        fracs.append(float(np.mean(gate_out[t, td] > 0)))
+                fracs = [float(np.mean(pos_fracs[pos_key][t, w_top[:k]])) for k in ks]
                 frac_data[ci][t] = fracs
                 all_fracs.extend(fracs)
 
-        y_lo = min(all_fracs) - 0.02
-        y_hi = max(all_fracs) + 0.02
+        y_lo_f = min(all_fracs) - 0.02
+        y_hi_f = max(all_fracs) + 0.02
 
-        for ci, label in enumerate(["WITHOUT gamma", "WITH gamma (actual)"]):
-            ax = axes[di * 2 + 1, ci]
+        for ci, (_, label) in enumerate(components):
+            ax = axes[di, ci]
             for t in toks:
                 ax.plot(range(len(ks)), frac_data[ci][t], marker="o",
-                        markersize=4, color=tok_colors.get(t, "#aaaaaa"),
-                        alpha=0.85, label=f"tok{t}" if di == 0 else None)
+                        markersize=4, color=tok_colors[t], alpha=0.85,
+                        label=f"tok{t}")
             ax.set_xticks(range(len(ks)))
             ax.set_xticklabels(
                 [str(k) if k < d_ffn else "all" for k in ks],
                 fontsize=7, rotation=45)
-            ax.set_title(f"dim {odim}: frac(gate>0) {label}", fontsize=9)
-            ax.set_xlabel(f"top-k by {rank_label}")
+            ax.set_title(f"dim {odim}: frac(gate>0) — {label}", fontsize=9)
+            ax.set_xlabel(f"top-k by |W_down[{odim},d]|")
             ax.set_ylabel("fraction > 0", fontsize=8)
-            ax.set_ylim(y_lo, y_hi)
+            ax.set_ylim(y_lo_f, y_hi_f)
             ax.grid(True, linewidth=0.3, alpha=0.3)
-            if di == 0:
-                ax.legend(fontsize=7, loc="best", frameon=False)
+            ax.legend(fontsize=7, loc="best", frameon=False)
 
     fig.suptitle(title, fontsize=12, y=0.995)
     fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.98])
@@ -4295,6 +4607,9 @@ def main():
     # ablation
     p.add_argument("--ablate-mlp-out", choices=["magnitude", "direction"], default=None, help="Ablate MLP output at token 0.")
     p.add_argument("--vec-idx", type=int, nargs="+", default=None, help="Indices of the vectors to ablate.")
+    # attention recalculation ablation
+    p.add_argument("--recalculate-attn", type=int, nargs="+", default=None,
+                   help="Ablate specified attn layers to self-attend only, then compare gate selectivity.")
     # output
     p.add_argument("--outdir", default="results")
     args = p.parse_args()
@@ -4549,19 +4864,64 @@ def main():
         if saved_gate:
             print(f"[plot_down_out_contrib] Saved gate analysis to {out_path_gate}")
 
-        out_path_sel = os.path.join(
+
+        out_path_decomp = os.path.join(
             args.outdir,
-            f"down_out_gate_selectivity_L{Lp}_{dim_str}.png"
+            f"gate_decompose_embed_attn_L{Lp}_{dim_str}.png"
         )
-        saved_sel = _plot_gate_selectivity(
-            acts=pack["acts"],
+        saved_decomp = _plot_gate_decompose_embed_attn(
+            model=model,
+            tokenized=tokenized,
+            layer_idx=Lp,
             projs=pack["projs"],
             out_dims=out_dims,
-            out_path=out_path_sel,
-            title=f"gate selectivity for down_out dims {out_dims} @ mlp.{Lp} (N={pack['n']})",
+            out_path=out_path_decomp,
+            title=f"gate decomposition: embed vs attn_out for dims {out_dims} @ mlp.{Lp}",
         )
-        if saved_sel:
-            print(f"[plot_down_out_contrib] Saved gate selectivity to {out_path_sel}")
+        if saved_decomp:
+            print(f"[plot_down_out_contrib] Saved gate decomposition to {out_path_decomp}")
+
+        out_path_wd = os.path.join(
+            args.outdir,
+            f"weight_distribution_L{Lp}_{dim_str}.png",
+        )
+        _plot_weight_distribution(
+            projs=pack["projs"],
+            out_dims=out_dims,
+            out_path=out_path_wd,
+            title=f"Weight distributions @ mlp.{Lp}, dims {out_dims}",
+        )
+        print(f"[plot_down_out_contrib] Saved weight distribution to {out_path_wd}")
+
+        if args.recalculate_attn:
+            print(f"[plot_down_out_contrib] Running self-attend-only ablation on attn layers {args.recalculate_attn}...")
+            ablated = _collect_gate_with_ablation(
+                model, tokenized, Lp, args.recalculate_attn,
+            )
+            if ablated:
+                ablate_str = "_".join(str(i) for i in args.recalculate_attn)
+                out_path_abl = os.path.join(
+                    args.outdir,
+                    f"gate_ablation_selfattn_L{Lp}_{dim_str}.png",
+                )
+                _plot_gate_ablation_comparison(
+                    orig_gate_pos_frac=pack["acts"]["gate_pos_frac"],
+                    ablated_gate_pos_frac=ablated["gate_pos_frac"],
+                    orig_up_out_mean=pack["acts"]["up_out"],
+                    ablated_up_out_mean=ablated["up_out"],
+                    projs=pack["projs"],
+                    out_dims=out_dims,
+                    attn_ablate_idxs=args.recalculate_attn,
+                    out_path=out_path_abl,
+                    title=f"gate ablation: self-attn only at attn {args.recalculate_attn} for dims {out_dims} @ mlp.{Lp}",
+                    n_orig=pack["n"],
+                    n_ablated=ablated["n"],
+                )
+                print(f"[plot_down_out_contrib] Saved ablation comparison to {out_path_abl}")
+
+            else:
+                print("[plot_down_out_contrib] Ablation collection returned no data.")
+
         return
 
     min_len = min(ids.shape[1] for (ids, _bp) in tokenized)
